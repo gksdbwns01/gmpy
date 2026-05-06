@@ -1,0 +1,3562 @@
+import sys
+import os
+import json
+import shutil
+import math
+import time
+import platform
+import multiprocessing
+import signal
+import re
+import gc
+import traceback
+import queue as qlib
+from pathlib import Path
+from datetime import datetime
+import zipfile
+import cv2
+import numpy as np
+import pandas as pd
+import psutil
+import torch
+from PyQt5.QtWidgets import QSizePolicy
+from PyQt5.QtCore import QSize
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRectF, QSettings
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
+    QLabel, QLineEdit, QPushButton, QFileDialog, QSpinBox, QDoubleSpinBox,
+    QComboBox, QCheckBox, QTextEdit, QProgressBar, QMessageBox,
+    QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QFormLayout, 
+    QScrollArea, QGridLayout, QSplitter, QDialog, QInputDialog,
+    QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsPixmapItem, QListWidget,
+    QListWidgetItem, QGraphicsLineItem
+)
+from PyQt5.QtGui import QPixmap, QImage, QFont, QIcon, QColor, QPainter, QPen
+
+# 🟢 DPI 배율에 따른 좌표 어긋남 방지 코드 (QApplication 생성 전 설정)
+if hasattr(Qt, 'AA_EnableHighDpiScaling'):
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
+
+
+# -------------------------------------------------------------------------
+# GPU VRAM 초기화 유틸리티
+# -------------------------------------------------------------------------
+def clear_vram():
+    """GPU 메모리 캐시를 강제로 비워 OOM 에러를 방지합니다."""
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0. 설정 저장 및 불러오기 관리자 (Config Manager & Builder)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ConfigManager:
+    def __init__(self, base_dir):
+        self.base_dir = Path(base_dir)
+        self._workspace_path = None
+        self._config_dir = None
+        
+    @property
+    def config_dir(self):
+        if self._config_dir is None:
+            return self.base_dir / "workspace" / "configs"
+        return self._config_dir
+
+    def update_workspace_path(self, workspace_path):
+        self._workspace_path = Path(workspace_path)
+        self._config_dir = self._workspace_path / "configs"
+        self._config_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_config(self, config_data, config_name):
+        try:
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            
+            test_file = self.config_dir / ".write_test"
+            test_file.touch()
+            test_file.unlink()
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            if not config_name:
+                config_name = f"config_{timestamp}"
+            
+            file_path = self.config_dir / f"{config_name}.json"
+            
+            final_data = {
+                "metadata": {"saved_at": timestamp, "version": "1.0", "name": config_name},
+                "config": config_data
+            }
+            
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(final_data, f, indent=4, ensure_ascii=False)
+            return True, str(file_path)
+        except PermissionError:
+            return False, f"설정 폴더에 쓰기 권한이 없습니다:\n{self.config_dir}"
+        except Exception as e:
+            return False, str(e)
+
+    def load_config(self, file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return True, data.get("config", {})
+        except Exception as e:
+            return False, str(e)
+
+    def get_all_configs(self):
+        configs = []
+        for f in self.config_dir.glob("*.json"):
+            configs.append(f)
+        return sorted(configs, key=os.path.getmtime, reverse=True)
+
+
+class ConfigBuilder:
+    @staticmethod
+    def build(window):
+        return {
+            "global": {
+                "proj_root": window.w_proj_root.get_path(),
+                "base_ds": window.w_base_ds.get_path(),
+                "proc_ds": window.w_proc_ds.get_path(),
+                "work_ds": window.w_work_ds.get_path(),
+                "webhook_url": window.w_webhook.text(),
+                "notify_error": window.chk_noti_error.isChecked(),
+                "notify_task": window.chk_noti_task.isChecked(),
+                "notify_fold": window.chk_noti_fold.isChecked(),
+                "notify_early_stop": window.chk_noti_early_stop.isChecked(),
+                "model": window.g_model.currentText(),
+                "imgsz": window.g_imgsz.currentText()
+            },
+            "tab1": {
+                "auto_crop": window.t1_auto_crop.isChecked(),
+                "margin": window.t1_margin.value(),
+                "mx": window.t1_mx.value(), "my": window.t1_my.value(),
+                "mw": window.t1_mw.value(), "mh": window.t1_mh.value(),
+                "class_map": window.t1_class_map.toPlainText(),
+                "clean": window.t1_clean.isChecked(),
+                "exif": window.t1_exif.isChecked()
+            },
+            "tab2": {
+                "epochs": window.t2_epochs.value(), "batch": window.t2_batch.value(),
+                "workers": window.t2_workers.value(), "patience": window.t2_patience.value(),
+                "seed": window.t2_seed.value(), "folds": window.t2_folds.value(),
+                "test_split": window.t2_test_split.value(),
+                "lcls": window.t2_lcls.value(), "lbox": window.t2_lbox.value(), "ldfl": window.t2_ldfl.value(),
+                "ah": window.t2_ah.value(), "as": window.t2_as.value(), "av": window.t2_av.value(),
+                "adeg": window.t2_adeg.value(), "atrans": window.t2_atrans.value(), "ascale": window.t2_ascale.value(),
+                "ashear": window.t2_ashear.value(), "afud": window.t2_afud.value(), "aflr": window.t2_aflr.value(),
+                "amos": window.t2_amos.value(), "amix": window.t2_amix.value(), "acp": window.t2_acp.value()
+            },
+            "tab3": {
+                "conf": window.t3_conf.value(), "iou": window.t3_iou.value(),
+                "match_iou": window.t3_match_iou.value(), "max_det": window.t3_max_det.value(),
+                "run_name": window.t3_run_name.text(), "agnostic": window.t3_agnostic.isChecked(),
+                "save_rel": window.t3_save_rel.isChecked()
+            },
+            "tab4": {
+                "epochs": window.t4_epochs.value(), "batch": window.t4_batch.value(), "run": window.t4_run.text(),
+                "lcls": window.t4_lcls.value(), "lbox": window.t4_lbox.value(),
+                "ah": window.t4_ah.value(), "as": window.t4_as.value(), "av": window.t4_av.value(),
+                "afud": window.t4_afud.value(), "aflr": window.t4_aflr.value(), "amos": window.t4_amos.value(),
+                "amix": window.t4_amix.value(), "acp": window.t4_acp.value(),
+                "eval_conf": window.t4_conf.value(), "eval_iou": window.t4_iou.value(),
+                "eval_match": window.t4_match_iou.value(), "eval_max": window.t4_max_det.value(),
+                "eval_agnostic": window.t4_agnostic.isChecked()
+            },
+            "tab5": {
+                "method": window.t5_method.currentText(), "conf": window.t5_conf.value(),
+                "iou": window.t5_iou.value(), "max_det": window.t5_max_det.value(),
+                "agnostic": window.t5_agnostic.isChecked(), "knn_n": window.t5_knn_n.value(),
+                "edge_thr": window.t5_edge_thr.text(), "skip_ng": window.t5_skip_ng.isChecked(),
+                "drop_odd": window.t5_drop_odd.isChecked(), "color1": window.t5_color1.currentText(),
+                "color2": window.t5_color2.currentText()
+            },
+            "tab6": {
+                "class_map": window.t6_class_map.toPlainText(),
+                "color": window.t6_color_combo.currentText(),
+                "auto_thr": window.t6_auto_thr.value(),
+                "auto_nms": window.t6_auto_nms.value()
+            }
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. MULTIPROCESSING WORKERS (학습 및 재학습용)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def send_discord_webhook(webhook_url, content):
+    if not webhook_url or not webhook_url.startswith("http"):
+        return
+    import requests
+    try:
+        requests.post(webhook_url, json={"content": content}, timeout=5)
+    except Exception as e:
+        print(f"디스코드 웹훅 발송 실패: {e}")
+
+def _kfold_train_worker(args: dict, queue):
+    import json, shutil, numpy as np, time
+    from pathlib import Path
+    from ultralytics import YOLO
+    from sklearn.model_selection import KFold, train_test_split
+    start_time = time.time()
+    result = {"success": False, "error": "", "msg": "", "best_model": ""}
+    try:
+        processed_dir = Path(args["processed_dir"])
+        workspace_dir = Path(args["workspace_dir"])
+        model_name    = args["model_name"]
+        imgsz         = args["imgsz"]
+        epochs        = args["epochs"]
+        batch_size    = args["batch"]
+        workers       = args["workers"]
+        patience      = args.get("patience", 100)
+        random_seed   = args["random_seed"]
+        deterministic = args["deterministic"]
+        num_folds     = args["num_folds"]
+        test_split    = args["test_split"]
+        best_metric   = args["best_metric"]
+        second_metric = args["second_metric"]
+        class_names   = args["class_names"]
+        aug           = args["aug"]
+        loss          = args["loss"]
+        webhook_url   = args.get("webhook_url", "")
+        noti_flags    = args.get("noti_flags", {})
+
+        kfold_base = workspace_dir / "kfold"
+        runs_dir   = workspace_dir / "runs" / "kfold_train"
+
+        img_map = {f.stem: f for f in sorted((processed_dir / "images").glob("*.jpg"))}
+        lbl_map = {f.stem: f for f in sorted((processed_dir / "labels").glob("*.txt"))}
+        paired  = [(str(img_map[n]), str(lbl_map[n])) for n in img_map if n in lbl_map]
+        if len(paired) < 5:
+            result["error"] = f"학습에 사용할 수 있는 데이터가 너무 적습니다. (현재 정상 데이터: {len(paired)}개)\n전처리가 제대로 되었는지 확인하시고, 최소 5개 이상의 데이터를 준비해주세요."
+            queue.put(result)
+            return
+        train_val, test_files = train_test_split(paired, test_size=test_split, random_state=random_seed)
+
+        if kfold_base.exists(): shutil.rmtree(kfold_base)
+        kfold_base.mkdir(parents=True, exist_ok=True)
+
+        test_img_dir = kfold_base / "images" / "test"; test_lbl_dir = kfold_base / "labels" / "test"
+        test_img_dir.mkdir(parents=True, exist_ok=True); test_lbl_dir.mkdir(parents=True, exist_ok=True)
+        for img, lbl in test_files:
+            shutil.copy(img, test_img_dir); shutil.copy(lbl, test_lbl_dir)
+
+        fold_metrics, fold_save_dirs = [], {}
+
+        def check_early_stop(save_dir, fold_name):
+            try:
+                df = pd.read_csv(Path(save_dir) / 'results.csv')
+                actual_epochs = len(df)
+                if actual_epochs < epochs and noti_flags.get("early_stop") and webhook_url:
+                    send_discord_webhook(webhook_url, f"🛑 **[조기 종료 발동]**\nFold {fold_name}이(가) 성능 개선이 없어 {actual_epochs} Epoch에서 종료되었습니다.")
+            except: pass
+
+        if num_folds == 1:
+            fd = kfold_base / "fold_1"
+            fd.mkdir(exist_ok=True)
+
+            tr, vl = train_test_split(train_val, test_size=test_split, random_state=random_seed)
+            tr_txt, vl_txt = fd / "train.txt", fd / "val.txt"
+            tr_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in tr))
+            vl_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in vl))
+
+            data_yaml = fd / "data.yaml"
+            data_yaml.write_text(
+                f"train: {tr_txt.resolve()}\nval: {vl_txt.resolve()}\ntest: {test_img_dir.resolve()}\nnc: {len(class_names)}\nnames: {class_names}\n"
+            )
+
+            model = YOLO(model_name)
+            results = model.train(
+                data=str(data_yaml), epochs=epochs, patience=patience, imgsz=imgsz, batch=batch_size,
+                workers=workers, project=str(runs_dir), name="single_train",
+                seed=random_seed, deterministic=deterministic,
+                hsv_h=aug["h"], hsv_s=aug["s"], hsv_v=aug["v"], degrees=aug["deg"],
+                translate=aug["trans"], scale=aug["scale"], shear=aug["shear"],
+                flipud=aug["fud"], fliplr=aug["flr"], mosaic=aug["mos"],
+                mixup=aug["mix"], copy_paste=aug["cp"], cls=loss["cls"], box=loss["box"], dfl=loss["dfl"], verbose=True
+            )
+            fold_metrics.append(results.results_dict)
+            fold_save_dirs[1] = str(results.save_dir)
+            check_early_stop(results.save_dir, "1 (단일학습)")
+            del model, results
+
+        else:
+            kf = KFold(n_splits=num_folds, shuffle=True, random_state=random_seed)
+            for fold, (ti, vi) in enumerate(kf.split(train_val)):
+                fold_num = fold + 1
+                fd = kfold_base / f"fold_{fold_num}"; fd.mkdir(exist_ok=True)
+
+                tr, vl = np.array(train_val)[ti], np.array(train_val)[vi]
+                tr_txt, vl_txt = fd / "train.txt", fd / "val.txt"
+                tr_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in tr))
+                vl_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in vl))
+
+                data_yaml = fd / "data.yaml"
+                data_yaml.write_text(
+                    f"train: {tr_txt.resolve()}\nval: {vl_txt.resolve()}\ntest: {test_img_dir.resolve()}\nnc: {len(class_names)}\nnames: {class_names}\n"
+                )
+
+                model   = YOLO(model_name)
+                results = model.train(
+                    data=str(data_yaml), epochs=epochs, patience=patience, imgsz=imgsz, batch=batch_size,
+                    workers=workers, project=str(runs_dir), name=f"fold_{fold_num}",
+                    seed=random_seed, deterministic=deterministic,
+                    hsv_h=aug["h"], hsv_s=aug["s"], hsv_v=aug["v"], degrees=aug["deg"],
+                    translate=aug["trans"], scale=aug["scale"], shear=aug["shear"],
+                    flipud=aug["fud"], fliplr=aug["flr"], mosaic=aug["mos"],
+                    mixup=aug["mix"], copy_paste=aug["cp"], cls=loss["cls"], box=loss["box"], dfl=loss["dfl"], verbose=True
+                )
+                fold_metrics.append(results.results_dict)
+                fold_save_dirs[fold_num] = str(results.save_dir)
+                
+                check_early_stop(results.save_dir, str(fold_num))
+                if webhook_url and noti_flags.get("fold"):
+                    send_discord_webhook(webhook_url, f"🏃 **[K-Fold 진행 중]**\n✅ Fold {fold_num}/{num_folds} 완료!")
+                del model, results
+
+        if fold_metrics:
+            best_i = max(range(len(fold_metrics)), key=lambda i: (fold_metrics[i].get(best_metric, 0), fold_metrics[i].get(second_metric, 0)))
+            best_n = best_i + 1
+            src = Path(fold_save_dirs[best_n]) / "weights" / "best.pt"
+            dst = kfold_base / "best_model.pt"
+            if src.exists():
+                shutil.copy(src, dst)
+                elapsed_sec = time.time() - start_time
+                hours, rem = divmod(elapsed_sec, 3600)
+                mins, secs = divmod(rem, 60)
+                time_str = f"{int(hours)}시간 {int(mins)}분 {int(secs)}초" if hours else f"{int(mins)}분 {int(secs)}초"
+                
+                result["success"] = True
+                result["msg"] = f"✅ 학습 완료! (소요시간: {time_str})\n저장: {dst}" 
+                result["best_model"] = str(dst)
+                
+                summary = []
+                for i, fm in enumerate(fold_metrics):
+                    map50 = fm.get("metrics/mAP50(B)", 0)
+                    map50_95 = fm.get("metrics/mAP50-95(B)", 0)
+                    fitness = (0.1 * map50) + (0.9 * map50_95)
+                    summary.append({
+                        "Fold": i + 1,
+                        "mAP50": map50,
+                        "mAP50-95": map50_95,
+                        "Precision": fm.get("metrics/precision(B)", 0),
+                        "Recall": fm.get("metrics/recall(B)", 0),
+                        "Fitness": fitness
+                    })
+                
+                avg_mAP50 = sum(m["mAP50"] for m in summary) / len(summary)
+                avg_mAP50_95 = sum(m["mAP50-95"] for m in summary) / len(summary)
+                avg_p = sum(m["Precision"] for m in summary) / len(summary)
+                avg_r = sum(m["Recall"] for m in summary) / len(summary)
+                avg_fit = sum(m["Fitness"] for m in summary) / len(summary)
+                
+                summary.append({
+                    "Fold": "Average",
+                    "mAP50": avg_mAP50,
+                    "mAP50-95": avg_mAP50_95,
+                    "Precision": avg_p,
+                    "Recall": avg_r,
+                    "Fitness": avg_fit
+                })
+                result["metrics_summary"] = summary
+                result["best_fold"] = best_n  
+                
+                if webhook_url and noti_flags.get("task"):
+                    noti_msg = (
+                        f"🟢 **[YOLO K-Fold 학습 완료]**\n"
+                        f"⏱️ **소요시간**: {time_str}\n"
+                        f"👑 **Best Fold**: {best_n}\n"
+                        f"📊 **평균 mAP50-95**: {avg_mAP50_95:.4f}\n"
+                        f"📁 **저장 경로**: `{dst}`"
+                    )
+                    send_discord_webhook(webhook_url, noti_msg)
+            else:
+                result["error"] = "Best 모델 가중치를 찾을 수 없습니다."
+        else:
+            result["error"] = "학습을 완료한 Fold가 없습니다."
+    except Exception as e:
+        result["error"] = traceback.format_exc()
+        noti_flags = args.get("noti_flags", {})
+        webhook_url = args.get("webhook_url", "")
+        if webhook_url and noti_flags.get("error"):
+            send_discord_webhook(webhook_url, f"❌ **[K-Fold 학습 에러 발생]**\n에러내용:\n{str(e)[:500]}")
+    finally:
+        clear_vram()
+        queue.put(result)
+
+
+def _retrain_worker(args: dict, queue):
+    import json, shutil, time, yaml as _yaml
+    from pathlib import Path
+    from ultralytics import YOLO
+    start_time = time.time()
+    result = {"success": False, "error": "", "msg": "", "save_dir": "", "model_path": ""}
+    
+    webhook_url = args.get("webhook_url", "")
+    noti_flags = args.get("noti_flags", {})
+
+    try:
+        p = args
+        rt_hard_dir, rt_orig_labels, rt_base_model = Path(p["rt_hard_dir"]), Path(p["rt_orig_labels"]), Path(p["rt_base_model"])
+        workspace_dir = Path(p["workspace_dir"])
+        
+        retrain_ds = workspace_dir / "retrain"
+        runs_dir   = workspace_dir / "runs" / "retrain_train"
+        new_img, new_lbl = retrain_ds / "images" / "train", retrain_ds / "labels" / "train"
+
+        if retrain_ds.exists(): shutil.rmtree(retrain_ds)
+        new_img.mkdir(parents=True, exist_ok=True); new_lbl.mkdir(parents=True, exist_ok=True)
+
+        files = [f for f in rt_hard_dir.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png")]
+        if not files:
+            result["error"] = "오답 이미지 폴더에 처리할 이미지가 없습니다."
+            queue.put(result)
+            return
+
+        for img_file in files:
+            shutil.copy(img_file, new_img / img_file.name)
+            src_txt = rt_orig_labels / img_file.with_suffix(".txt").name
+            dst_txt = new_lbl / img_file.with_suffix(".txt").name
+            shutil.copy(src_txt, dst_txt) if src_txt.exists() else dst_txt.touch()
+
+        yaml_data = {"path": retrain_ds.resolve().as_posix(), "train": "images/train", "val": "images/train", "nc": len(p["class_names"]), "names": p["class_names"]}
+        yaml_rt = retrain_ds / "retrain_data.yaml"
+        yaml_rt.write_text(_yaml.dump(yaml_data, sort_keys=False), encoding="utf-8")
+
+        model = YOLO(str(rt_base_model))
+        results = model.train(
+            data=str(yaml_rt), epochs=p["rt_epochs"], imgsz=p["imgsz"], batch=p["rt_batch"],
+            project=str(runs_dir), name=p["rt_run_name"], exist_ok=True,
+            hsv_h=p["rt_h"], hsv_s=p["rt_s"], hsv_v=p["rt_v"], flipud=p["rt_flipud"], fliplr=p["rt_fliplr"],
+            mosaic=p["rt_mosaic"], mixup=p["rt_mix"], copy_paste=p["rt_cp"], cls=p["rt_cls"], box=p["rt_box"], verbose=True
+        )
+        elapsed_sec = time.time() - start_time
+        hours, rem = divmod(elapsed_sec, 3600)
+        mins, secs = divmod(rem, 60)
+        time_str = f"{int(hours)}시간 {int(mins)}분 {int(secs)}초" if hours else f"{int(mins)}분 {int(secs)}초"
+
+        result["success"] = True
+        result["msg"] = f"✅ 재학습 완료! (소요시간: {time_str})\n저장: {results.save_dir}"
+        result["save_dir"] = str(results.save_dir)
+        result["model_path"] = str(Path(results.save_dir) / "weights" / "best.pt")
+        
+        try:
+            df = pd.read_csv(Path(results.save_dir) / 'results.csv')
+            actual_epochs = len(df)
+            if actual_epochs < p["rt_epochs"] and noti_flags.get("early_stop") and webhook_url:
+                send_discord_webhook(webhook_url, f"🛑 **[조기 종료 발동]**\n재학습이 {actual_epochs} Epoch에서 종료되었습니다.")
+        except: pass
+
+        if webhook_url and noti_flags.get("task"):
+            noti_msg = (
+                f"🔁 **[Hard Example 재학습 완료]**\n"
+                f"⏱️ **소요시간**: {time_str}\n"
+                f"📁 **저장 경로**: `{results.save_dir}`"
+            )
+            send_discord_webhook(webhook_url, noti_msg)
+            
+        del model, results
+    except Exception as e:
+        result["error"] = traceback.format_exc()
+        if webhook_url and noti_flags.get("error"):
+            send_discord_webhook(webhook_url, f"❌ **[재학습 에러 발생]**\n에러내용:\n{str(e)[:500]}")
+    finally:
+        clear_vram()
+        queue.put(result)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. QTHREADS (비동기 처리 워커)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ProcessMonitorThread(QThread):
+    finished_ok = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, queue, process):
+        super().__init__()
+        self.queue = queue
+        self.process = process
+
+    def run(self):
+        while self.process.is_alive():
+            try:
+                res = self.queue.get(timeout=0.5)
+                self.finished_ok.emit(res)
+                return
+            except qlib.Empty:
+                continue
+                
+        try:
+            res = self.queue.get(timeout=1.0)
+            self.finished_ok.emit(res)
+        except qlib.Empty:
+            if self.process.exitcode != 0:
+                self.error.emit(f"프로세스가 비정상 종료되었습니다 (Exit Code: {self.process.exitcode})")
+
+class PreprocessThread(QThread):
+    progress = pyqtSignal(int); log_msg = pyqtSignal(str); finished_ok = pyqtSignal(int); error = pyqtSignal(str)
+    def __init__(self, config): super().__init__(); self.config = config
+    def run(self):
+        try:
+            from PIL import Image as PILImage, ImageOps
+            import json, shutil
+            
+            c = self.config
+            label_dir, image_dir = Path(c["base_dir"]) / "data", Path(c["base_dir"]) / "image"
+            out_img, out_lbl = Path(c["processed_dir"]) / "images", Path(c["processed_dir"]) / "labels"
+            if not label_dir.is_dir(): return self.error.emit(f"라벨 폴더(data) 누락: {label_dir}")
+
+            label_files = list(label_dir.glob("*.json")) + list(label_dir.glob("*.txt"))
+
+            if c["use_auto_crop"]:
+                min_x = min_y = float("inf"); max_x = max_y = 0.0
+                for lf in label_files:
+                    if lf.suffix == ".json":
+                        data = json.loads(lf.read_text(encoding="utf-8"))
+                        for item in data.get("area", []):
+                            if isinstance(item, dict) and len(item) == 1 and len(list(item.values())[0]) == 4:
+                                x, y, w, h = list(item.values())[0]
+                                min_x, min_y = min(min_x, x), min(min_y, y)
+                                max_x, max_y = max(max_x, x + w), max(max_y, y + h)
+                    elif lf.suffix == ".txt":
+                        img_path = None
+                        for ext in [".jpg", ".jpeg", ".png", ".JPG", ".PNG"]:
+                            temp = image_dir / lf.with_suffix(ext).name
+                            if temp.exists():
+                                img_path = temp; break
+                        if img_path:
+                            try:
+                                with PILImage.open(img_path) as img:
+                                    if c["use_exif"]: img = ImageOps.exif_transpose(img)
+                                    iw, ih = img.size
+                                for line in lf.read_text(encoding="utf-8").strip().splitlines():
+                                    parts = line.strip().split()
+                                    if len(parts) == 5:
+                                        xc, yc, nw, nh = map(float, parts[1:])
+                                        w, h = nw * iw, nh * ih
+                                        x, y = (xc * iw) - (w / 2), (yc * ih) - (h / 2)
+                                        min_x, min_y = min(min_x, x), min(min_y, y)
+                                        max_x, max_y = max(max_x, x + w), max(max_y, y + h)
+                            except: pass
+                
+                if min_x == float("inf"):
+                    crop_x, crop_y, crop_w, crop_h = c["manual_crop"]
+                else:
+                    crop_x, crop_y = max(0, int(min_x - c["margin"])), max(0, int(min_y - c["margin"]))
+                    crop_w, crop_h = int((max_x + c["margin"]) - crop_x), int((max_y + c["margin"]) - crop_y)
+            else:
+                crop_x, crop_y, crop_w, crop_h = c["manual_crop"]
+
+            self.log_msg.emit(f"✂️ 크롭 영역 확정 → X={crop_x}, Y={crop_y}, W={crop_w}, H={crop_h}")
+            if c["clean_old"] and Path(c["processed_dir"]).exists(): shutil.rmtree(c["processed_dir"])
+            out_img.mkdir(parents=True, exist_ok=True); out_lbl.mkdir(parents=True, exist_ok=True)
+
+            ok_count = 0
+            for i, lf in enumerate(label_files):
+                img_id = None
+                boxes_abs = []
+
+                if lf.suffix == ".json":
+                    ann = json.loads(lf.read_text(encoding="utf-8"))
+                    img_id = ann.get("id")
+                    if not img_id or not (image_dir / img_id).exists(): continue
+                    
+                    for item in ann.get("area", []):
+                        if isinstance(item, dict) and len(item) == 1:
+                            label, bbox = list(item.keys())[0], list(item.values())[0]
+                            if label in c["class_map"] and len(bbox) == 4:
+                                cid = c["class_map"][label]
+                                boxes_abs.append((cid, bbox))
+                elif lf.suffix == ".txt":
+                    for ext in [".jpg", ".jpeg", ".png", ".JPG", ".PNG"]:
+                        temp = image_dir / lf.with_suffix(ext).name
+                        if temp.exists():
+                            img_id = temp.name; break
+                    if not img_id: continue
+
+                try:
+                    img = PILImage.open(image_dir / img_id)
+                    if c["use_exif"]: img = ImageOps.exif_transpose(img)
+                    iw, ih = img.size
+                    acw, ach = min(crop_w, iw - crop_x), min(crop_h, ih - crop_y)
+                    if acw <= 0 or ach <= 0: continue
+                    
+                    if lf.suffix == ".txt":
+                        for line in lf.read_text(encoding="utf-8").strip().splitlines():
+                            parts = line.strip().split()
+                            if len(parts) == 5:
+                                cid = int(parts[0])
+                                xc, yc, nw, nh = map(float, parts[1:])
+                                w, h = nw * iw, nh * ih
+                                x, y = (xc * iw) - (w / 2), (yc * ih) - (h / 2)
+                                boxes_abs.append((cid, [x, y, w, h]))
+
+                    labels = []
+                    for cid, (xo, yo, wo, ho) in boxes_abs:
+                        nx, ny = xo - crop_x, yo - crop_y
+                        if nx + wo > 0 and ny + ho > 0 and nx < acw and ny < ach:
+                            fx1, fy1, fx2, fy2 = max(0, nx), max(0, ny), min(acw, nx + wo), min(ach, ny + ho)
+                            fw, fh = fx2 - fx1, fy2 - fy1
+                            xc, yc = (fx1 + fw / 2) / acw, (fy1 + fh / 2) / ach
+                            labels.append(f"{cid} {xc:.6f} {yc:.6f} {fw/acw:.6f} {fh/ach:.6f}")
+
+                    (out_lbl / Path(img_id).with_suffix(".txt").name).write_text("\n".join(labels), encoding="utf-8")
+                    img.crop((crop_x, crop_y, crop_x + acw, crop_y + ach)).save(out_img / img_id)
+                    img.close(); ok_count += 1
+                    self.progress.emit(int((i + 1) / len(label_files) * 100))
+                except Exception as e:
+                    continue
+
+            if c.get("webhook_url") and c.get("noti_flags", {}).get("task"):
+                send_discord_webhook(c["webhook_url"], f"✂️ **[데이터 전처리 완료]**\n총 {ok_count}장 처리 완료!")
+            self.finished_ok.emit(ok_count)
+        except Exception as e:
+            if c.get("webhook_url") and c.get("noti_flags", {}).get("error"):
+                send_discord_webhook(c["webhook_url"], f"❌ **[데이터 전처리 에러 발생]**\n에러내용:\n{str(e)[:500]}")
+            self.error.emit(traceback.format_exc())
+
+class EvalThread(QThread):
+    finished_ok = pyqtSignal(pd.DataFrame, list, list, dict); error = pyqtSignal(str)
+    def __init__(self, config): super().__init__(); self.config = config
+    def run(self):
+        try:
+            from ultralytics import YOLO; import shutil
+            c = self.config
+            eval_project_dir = Path(c["workspace_dir"]) / "runs" / "eval"
+            relabel_dir = eval_project_dir / f"{c['eval_run_name']}_needs_relabel"
+            
+            if c["save_relabel"]: 
+                if relabel_dir.exists():
+                    shutil.rmtree(relabel_dir)
+                relabel_dir.mkdir(parents=True, exist_ok=True)
+
+            model = YOLO(str(c["eval_model_path"]))
+            results = model.predict(
+                source=str(c["eval_source"]), save=True, conf=c["eval_conf"], iou=c["eval_iou"],
+                max_det=c["max_det"], project=str(eval_project_dir), name=c["eval_run_name"], agnostic_nms=c["agnostic_nms"], exist_ok=True
+            )
+
+            def calc_iou(b1, b2):
+                ax1,ay1,ax2,ay2 = b1[0]-b1[2]/2, b1[1]-b1[3]/2, b1[0]+b1[2]/2, b1[1]+b1[3]/2
+                bx1,by1,bx2,by2 = b2[0]-b2[2]/2, b2[1]-b2[3]/2, b2[0]+b2[2]/2, b2[1]+b2[3]/2
+                ix, iy = max(0, min(ax2,bx2)-max(ax1,bx1)), max(0, min(ay2,by2)-max(ay1,by1))
+                ia = ix*iy; return ia/((ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-ia+1e-6)
+
+            rows, wrong, wrong_imgs, all_imgs = [], 0, [], []
+            for r in results:
+                img_name = Path(r.path).name
+                current_img_path = str(eval_project_dir / c["eval_run_name"] / img_name)
+                all_imgs.append(current_img_path)
+                
+                pred_boxes = [{"class": int(cls.item()), "box": b.tolist()} for cls, b in zip(r.boxes.cls, r.boxes.xywhn)] if len(r.boxes) > 0 else []
+                gt_boxes = []
+                txt = Path(c["gt_labels_path"]) / Path(img_name).with_suffix(".txt").name
+                if txt.exists():
+                    for line in txt.read_text().splitlines():
+                        parts = line.strip().split()
+                        if len(parts) == 5: gt_boxes.append({"class": int(parts[0]), "box": [float(x) for x in parts[1:]]})
+
+                correct, reason = True, ""
+                if len(pred_boxes) != len(gt_boxes): correct, reason = False, "개수 오류"
+                else:
+                    matched = []
+                    for pb in pred_boxes:
+                        found = False
+                        for j, gb in enumerate(gt_boxes):
+                            if j not in matched and pb["class"] == gb["class"] and calc_iou(pb["box"], gb["box"]) >= c["match_iou"]:
+                                found = True; matched.append(j); break
+                        if not found: correct, reason = False, "분류/위치 오류"; break
+
+                if not correct:
+                    wrong += 1
+                    if c["save_relabel"]: shutil.copy(r.path, relabel_dir / img_name)
+                    wrong_imgs.append(current_img_path)
+
+                rows.append({"파일명": img_name, "상태": "✅ 정답" if correct else "❌ 오답", "예측 수": len(pred_boxes), "정답 수": len(gt_boxes), "사유": "정확히 일치" if correct else reason})
+
+            total = len(rows); acc = (total - wrong) / total * 100 if total else 0
+            stats = {"total": total, "correct": total-wrong, "wrong": wrong, "acc": acc, "relabel_dir": str(relabel_dir) if c["save_relabel"] else ""}
+            
+            if c.get("webhook_url") and c.get("noti_flags", {}).get("task"):
+                send_discord_webhook(c["webhook_url"], f"🔍 **[평가 선별 완료]**\n총 {stats['total']}장 중 {stats['wrong']}개 오답 (정확도 {stats['acc']:.1f}%)")
+                
+            del model; clear_vram()
+            self.finished_ok.emit(pd.DataFrame(rows).sort_values("상태"), wrong_imgs, all_imgs, stats)
+        except Exception as e:
+            if c.get("webhook_url") and c.get("noti_flags", {}).get("error"):
+                send_discord_webhook(c["webhook_url"], f"❌ **[평가 에러 발생]**\n에러내용:\n{str(e)[:500]}")
+            self.error.emit(traceback.format_exc())
+
+class Tab4FinalEvalThread(QThread):
+    finished_ok = pyqtSignal(pd.DataFrame, list, list, dict, str); error = pyqtSignal(str)
+    def __init__(self, config): super().__init__(); self.config = config
+    def run(self):
+        try:
+            from ultralytics import YOLO
+            c = self.config
+            model = YOLO(str(c["retrained_model"]))
+            
+            val_metrics = model.val(
+                data=str(c["yaml_path"]), 
+                conf=c["eval_conf"], 
+                iou=c["eval_iou"], 
+                max_det=c["max_det"],
+                project=str(Path(c["workspace_dir"]) / "runs" / "eval"),
+                name=c["eval_run_name"] + "_val"
+            )
+            pr_curve = str(Path(val_metrics.save_dir) / "PR_curve.png")
+            
+            eval_config = c.copy()
+            eval_config["eval_model_path"] = c["retrained_model"]
+            eval_config["eval_run_name"] = c["eval_run_name"] + "_final_eval"
+            eval_config["save_relabel"] = False
+            
+            del model; clear_vram()
+            eval_thread = EvalThread(eval_config)
+            eval_thread.finished_ok.connect(lambda df, imgs, a_imgs, st: self.finished_ok.emit(df, imgs, a_imgs, st, pr_curve))
+            eval_thread.error.connect(self.error.emit)
+            eval_thread.run()
+        except Exception as e:
+            c = self.config
+            if c.get("webhook_url") and c.get("noti_flags", {}).get("error"):
+                send_discord_webhook(c["webhook_url"], f"❌ **[재학습 평가 에러 발생]**\n에러내용:\n{str(e)[:500]}")
+            self.error.emit(traceback.format_exc())
+
+class MeasureThread(QThread):
+    progress = pyqtSignal(int); log_msg = pyqtSignal(str); finished_ok = pyqtSignal(pd.DataFrame, pd.DataFrame, pd.DataFrame, list); error = pyqtSignal(str)
+    
+    COLOR_MAP = {
+        "노란색 (Yellow)": (0, 255, 255), "초록색 (Green)": (0, 255, 0), "빨간색 (Red)": (0, 0, 255),
+        "파란색 (Blue)": (255, 0, 0), "청록색 (Cyan)": (255, 255, 0), "자주색 (Magenta)": (255, 0, 255), "흰색 (White)": (255, 255, 255)
+    }
+
+    def __init__(self, config): super().__init__(); self.config = config
+    def run(self):
+        try:
+            from ultralytics import YOLO
+            c = self.config; dist_source = Path(c["dist_source"])
+            is_edge, is_knn = c["measure_method"] == "테두리 최단거리 (Edge)", c["measure_method"] == "가장 가까운 N개 이웃 (방향 무관)"
+            
+            c1 = self.COLOR_MAP.get(c.get("color1", "노란색 (Yellow)"), (0, 255, 255))
+            c2 = self.COLOR_MAP.get(c.get("color2", "청록색 (Cyan)"), (255, 255, 0))
+            
+            dist_run_name = "ok_edge_distance" if is_edge else "ok_knn_distance" if is_knn else "ok_euclidean_distance"
+            dist_col_name = "수평/수직 테두리 거리(px)" if is_edge else "최단 중심점 거리_N개(px)" if is_knn else "중심점 간 유클리드 거리(px)"
+
+            base_dir = Path(c["workspace_dir"]) / "runs" / "measure"; base_dir.mkdir(parents=True, exist_ok=True)
+            folder_idx = 1
+            while (base_dir / f"{dist_run_name}_{folder_idx:02d}").exists(): folder_idx += 1
+            final_save_dir = base_dir / f"{dist_run_name}_{folder_idx:02d}"; final_save_dir.mkdir()
+
+            model = YOLO(str(c["dist_model_path"]))
+            img_files = [f for f in dist_source.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png")]
+            total_imgs = len(img_files)
+
+            results = model.predict(source=str(dist_source), save=False, conf=c["dist_conf"], iou=c["dist_iou"], max_det=c["dist_max_det"], agnostic_nms=c["dist_agnostic"], stream=True)
+            image_pairs = []; processed = 0
+
+            for r in results:
+                processed += 1; self.progress.emit(int(processed / max(total_imgs, 1) * 100))
+                img_name = Path(r.path).name; result_img_path = final_save_dir / img_name
+                detected = [r.names[int(cls_id)].lower() for cls_id in r.boxes.cls]
+                if c["skip_ng"] and "ng" in detected: continue
+
+                num_objects = len(r.boxes)
+                if c["drop_odd_lowest"] and num_objects % 2 != 0 and num_objects > 0:
+                    r = r[[i for i in range(num_objects) if i != int(r.boxes.conf.argmin().item())]]
+                    num_objects = len(r.boxes)
+
+                plotted_img = r.plot(line_width=1, conf=False, labels=False)
+                measured_distances = []; worst_conf = r.boxes.conf.min().item() if num_objects > 0 else 0.0
+
+                if num_objects >= 2:
+                    boxes = r.boxes.xyxy.cpu().numpy()
+                    for i, b1 in enumerate(boxes):
+                        min_x = min_y = float("inf"); r_pts = b_pts = None; r_dist = b_dist = 0
+                        cx1, cy1 = (b1[0] + b1[2]) / 2, (b1[1] + b1[3]) / 2
+                        knn_cands = []
+
+                        for j, b2 in enumerate(boxes):
+                            if i == j: continue
+                            ox, oy = min(b1[2], b2[2]) - max(b1[0], b2[0]), min(b1[3], b2[3]) - max(b1[1], b2[1])
+                            cx2, cy2 = (b2[0] + b2[2]) / 2, (b2[1] + b2[3]) / 2
+                            dist = math.sqrt((cx2 - cx1)**2 + (cy2 - cy1)**2)
+
+                            if is_knn: knn_cands.append((dist, (int(cx1), int(cy1)), (int(cx2), int(cy2))))
+                            elif is_edge:
+                                if oy > 0 and b2[0] >= b1[2] and (b2[0] - b1[2]) < min_x:
+                                    min_x = r_dist = b2[0] - b1[2]
+                                    y_cen = int((max(b1[1], b2[1]) + min(b1[3], b2[3])) / 2)
+                                    r_pts = ((int(b1[2]), y_cen), (int(b2[0]), y_cen))
+                                if ox > 0 and b2[1] >= b1[3] and (b2[1] - b1[3]) < min_y:
+                                    min_y = b_dist = b2[1] - b1[3]
+                                    x_cen = int((max(b1[0], b2[0]) + min(b1[2], b2[2])) / 2)
+                                    b_pts = ((x_cen, int(b1[3])), (x_cen, int(b2[1])))
+                            else:
+                                if oy > 0 and cx2 > cx1 and dist < min_x: min_x = r_dist = dist; r_pts = ((int(cx1), int(cy1)), (int(cx2), int(cy2)))
+                                if ox > 0 and cy2 > cy1 and dist < min_y: min_y = b_dist = dist; b_pts = ((int(cx1), int(cy1)), (int(cx2), int(cy2)))
+
+                        if is_knn:
+                            for d, pt1, pt2 in sorted(knn_cands, key=lambda x: x[0])[:c["n_neighbors"]]:
+                                cv2.line(plotted_img, pt1, pt2, c1, 2); cv2.putText(plotted_img, f"{d:.1f}", (int((pt1[0]+pt2[0])/2), int((pt1[1]+pt2[1])/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c1, 2)
+                                measured_distances.append(round(d, 1))
+                        else:
+                            if r_pts:
+                                cv2.line(plotted_img, r_pts[0], r_pts[1], c1, 2); cv2.putText(plotted_img, f"{r_dist:.1f}", (int((r_pts[0][0]+r_pts[1][0])/2), int((r_pts[0][1]+r_pts[1][1])/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c1, 2)
+                                measured_distances.append(round(r_dist, 1))
+                            if b_pts:
+                                cv2.line(plotted_img, b_pts[0], b_pts[1], c2, 2); cv2.putText(plotted_img, f"{b_dist:.1f}", (int((b_pts[0][0]+b_pts[1][0])/2), int((b_pts[0][1]+b_pts[1][1])/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c2, 2)
+                                measured_distances.append(round(b_dist, 1))
+
+                cv2.imwrite(str(result_img_path), plotted_img)
+                image_pairs.append({
+                    "파일명": img_name, "탐지 수": f"{num_objects}개", "최저 신뢰도": round(worst_conf, 2),
+                    dist_col_name: ", ".join([str(d) for d in sorted(list(set(measured_distances)))]) if measured_distances else "측정된 선 없음",
+                    "_img_path": str(result_img_path)
+                })
+
+            df_export = pd.DataFrame([{k:v for k,v in item.items() if k!="_img_path"} for item in image_pairs])
+            df_export.to_csv(final_save_dir / f"{dist_run_name}_results.csv", index=False, encoding="utf-8-sig")
+            
+            thresholds = [float(x.strip()) for x in c["edge_thresholds"].split(",") if x.strip()] if is_edge else [60.0]
+            def get_cat(d, thr):
+                if d < thr[0]: return f"유형 1 ( < {thr[0]} )"
+                for i in range(len(thr)-1):
+                    if thr[i] <= d < thr[i+1]: return f"유형 {i+2} ( {thr[i]}~{thr[i+1]} )"
+                return f"유형 {len(thr)+1} ( >= {thr[-1]} )"
+
+            all_data = []
+            for _, row in df_export.iterrows():
+                dstr = str(row[dist_col_name])
+                if dstr != "nan" and "없음" not in dstr:
+                    for d in [float(x.strip()) for x in dstr.split(",")]:
+                        all_data.append({"파일명": row["파일명"], "구분": get_cat(d, thresholds) if is_edge else "유클리드", "거리(px)": d})
+            
+            df_parsed = pd.DataFrame(all_data); outliers_list = []
+            if not df_parsed.empty:
+                stats_list = []  
+                
+                for cat in df_parsed["구분"].unique():
+                    subset = df_parsed[df_parsed["구분"] == cat]
+                    Q1, Q3 = subset["거리(px)"].quantile(0.25), subset["거리(px)"].quantile(0.75); IQR = Q3 - Q1
+                    lo, hi = Q1 - 1.5*IQR, Q3 + 1.5*IQR
+                    outs = subset[(subset["거리(px)"] < lo) | (subset["거리(px)"] > hi)].copy()
+                    
+                    if not outs.empty:
+                        outs["하한"], outs["상한"] = round(lo, 2), round(hi, 2)
+                        outliers_list.append(outs)
+                    
+                    stats_list.append({
+                        "구분(유형)": cat,
+                        "데이터 수(Count)": len(subset),
+                        "평균(Mean)": round(subset["거리(px)"].mean(), 2),
+                        "표준편차(Std)": round(subset["거리(px)"].std(), 2) if len(subset) > 1 else 0.0,
+                        "최소값(Min)": round(subset["거리(px)"].min(), 2),
+                        "1사분위(Q1)": round(Q1, 2),
+                        "중앙값(Median)": round(subset["거리(px)"].median(), 2),
+                        "3사분위(Q3)": round(Q3, 2),
+                        "최대값(Max)": round(subset["거리(px)"].max(), 2),
+                        "IQR": round(IQR, 2),
+                        "정상 하한값(Lower Bounds)": round(lo, 2),
+                        "정상 상한값(Upper Bounds)": round(hi, 2),
+                        "이상치 개수": len(outs)
+                    })
+
+                df_stats = pd.DataFrame(stats_list)
+                df_stats.to_csv(final_save_dir / f"{dist_run_name}_statistics.csv", index=False, encoding="utf-8-sig")
+                
+                if outliers_list:
+                    pd.concat(outliers_list, ignore_index=True).to_csv(final_save_dir / f"{dist_run_name}_outliers.csv", index=False, encoding="utf-8-sig")
+
+            df_outliers = pd.concat(outliers_list, ignore_index=True) if outliers_list else pd.DataFrame()
+            
+            if c.get("webhook_url") and c.get("noti_flags", {}).get("task"):
+                send_discord_webhook(c["webhook_url"], f"📏 **[거리 측정 완료]**\n총 {len(df_export)}건 측정 (이상치 {len(df_outliers)}건 발견)")
+
+            del model; clear_vram()
+            self.finished_ok.emit(df_export, df_parsed, df_outliers, image_pairs)
+        except Exception as e:
+            c = self.config
+            if c.get("webhook_url") and c.get("noti_flags", {}).get("error"):
+                send_discord_webhook(c["webhook_url"], f"❌ **[거리 측정 에러 발생]**\n에러내용:\n{str(e)[:500]}")
+            self.error.emit(traceback.format_exc())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2.5 LABELING COMPONENTS (라벨링 기능)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LabelDialog(QDialog):
+    """박스를 그린 후 클래스를 선택하는 팝업"""
+    def __init__(self, class_names, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("클래스 선택")
+        self.class_id = -1
+        layout = QVBoxLayout(self)
+        
+        self.combo = QComboBox()
+        self.combo.addItems(class_names)
+        layout.addWidget(QLabel("객체의 클래스를 선택하세요:"))
+        layout.addWidget(self.combo)
+        
+        btn_layout = QHBoxLayout()
+        btn_ok = QPushButton("확인"); btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton("취소"); btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_ok); btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+
+    def get_class_index(self):
+        return self.combo.currentIndex()
+
+class LabelingView(QGraphicsView):
+    """이미지 위에 Bounding Box를 그리는 QGraphicsView"""
+    box_added = pyqtSignal(list)
+    request_prev = pyqtSignal()
+    request_next = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.scene = QGraphicsScene(self)
+        self.setScene(self.scene)
+        self.setRenderHint(QPainter.Antialiasing)
+        self.setMouseTracking(True)
+        self.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+
+        self.crosshair_color = QColor(255, 255, 255, 180)
+        self.image_item = None
+        self.current_rect_item = None
+        self.pending_rect_item = None
+        self.start_pos = None
+        
+        self.class_names = []
+        self.boxes = []
+        self.selected_indices = []
+        
+        self.undo_stack = []  
+        self.redo_stack = []  
+        self.pre_move_state = [] 
+
+        self.is_panning = False
+        self.last_mouse_pos = None
+        
+        self.is_moving_box = False
+        self.moving_box_data = None
+        self.move_start_pos = None
+        self.original_rect = None
+        
+        self.is_resizing_box = False
+        self.resize_handle = None
+        self.resize_target_data = None
+        
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def load_image(self, img_path, class_names):
+        self.scene.clear()
+        self.boxes.clear()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.pending_rect_item = None
+        self.current_rect_item = None
+        self.class_names = class_names
+        self.selected_indices = []
+        self.is_resizing_box = False
+        self.resize_handle = None
+        self.resize_target_data = None
+        self.current_image_path = img_path
+        
+        pixmap = QPixmap(img_path)
+        if pixmap.isNull(): return False
+        
+        self.image_item = QGraphicsPixmapItem(pixmap)
+        self.scene.addItem(self.image_item)
+        self.setSceneRect(0, 0, pixmap.width(), pixmap.height())
+        
+        self.h_line = QGraphicsLineItem()
+        self.v_line = QGraphicsLineItem()
+        pen = QPen(self.crosshair_color, 1, Qt.DashLine)
+        self.h_line.setPen(pen)
+        self.v_line.setPen(pen)
+        self.h_line.setZValue(9999)
+        self.v_line.setZValue(9999)
+        self.scene.addItem(self.h_line)
+        self.scene.addItem(self.v_line)
+        self.h_line.hide()
+        self.v_line.hide()
+
+        self.fitInView(self.sceneRect(), Qt.KeepAspectRatio)
+        return True
+
+    def get_resize_handle(self, pos, rect, margin=8):
+        if not rect.adjusted(-margin, -margin, margin, margin).contains(pos):
+            return None
+
+        left = abs(pos.x() - rect.left()) < margin
+        right = abs(pos.x() - rect.right()) < margin
+        top = abs(pos.y() - rect.top()) < margin
+        bottom = abs(pos.y() - rect.bottom()) < margin
+
+        if left and top: return 'TL'
+        if right and top: return 'TR'
+        if left and bottom: return 'BL'
+        if right and bottom: return 'BR'
+        if left and rect.top() <= pos.y() <= rect.bottom(): return 'L'
+        if right and rect.top() <= pos.y() <= rect.bottom(): return 'R'
+        if top and rect.left() <= pos.x() <= rect.right(): return 'T'
+        if bottom and rect.left() <= pos.x() <= rect.right(): return 'B'
+        return None
+
+    def save_state(self):
+        self.undo_stack.append(self.get_yolo_format())
+        self.redo_stack.clear()
+
+    def clear_boxes(self):
+        for rect_item, text_item, _ in self.boxes:
+            if rect_item.scene() == self.scene:
+                self.scene.removeItem(rect_item)
+            if text_item.scene() == self.scene:
+                self.scene.removeItem(text_item)
+        self.boxes.clear()
+        self.selected_indices = []
+
+    def apply_state(self, state):
+        self.clear_boxes()
+        if state:
+            self.load_existing_labels(state)
+        self.box_added.emit(self.get_yolo_format())
+
+    def wheelEvent(self, event):
+        if not self.image_item: return
+        zoom_in_factor = 1.15
+        zoom_out_factor = 1 / zoom_in_factor
+        
+        old_pos = self.mapToScene(event.pos())
+        if event.angleDelta().y() > 0:
+            zoom_factor = zoom_in_factor
+        else:
+            zoom_factor = zoom_out_factor
+            
+        self.scale(zoom_factor, zoom_factor)
+        new_pos = self.mapToScene(event.pos())
+        
+        delta = new_pos - old_pos
+        self.translate(delta.x(), delta.y())
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton: 
+            self.is_panning = True
+            self.last_mouse_pos = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+        elif event.button() == Qt.MiddleButton and self.image_item: 
+            pos = self.mapToScene(event.pos())
+            for b in reversed(self.boxes):
+                if b[0].rect().contains(pos): 
+                    self.pre_move_state = self.get_yolo_format()
+                    self.is_moving_box = True
+                    self.moving_box_data = b
+                    self.move_start_pos = pos
+                    self.original_rect = b[0].rect()
+                    self.setCursor(Qt.ClosedHandCursor)
+                    break
+        elif event.button() == Qt.LeftButton and self.image_item: 
+            if self.resize_handle and self.resize_target_data:
+                self.pre_move_state = self.get_yolo_format()
+                self.is_resizing_box = True
+                self.original_rect = self.resize_target_data[0].rect()
+            else:
+                if self.pending_rect_item: 
+                    self.scene.removeItem(self.pending_rect_item)
+                    self.pending_rect_item = None
+                    
+                self.start_pos = self.mapToScene(event.pos())
+                self.current_rect_item = QGraphicsRectItem()
+                self.current_rect_item.setPen(QPen(Qt.red, 2, Qt.SolidLine))
+                self.scene.addItem(self.current_rect_item)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        cur_pos = self.mapToScene(event.pos())
+
+        if self.image_item and hasattr(self, 'h_line'):
+            if self.sceneRect().contains(cur_pos):
+                self.h_line.setLine(0, cur_pos.y(), self.sceneRect().width(), cur_pos.y())
+                self.v_line.setLine(cur_pos.x(), 0, cur_pos.x(), self.sceneRect().height())
+                self.h_line.show()
+                self.v_line.show()
+            else:
+                self.h_line.hide()
+                self.v_line.hide()
+
+        if not (event.buttons() & Qt.LeftButton) and not (event.buttons() & Qt.MiddleButton) and not (event.buttons() & Qt.RightButton):
+            cursor = Qt.CrossCursor
+            self.resize_target_data = None
+            self.resize_handle = None
+            
+            for b in reversed(self.boxes):
+                rect = b[0].rect()
+                handle = self.get_resize_handle(cur_pos, rect)
+                if handle:
+                    self.resize_target_data = b
+                    self.resize_handle = handle
+                    if handle in ('TL', 'BR'): cursor = Qt.SizeFDiagCursor
+                    elif handle in ('TR', 'BL'): cursor = Qt.SizeBDiagCursor
+                    elif handle in ('L', 'R'): cursor = Qt.SizeHorCursor
+                    elif handle in ('T', 'B'): cursor = Qt.SizeVerCursor
+                    break
+            
+            self.viewport().setCursor(cursor)
+
+        if self.is_panning:
+            delta = event.pos() - self.last_mouse_pos
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            self.last_mouse_pos = event.pos()
+        elif self.is_moving_box and self.moving_box_data: 
+            delta = cur_pos - self.move_start_pos
+            new_rect = self.original_rect.translated(delta.x(), delta.y())
+
+            new_x = max(0, min(new_rect.x(), self.sceneRect().width() - new_rect.width()))
+            new_y = max(0, min(new_rect.y(), self.sceneRect().height() - new_rect.height()))
+            new_rect.moveTo(new_x, new_y)
+
+            self.moving_box_data[0].setRect(new_rect)
+            self.moving_box_data[1].setPos(new_rect.topLeft())
+        elif self.is_resizing_box and self.resize_target_data: 
+            rect = QRectF(self.original_rect)
+            
+            if 'L' in self.resize_handle:
+                rect.setLeft(min(cur_pos.x(), rect.right() - 5))
+            if 'R' in self.resize_handle:
+                rect.setRight(max(cur_pos.x(), rect.left() + 5))
+            if 'T' in self.resize_handle:
+                rect.setTop(min(cur_pos.y(), rect.bottom() - 5))
+            if 'B' in self.resize_handle:
+                rect.setBottom(max(cur_pos.y(), rect.top() + 5))
+                
+            self.resize_target_data[0].setRect(rect)
+            self.resize_target_data[1].setPos(rect.topLeft())
+        elif self.start_pos and self.current_rect_item:
+            rect = QRectF(self.start_pos, cur_pos).normalized()
+            rect = rect.intersected(self.sceneRect())
+            self.current_rect_item.setRect(rect)
+            
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self.is_panning = False
+            self.viewport().setCursor(Qt.CrossCursor)
+        elif event.button() == Qt.MiddleButton and self.is_moving_box: 
+            self.is_moving_box = False
+            self.moving_box_data = None
+            self.viewport().setCursor(Qt.CrossCursor)
+            
+            current_state = self.get_yolo_format()
+            if self.pre_move_state != current_state:
+                self.undo_stack.append(self.pre_move_state)
+                self.redo_stack.clear()
+            self.box_added.emit(current_state)
+            
+        elif event.button() == Qt.LeftButton:
+            if self.is_resizing_box:
+                self.is_resizing_box = False
+                current_state = self.get_yolo_format()
+                if self.pre_move_state != current_state:
+                    self.undo_stack.append(self.pre_move_state)
+                    self.redo_stack.clear()
+                self.box_added.emit(current_state)
+                self.resize_target_data = None
+                self.resize_handle = None
+            elif self.current_rect_item:
+                rect = self.current_rect_item.rect()
+                if rect.width() > 5 and rect.height() > 5:
+                    self.pending_rect_item = self.current_rect_item
+                    self.pending_rect_item.setPen(QPen(Qt.yellow, 2, Qt.DashLine))
+                else:
+                    self.scene.removeItem(self.current_rect_item)
+                    
+                self.current_rect_item = None
+                self.start_pos = None
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event):
+        if hasattr(self, 'h_line'):
+            self.h_line.hide()
+            self.v_line.hide()
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_A:
+            self.request_prev.emit()
+        elif event.key() == Qt.Key_D:
+            self.request_next.emit()
+        elif event.key() == Qt.Key_Q:
+            if self.pending_rect_item:
+                self.scene.removeItem(self.pending_rect_item)
+                self.pending_rect_item = None
+            elif self.undo_stack:
+                current_state = self.get_yolo_format()
+                self.redo_stack.append(current_state)
+                prev_state = self.undo_stack.pop()
+                self.apply_state(prev_state)
+        elif event.key() == Qt.Key_E:
+            if self.redo_stack:
+                current_state = self.get_yolo_format()
+                self.undo_stack.append(current_state)
+                next_state = self.redo_stack.pop()
+                self.apply_state(next_state)
+        elif event.key() == Qt.Key_S:
+            if self.pending_rect_item and len(self.class_names) > 0:
+                self.finalize_pending_box(0)
+        elif event.key() == Qt.Key_W:
+            if self.pending_rect_item and len(self.class_names) > 1:
+                self.finalize_pending_box(1)
+        elif event.key() == Qt.Key_Escape:
+            if self.pending_rect_item:
+                self.scene.removeItem(self.pending_rect_item)
+                self.pending_rect_item = None
+        elif event.key() in (Qt.Key_Space, Qt.Key_Return):
+            if self.pending_rect_item:
+                dialog = LabelDialog(self.class_names, self)
+                if dialog.exec_() == QDialog.Accepted:
+                    self.finalize_pending_box(dialog.get_class_index())
+                else:
+                    self.scene.removeItem(self.pending_rect_item)
+                    self.pending_rect_item = None
+        else:
+            super().keyPressEvent(event)
+
+    def finalize_pending_box(self, class_id):
+        if not self.pending_rect_item: return
+        self.save_state()
+        class_name = self.class_names[class_id]
+        color = Qt.green if class_id == 0 else Qt.red
+        self.pending_rect_item.setPen(QPen(color, 2, Qt.SolidLine))
+        
+        text_item = self.scene.addText(class_name, QFont("Arial", 12, QFont.Bold))
+        text_item.setDefaultTextColor(color)
+        text_item.setPos(self.pending_rect_item.rect().topLeft())
+        
+        self.boxes.append((self.pending_rect_item, text_item, class_id))
+        self.box_added.emit(self.get_yolo_format())
+        self.pending_rect_item = None
+
+    def get_yolo_format(self):
+        if not self.image_item: return []
+        img_w = self.sceneRect().width()
+        img_h = self.sceneRect().height()
+        yolo_data = []
+        for rect_item, text_item, class_id in self.boxes:
+            rect = rect_item.rect()
+            x_center = (rect.x() + rect.width() / 2) / img_w
+            y_center = (rect.y() + rect.height() / 2) / img_h
+            norm_w = rect.width() / img_w
+            norm_h = rect.height() / img_h
+            yolo_data.append(f"{class_id} {x_center:.6f} {y_center:.6f} {norm_w:.6f} {norm_h:.6f}")
+        return yolo_data
+    
+    def set_crosshair_color(self, qcolor):
+        self.crosshair_color = qcolor
+        if hasattr(self, 'h_line') and hasattr(self, 'v_line'):
+            pen = QPen(self.crosshair_color, 1, Qt.DashLine)
+            self.h_line.setPen(pen)
+            self.v_line.setPen(pen)
+    
+    def load_existing_labels(self, yolo_lines):
+        if not self.image_item: return
+        img_w = self.sceneRect().width()
+        img_h = self.sceneRect().height()
+        
+        for line in yolo_lines:
+            parts = line.split()
+            if len(parts) == 5:
+                try:
+                    class_id = int(parts[0])
+                    x_center, y_center, norm_w, norm_h = map(float, parts[1:5])
+                    
+                    w, h = norm_w * img_w, norm_h * img_h
+                    x, y = (x_center * img_w) - (w / 2), (y_center * img_h) - (h / 2)
+                    
+                    rect = QRectF(x, y, w, h)
+                    rect_item = QGraphicsRectItem(rect)
+                    
+                    color = Qt.green if class_id == 0 else Qt.red
+                    rect_item.setPen(QPen(color, 2, Qt.SolidLine))
+                    
+                    class_name = self.class_names[class_id] if 0 <= class_id < len(self.class_names) else f"Class {class_id}"
+                    text_item = self.scene.addText(class_name, QFont("Arial", 12, QFont.Bold))
+                    text_item.setDefaultTextColor(color)
+                    text_item.setPos(rect.topLeft())
+                    
+                    self.scene.addItem(rect_item)
+                    self.boxes.append((rect_item, text_item, class_id))
+                except Exception as e:
+                    print(f"라벨 파싱 오류: {e}")
+                    
+        self.box_added.emit(self.get_yolo_format())
+
+    def delete_boxes(self, indices):
+        if not indices: return
+        self.save_state()
+        for index in sorted(indices, reverse=True):
+            if 0 <= index < len(self.boxes):
+                rect_item, text_item, _ = self.boxes.pop(index)
+                self.scene.removeItem(rect_item)
+                self.scene.removeItem(text_item)
+        self.box_added.emit(self.get_yolo_format())
+
+    def update_boxes_class(self, indices, new_class_id):
+        if not indices: return
+        self.save_state()
+        for index in indices:
+            if 0 <= index < len(self.boxes):
+                rect_item, text_item, _ = self.boxes[index]
+                class_name = self.class_names[new_class_id]
+                color = Qt.green if new_class_id == 0 else Qt.red
+                
+                rect_item.setPen(QPen(color, 2, Qt.SolidLine))
+                text_item.setPlainText(class_name)
+                text_item.setDefaultTextColor(color)
+                self.boxes[index] = (rect_item, text_item, new_class_id)
+        self.box_added.emit(self.get_yolo_format())
+
+    def select_boxes(self, indices):
+        for i, (rect_item, text_item, class_id) in enumerate(self.boxes):
+            color = Qt.green if class_id == 0 else Qt.red
+            rect_item.setPen(QPen(color, 2, Qt.SolidLine))
+            text_item.setDefaultTextColor(color)
+
+        self.selected_indices = indices
+
+        for idx in self.selected_indices:
+            if 0 <= idx < len(self.boxes):
+                rect_item, text_item, class_id = self.boxes[idx]
+                highlight_color = Qt.cyan
+                rect_item.setPen(QPen(highlight_color, 4, Qt.SolidLine))
+                text_item.setDefaultTextColor(highlight_color)
+
+    def auto_label_similar(self, threshold, nms_threshold):
+        if not hasattr(self, 'selected_indices') or len(self.selected_indices) != 1:
+            return False, "자동 찾기를 위해 기준 박스를 정확히 1개만 클릭하여 선택해주세요."
+            
+        idx = self.selected_indices[0]
+        if idx < 0 or idx >= len(self.boxes):
+            return False, "유효하지 않은 선택입니다."
+            
+        if not self.image_item or not hasattr(self, 'current_image_path'):
+            return False, "이미지가 로드되지 않았습니다."
+
+        import cv2
+        import numpy as np
+
+        img = cv2.imread(str(self.current_image_path))
+        if img is None: 
+            return False, "이미지를 읽을 수 없습니다."
+
+        rect_item, _, class_id = self.boxes[idx]
+        r = rect_item.rect()
+        x, y, w, h = int(r.x()), int(r.y()), int(r.width()), int(r.height())
+
+        if w < 5 or h < 5 or x < 0 or y < 0 or x+w > img.shape[1] or y+h > img.shape[0]:
+            return False, "선택한 박스의 크기나 위치가 유효하지 않습니다."
+
+        template = img[y:y+h, x:x+w].copy() 
+        
+        try:
+            res = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
+            loc = np.where(res >= threshold)
+
+            cand_boxes = []
+            scores = []
+            for pt in zip(*loc[::-1]): 
+                cand_boxes.append([pt[0], pt[1], w, h]) 
+                scores.append(float(res[pt[1], pt[0]]))
+
+            if not cand_boxes: return True, 0 
+
+            indices = cv2.dnn.NMSBoxes(cand_boxes, scores, threshold, nms_threshold)
+            flat_indices = np.array(indices).flatten() if len(indices) > 0 else []
+
+            existing_boxes = [(int(b[0].rect().x()), int(b[0].rect().y()), int(b[0].rect().width()), int(b[0].rect().height())) for b in self.boxes]
+            self.save_state() 
+            added_count = 0
+
+            for idx in flat_indices:
+                nx, ny, nw, nh = cand_boxes[int(idx)]
+                cx, cy = nx + nw/2, ny + nh/2
+                is_dup = False
+                for ex, ey, ew, eh in existing_boxes:
+                    ecx, ecy = ex + ew/2, ey + eh/2
+                    if abs(cx - ecx) < nw/2 and abs(cy - ecy) < nh/2:
+                        is_dup = True; break
+                if is_dup: continue
+
+                new_rect = QRectF(nx, ny, nw, nh)
+                new_rect_item = QGraphicsRectItem(new_rect)
+                color = Qt.green if class_id == 0 else Qt.red
+                new_rect_item.setPen(QPen(color, 2, Qt.SolidLine))
+
+                class_name = self.class_names[class_id]
+                text_item = self.scene.addText(class_name, QFont("Arial", 12, QFont.Bold))
+                text_item.setDefaultTextColor(color)
+                text_item.setPos(new_rect.topLeft())
+
+                self.scene.addItem(new_rect_item)
+                self.boxes.append((new_rect_item, text_item, class_id))
+                added_count += 1
+
+            if added_count > 0: self.box_added.emit(self.get_yolo_format()) 
+            return True, added_count
+        finally:
+            del template
+            if 'res' in locals(): del res
+
+    def save_all_templates(self):
+        if not self.image_item or not hasattr(self, 'current_image_path'):
+            return False
+        import cv2
+        img = cv2.imread(str(self.current_image_path))
+        if img is None: return False
+
+        self.saved_templates = []
+        for rect_item, _, class_id in self.boxes:
+            r = rect_item.rect()
+            x, y, w, h = int(r.x()), int(r.y()), int(r.width()), int(r.height())
+            
+            if w < 5 or h < 5 or x < 0 or y < 0 or x+w > img.shape[1] or y+h > img.shape[0]:
+                continue
+                
+            template = img[y:y+h, x:x+w].copy()
+            self.saved_templates.append({'template': template, 'class_id': class_id, 'w': w, 'h': h})
+        return len(self.saved_templates) > 0
+
+    def auto_label_from_saved_templates(self, threshold, nms_threshold):
+        if not hasattr(self, 'saved_templates') or not self.saved_templates:
+            return False, "저장된 기준 객체가 없습니다."
+        if not self.image_item or not hasattr(self, 'current_image_path'):
+            return False, "이미지가 로드되지 않았습니다."
+
+        import cv2
+        import numpy as np
+
+        img = cv2.imread(str(self.current_image_path))
+        if img is None: return False, "이미지를 읽을 수 없습니다."
+
+        self.save_state()
+        total_added = 0
+
+        for tmpl_data in self.saved_templates:
+            template = tmpl_data['template']
+            class_id = tmpl_data['class_id']
+            w, h = tmpl_data['w'], tmpl_data['h']
+
+            res = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
+            loc = np.where(res >= threshold)
+
+            cand_boxes = []
+            scores = []
+            for pt in zip(*loc[::-1]):
+                cand_boxes.append([pt[0], pt[1], w, h])
+                scores.append(float(res[pt[1], pt[0]]))
+
+            if not cand_boxes: continue
+
+            indices = cv2.dnn.NMSBoxes(cand_boxes, scores, threshold, nms_threshold)
+            flat_indices = np.array(indices).flatten() if len(indices) > 0 else []
+            existing_boxes = [(int(b[0].rect().x()), int(b[0].rect().y()), int(b[0].rect().width()), int(b[0].rect().height())) for b in self.boxes]
+
+            for idx in flat_indices:
+                nx, ny, nw, nh = cand_boxes[int(idx)]
+                cx, cy = nx + nw/2, ny + nh/2
+                
+                is_dup = False
+                for ex, ey, ew, eh in existing_boxes:
+                    ecx, ecy = ex + ew/2, ey + eh/2
+                    if abs(cx - ecx) < nw/2 and abs(cy - ecy) < nh/2:
+                        is_dup = True; break
+                if is_dup: continue
+
+                new_rect = QRectF(nx, ny, nw, nh)
+                new_rect_item = QGraphicsRectItem(new_rect)
+                color = Qt.green if class_id == 0 else Qt.red
+                new_rect_item.setPen(QPen(color, 2, Qt.SolidLine))
+
+                class_name = self.class_names[class_id]
+                text_item = self.scene.addText(class_name, QFont("Arial", 12, QFont.Bold))
+                text_item.setDefaultTextColor(color)
+                text_item.setPos(new_rect.topLeft())
+
+                self.scene.addItem(new_rect_item)
+                self.boxes.append((new_rect_item, text_item, class_id))
+                existing_boxes.append((int(nx), int(ny), int(nw), int(nh)))
+                total_added += 1
+
+        if total_added > 0: self.box_added.emit(self.get_yolo_format()) 
+        return True, total_added
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. GUI COMPONENTS & MAIN WINDOW
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PathInputWidget(QWidget):
+    def __init__(self, label, is_folder=True, default_path=""):
+        super().__init__()
+        self.is_folder = is_folder
+        layout = QHBoxLayout(); layout.setContentsMargins(0, 0, 0, 0)
+        self.line_edit = QLineEdit(default_path)
+        self.btn = QPushButton("📂"); self.btn.clicked.connect(self.browse)
+        layout.addWidget(QLabel(label)); layout.addWidget(self.line_edit); layout.addWidget(self.btn)
+        self.setLayout(layout)
+    def browse(self):
+        path = QFileDialog.getExistingDirectory(self, "폴더 선택", self.line_edit.text()) if self.is_folder else \
+               QFileDialog.getOpenFileName(self, "파일 선택", self.line_edit.text(), "PyTorch Model (*.pt);;All Files (*)")[0]
+        if path: self.line_edit.setText(path)
+    def get_path(self): return self.line_edit.text()
+
+class ImagePreviewDialog(QDialog):
+    def __init__(self, image_paths, start_index, parent=None):
+        super().__init__(parent)
+        self.image_paths = image_paths
+        self.current_index = start_index
+        self.original_pixmap = None  
+        self.scale_factor = 1.0     
+        self.is_panning = False
+        self.last_mouse_pos = None
+
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(10, 10, 10, 10)
+        
+        self.filename_edit = QLineEdit()
+        self.filename_edit.setReadOnly(True) 
+        self.filename_edit.setStyleSheet("background: transparent; border: none; font-size: 14px; font-weight: bold; color: #333;")
+        self.filename_edit.setFocusPolicy(Qt.ClickFocus)
+        self.layout.addWidget(self.filename_edit)
+        
+        help_lbl = QLabel("⬅️ ➡️ 방향키: 이전/다음 | 🖱️ 마우스 휠: 확대/축소 | ✋ 클릭 후 드래그: 화면 이동")
+        help_lbl.setStyleSheet("color: #666; font-size: 11px;")
+        self.layout.addWidget(help_lbl)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFocusPolicy(Qt.NoFocus)
+
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setCursor(Qt.OpenHandCursor)
+        self.scroll.setWidget(self.image_label)
+        self.layout.addWidget(self.scroll)
+
+        self.image_label.installEventFilter(self)
+
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.load_image()
+        self.setFocus()
+
+    def load_image(self):
+        if not (0 <= self.current_index < len(self.image_paths)): return
+        path = self.image_paths[self.current_index]
+        file_name = Path(path).name
+        self.setWindowTitle(f"이미지 상세 보기 ({self.current_index + 1}/{len(self.image_paths)})")
+        self.filename_edit.setText(file_name)
+        self.original_pixmap = QPixmap(path)
+
+        if not self.original_pixmap.isNull():
+            screen_geo = QApplication.primaryScreen().availableGeometry()
+            max_w, max_h = screen_geo.width() - 100, screen_geo.height() - 150
+            img_w, img_h = self.original_pixmap.width(), self.original_pixmap.height()
+
+            if img_w > max_w or img_h > max_h:
+                self.scale_factor = min(max_w / img_w, max_h / img_h)
+            else:
+                self.scale_factor = 1.0 
+
+            self.update_image_display()
+            target_w, target_h = int(img_w * self.scale_factor) + 40, int(img_h * self.scale_factor) + 100
+            self.resize(target_w, target_h)
+
+    def update_image_display(self):
+        if self.original_pixmap and not self.original_pixmap.isNull():
+            new_w = int(self.original_pixmap.width() * self.scale_factor)
+            new_h = int(self.original_pixmap.height() * self.scale_factor)
+            scaled_pix = self.original_pixmap.scaled(new_w, new_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.image_label.setPixmap(scaled_pix)
+
+    def wheelEvent(self, event):
+        if self.original_pixmap is None or self.original_pixmap.isNull(): return
+        h_bar, v_bar = self.scroll.horizontalScrollBar(), self.scroll.verticalScrollBar()
+        h_ratio = h_bar.value() / h_bar.maximum() if h_bar.maximum() > 0 else 0
+        v_ratio = v_bar.value() / v_bar.maximum() if v_bar.maximum() > 0 else 0
+
+        if event.angleDelta().y() > 0: self.scale_factor *= 1.15
+        elif event.angleDelta().y() < 0: self.scale_factor /= 1.15
+
+        self.scale_factor = max(0.05, min(self.scale_factor, 10.0))
+        self.update_image_display()
+        h_bar.setValue(int(h_bar.maximum() * h_ratio))
+        v_bar.setValue(int(v_bar.maximum() * v_ratio))
+
+    def eventFilter(self, source, event):
+        if source == self.image_label:
+            if event.type() == event.MouseButtonPress and event.button() == Qt.LeftButton:
+                self.is_panning = True
+                self.last_mouse_pos = event.globalPos()
+                self.image_label.setCursor(Qt.ClosedHandCursor)
+                return True
+            elif event.type() == event.MouseMove and self.is_panning:
+                current_pos = event.globalPos()
+                delta = current_pos - self.last_mouse_pos
+                self.last_mouse_pos = current_pos
+                self.scroll.horizontalScrollBar().setValue(self.scroll.horizontalScrollBar().value() - delta.x())
+                self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().value() - delta.y())
+                return True
+            elif event.type() == event.MouseButtonRelease and event.button() == Qt.LeftButton:
+                self.is_panning = False
+                self.image_label.setCursor(Qt.OpenHandCursor)
+                return True
+        return super().eventFilter(source, event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Left:
+            if self.current_index > 0: self.current_index -= 1; self.load_image()
+        elif event.key() == Qt.Key_Right:
+            if self.current_index < len(self.image_paths) - 1: self.current_index += 1; self.load_image()
+        else:
+            super().keyPressEvent(event)
+
+class ClickableLabel(QLabel):
+    clicked = pyqtSignal(str)
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("클릭하면 원본 크기로 확대됩니다.")
+        self.setAlignment(Qt.AlignCenter) 
+        
+        self.original_pixmap = QPixmap(path)
+        self.setMinimumSize(150, 150) 
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def resizeEvent(self, event):
+        if hasattr(self, 'original_pixmap') and not self.original_pixmap.isNull():
+            scaled_pixmap = self.original_pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.setPixmap(scaled_pixmap)
+        super().resizeEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton: self.clicked.emit(self.path)
+
+    def hasHeightForWidth(self): return True
+
+    def heightForWidth(self, width):
+        if not self.original_pixmap.isNull() and self.original_pixmap.width() > 0:
+            return int(width * (self.original_pixmap.height() / self.original_pixmap.width()))
+        return width
+
+    def sizeHint(self): return QSize(400, self.heightForWidth(400))
+
+class ImageGridWidget(QWidget):
+    def __init__(self, max_display=100):
+        super().__init__()
+        self.max_display = max_display
+        self.current_page = 0
+        self.all_image_paths = []
+        self.current_images = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.page_controls = QWidget()
+        pc_layout = QHBoxLayout(self.page_controls)
+        pc_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.btn_prev = QPushButton("◀ 이전")
+        self.btn_prev.clicked.connect(self.prev_page)
+        
+        self.lbl_page = QLabel("1 / 1 페이지 (총 0장)")
+        self.lbl_page.setAlignment(Qt.AlignCenter)
+        
+        self.btn_next = QPushButton("다음 ▶")
+        self.btn_next.clicked.connect(self.next_page)
+        
+        pc_layout.addWidget(self.btn_prev)
+        pc_layout.addWidget(self.lbl_page)
+        pc_layout.addWidget(self.btn_next)
+        
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.container = QWidget()
+        self.grid = QGridLayout(self.container)
+        self.grid.setSpacing(15)
+        self.scroll.setWidget(self.container)
+        
+        layout.addWidget(self.page_controls)
+        layout.addWidget(self.scroll)
+
+    def update_images(self, image_paths):
+        self.all_image_paths = image_paths
+        self.current_page = 0
+        self.show_page()
+
+    def show_page(self):
+        total_items = len(self.all_image_paths)
+        total_pages = max(1, math.ceil(total_items / self.max_display))
+        self.lbl_page.setText(f"{self.current_page + 1} / {total_pages} 페이지 (총 {total_items}장)")
+        
+        self.btn_prev.setEnabled(self.current_page > 0)
+        self.btn_next.setEnabled(self.current_page < total_pages - 1)
+        
+        start_idx = self.current_page * self.max_display
+        end_idx = start_idx + self.max_display
+        self.current_images = self.all_image_paths[start_idx:end_idx]
+        
+        for i in reversed(range(self.grid.count())): 
+            widget = self.grid.itemAt(i).widget()
+            if widget: widget.setParent(None)
+            
+        for i in range(self.grid.rowCount()): self.grid.setRowStretch(i, 0)
+        for i in range(self.grid.columnCount()): self.grid.setColumnStretch(i, 0)
+            
+        self.grid.setColumnStretch(0, 1)
+        self.grid.setColumnStretch(1, 1)
+            
+        for i, path in enumerate(self.current_images):
+            lbl = ClickableLabel(path)
+            lbl.clicked.connect(self.show_full_image)
+            self.grid.addWidget(lbl, i // 2, i % 2)
+
+        row_count = (len(self.current_images) + 1) // 2
+        self.grid.setRowStretch(row_count, 1)
+        self.scroll.verticalScrollBar().setValue(0)
+
+    def prev_page(self):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.show_page()
+
+    def next_page(self):
+        total_pages = math.ceil(len(self.all_image_paths) / self.max_display)
+        if self.current_page < total_pages - 1:
+            self.current_page += 1
+            self.show_page()
+
+    def show_full_image(self, path):
+        if path in self.current_images:
+            index = self.current_images.index(path)
+            dialog = ImagePreviewDialog(self.current_images, index, self)
+            dialog.exec_()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("YOLO Training Pipeline (PyQt5)")
+        self.resize(1400, 900)
+        import sys
+        if getattr(sys, 'frozen', False):
+            self.base_dir = Path(sys.executable).parent
+        else:
+            self.base_dir = Path(__file__).resolve().parent
+            
+        self.tmp_dir = self.base_dir / ".tmp"
+        self.tmp_dir.mkdir(exist_ok=True)
+        
+        default_proj_path = self.base_dir / "MyProject"
+        self.config_manager = ConfigManager(str(default_proj_path))
+        self.config_builder = ConfigBuilder()
+
+        self.training_process = None
+        self.init_ui()
+
+    def validate_paths(self, **paths):
+        """딕셔너리 형태로 전달받은 여러 경로들의 유효성을 한 번에 검증합니다."""
+        for name, path_obj in paths.items():
+            if not path_obj.exists():
+                return False, f"[{name}] 경로를 찾을 수 없습니다: {path_obj}"
+            if name.endswith('_file') and not path_obj.is_file():
+                return False, f"[{name}]은(는) 파일이어야 합니다: {path_obj}"
+            if name.endswith('_dir') and not path_obj.is_dir():
+                return False, f"[{name}]은(는) 폴더여야 합니다: {path_obj}"
+        return True, None
+
+    def closeEvent(self, event):
+        """메인 창이 닫힐 때 자식 스레드 및 멀티프로세스를 정리합니다."""
+        if self.training_process and self.training_process.is_alive():
+            self.stop_training()
+            self.training_process.join(timeout=3)
+            
+        for t_name in ["t1_thread", "t3_thread", "t4_thread", "t5_thread"]:
+            if hasattr(self, t_name):
+                th = getattr(self, t_name)
+                if th and th.isRunning():
+                    th.quit()
+                    th.wait(2000)
+        self.settings.setValue("webhook_url", self.w_webhook.text())
+        event.accept()
+
+    def sync_base_paths(self, new_path):
+        base_dir = Path(new_path)
+        if hasattr(self, 't6_img_dir'): self.t6_img_dir.line_edit.setText(str(base_dir / "image"))
+        if hasattr(self, 't6_lbl_dir'): self.t6_lbl_dir.line_edit.setText(str(base_dir / "data"))
+
+    def sync_proc_paths(self, new_path):
+        proc_dir = Path(new_path)
+        if hasattr(self, 't3_img'): self.t3_img.line_edit.setText(str(proc_dir / "images"))
+        if hasattr(self, 't3_lbl'): self.t3_lbl.line_edit.setText(str(proc_dir / "labels"))
+        if hasattr(self, 't4_orig'): self.t4_orig.line_edit.setText(str(proc_dir / "labels"))
+        if hasattr(self, 't5_img'): self.t5_img.line_edit.setText(str(proc_dir / "images"))
+
+    def sync_project_root(self, new_path):
+        proj_dir = Path(new_path)
+        self.w_base_ds.line_edit.setText(str(proj_dir / "dataset"))
+        self.w_proc_ds.line_edit.setText(str(proj_dir / "processed_dataset"))
+        self.w_work_ds.line_edit.setText(str(proj_dir / "workspace"))
+        self.config_manager.update_workspace_path(str(proj_dir / "workspace"))
+
+    def parse_and_validate_class_map(self, text):
+        import re
+        cmap = {}
+        lines = [line.strip() for line in text.strip().split('\n') if line.strip()]
+        if not lines: return False, "클래스명을 하나 이상 입력해주세요. (예:\nOK\nNG)"
+            
+        for idx, line in enumerate(lines):
+            if not re.match(r'^([a-zA-Z0-9가-힣_-]+)$', line):
+                return False, f"잘못된 클래스명이 포함되어 있습니다: '{line}'\n(띄어쓰기 없이 영문, 숫자, 한글, -, _ 만 사용 가능합니다.)"
+            if line in cmap:
+                return False, f"클래스명 '{line}'이(가) 중복 입력되었습니다."
+            cmap[line] = idx
+        return True, cmap
+
+    def scan_classes_from_data(self):
+        import json
+        base_dir = Path(self.w_base_ds.get_path())
+        lbl_dir = base_dir / "data"
+        
+        is_valid, err = self.validate_paths(라벨폴더_dir=lbl_dir)
+        if not is_valid:
+            QMessageBox.warning(self, "경로 오류", err); return
+            
+        found_classes = set()
+        for json_file in lbl_dir.glob("*.json"):
+            try:
+                data = json.loads(json_file.read_text(encoding="utf-8"))
+                for item in data.get("area", []):
+                    if isinstance(item, dict) and len(item) == 1:
+                        found_classes.add(list(item.keys())[0])
+            except Exception: continue
+                
+        classes_txt = lbl_dir / "classes.txt"
+        if classes_txt.exists():
+            for line in classes_txt.read_text(encoding="utf-8").splitlines():
+                if line.strip(): found_classes.add(line.strip())
+                
+        if found_classes:
+            sorted_classes = "\n".join(sorted(list(found_classes)))
+            self.t1_class_map.setPlainText(sorted_classes)
+            if hasattr(self, 't6_class_map'): self.t6_class_map.setPlainText(sorted_classes)
+            self.statusBar().showMessage(f"🔍 스캔 완료: {len(found_classes)}개의 클래스를 찾았습니다.", 4000)
+        else:
+            QMessageBox.warning(self, "스캔 결과", "데이터에서 클래스 이름을 찾지 못했습니다.\n수동으로 입력해주세요.")
+
+    def bind_default(self, widget, default_val, label_widget):
+        widget.setProperty("default_val", default_val)
+        def update_lbl(*args):
+            val = None
+            if isinstance(widget, (QSpinBox, QDoubleSpinBox)): val = widget.value()
+            elif isinstance(widget, QComboBox): val = widget.currentText()
+            elif isinstance(widget, QTextEdit): val = widget.toPlainText()
+            elif isinstance(widget, QLineEdit): val = widget.text()
+            elif isinstance(widget, QCheckBox): val = widget.isChecked()
+            
+            is_def = False
+            if isinstance(val, float) and isinstance(default_val, float):
+                is_def = math.isclose(val, default_val, abs_tol=1e-5)
+            elif isinstance(val, str) and isinstance(default_val, str):
+                is_def = (val.strip() == default_val.strip())
+            else:
+                is_def = (val == default_val)
+                
+            base_text = label_widget.property("base_text")
+            if not base_text:
+                base_text = label_widget.text().split("<span")[0].strip()
+                label_widget.setProperty("base_text", base_text)
+                
+            if is_def:
+                label_widget.setText(f"{base_text} <span style='color:#34d399; font-size:11px; font-weight:normal;'>(기본값)</span>")
+            else:
+                label_widget.setText(f"{base_text} <span style='color:#f87171; font-size:11px; font-weight:normal;'>(변경됨)</span>")
+
+        if isinstance(widget, (QSpinBox, QDoubleSpinBox)): widget.valueChanged.connect(update_lbl)
+        elif isinstance(widget, QComboBox): widget.currentTextChanged.connect(update_lbl)
+        elif isinstance(widget, QTextEdit): widget.textChanged.connect(update_lbl)
+        elif isinstance(widget, QLineEdit): widget.textChanged.connect(update_lbl)
+        elif isinstance(widget, QCheckBox): widget.stateChanged.connect(update_lbl)
+        update_lbl()
+
+    def add_param(self, form_layout, label_text, widget, default_val):
+        lbl = QLabel(label_text)
+        form_layout.addRow(lbl, widget)
+        self.bind_default(widget, default_val, lbl)
+
+    def _create_scroll(self, layout):
+        w = QWidget(); w.setLayout(layout); scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(w)
+        return scroll
+
+    def _apply_table_style(self, table):
+        table.setAlternatingRowColors(True)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+
+    def get_noti_flags(self):
+        """디스코드 알림 발송 설정 상태를 반환합니다."""
+        return {
+            "error": self.chk_noti_error.isChecked(),
+            "task": self.chk_noti_task.isChecked(),
+            "fold": self.chk_noti_fold.isChecked(),
+            "early_stop": self.chk_noti_early_stop.isChecked()
+        }
+
+    def init_ui(self):
+        main_widget = QWidget(); self.setCentralWidget(main_widget); main_layout = QVBoxLayout(main_widget)
+        
+        g_group = QGroupBox("📁 전역 설정 및 시스템 상태")
+        g_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed) 
+        g_layout = QHBoxLayout()
+        g_layout.setContentsMargins(10, 5, 10, 5) 
+        
+        path_layout = QVBoxLayout()
+        path_layout.setSpacing(2) 
+        
+        self.w_proj_root = PathInputWidget("🌟 프로젝트 루트", True, str(self.base_dir / "MyProject"))
+        self.w_proj_root.line_edit.setStyleSheet("background-color: #fffbeb; font-weight: bold; color: #92400e;")
+        
+        default_proj = Path(self.w_proj_root.get_path())
+        self.w_base_ds = PathInputWidget("원본 데이터(dataset)", True, str(default_proj / "dataset"))
+        self.w_proc_ds = PathInputWidget("처리 폴더(processed)", True, str(default_proj / "processed_dataset"))
+        self.w_work_ds = PathInputWidget("워크스페이스(workspace)", True, str(default_proj / "workspace"))
+
+        # 디스코드 알림 설정 추가 부분 복구
+        self.w_webhook = QLineEdit()
+        self.w_webhook.setMinimumWidth(300)
+        self.w_webhook.setPlaceholderText("디스코드 웹훅 URL (알림을 받으려면 입력하세요)")
+        self.w_webhook.setStyleSheet("background-color: #f5f3ff; color: #4c1d95; border: 1px solid #ddd6fe; padding: 2px;")
+        self.settings = QSettings("MyVisionProject", "YoloTrainerApp")
+        saved_webhook = self.settings.value("webhook_url", "")
+        self.w_webhook.setText(saved_webhook)
+        
+        self.chk_noti_error = QCheckBox("🚨 에러/강제종료")
+        self.chk_noti_task = QCheckBox("⏳ 주요 작업 완료")
+        self.chk_noti_fold = QCheckBox("📍 K-Fold 진행")
+        self.chk_noti_early_stop = QCheckBox("🛑 조기 종료")
+        
+        for chk in [self.chk_noti_error, self.chk_noti_task, self.chk_noti_fold, self.chk_noti_early_stop]:
+            chk.setChecked(True)
+            chk.setStyleSheet("font-size: 11px;")
+
+        webhook_h_layout = QHBoxLayout()
+        webhook_h_layout.setSpacing(10)
+        webhook_h_layout.addWidget(QLabel("🔔 알림 웹훅:"))
+        webhook_h_layout.addWidget(self.w_webhook, stretch=1)
+        webhook_h_layout.addWidget(QLabel(" |  수신 설정:"))
+        webhook_h_layout.addWidget(self.chk_noti_error)
+        webhook_h_layout.addWidget(self.chk_noti_task)
+        webhook_h_layout.addWidget(self.chk_noti_fold)
+        webhook_h_layout.addWidget(self.chk_noti_early_stop)
+        webhook_h_layout.addStretch(0)
+        
+        path_layout.addWidget(self.w_proj_root)
+        path_layout.addWidget(self.w_base_ds)
+        path_layout.addWidget(self.w_proc_ds)
+        path_layout.addWidget(self.w_work_ds)
+        path_layout.addSpacing(5)
+        path_layout.addLayout(webhook_h_layout)
+        
+        right_layout = QVBoxLayout()
+        right_layout.setSpacing(2)
+        
+        os_info = f"{platform.system()} {platform.release()}"
+        ram_info = f"{psutil.virtual_memory().total / (1024**3):.1f} GB"
+        gpu_info = "GPU 없음 (CPU 연산)"
+        if torch.cuda.is_available():
+            gpu_info = f"🟢 {torch.cuda.get_device_name(0)} (VRAM: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.1f} GB)"
+            
+        sys_label = QLabel(f"🖥️ <b>OS:</b> {os_info} &nbsp;&nbsp;|&nbsp;&nbsp; 💾 <b>RAM:</b> {ram_info} &nbsp;&nbsp;|&nbsp;&nbsp; 🚀 <b>GPU:</b> {gpu_info}")
+        sys_label.setStyleSheet("color: #4b5563; font-size: 12px;")
+        right_layout.addWidget(sys_label)
+        
+        opt_layout = QHBoxLayout()
+        self.g_model = QComboBox(); self.g_model.addItems(["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt", "yolo11n.pt", "yolo11s.pt"])
+        lbl_mod = QLabel("Model:"); self.bind_default(self.g_model, "yolov8n.pt", lbl_mod)
+        self.g_imgsz = QComboBox(); self.g_imgsz.addItems(["320", "416", "512", "640", "768", "1024"]); self.g_imgsz.setCurrentText("640")
+        lbl_sz = QLabel("imgsz:"); self.bind_default(self.g_imgsz, "640", lbl_sz)
+        
+        opt_layout.addWidget(lbl_mod); opt_layout.addWidget(self.g_model)
+        opt_layout.addSpacing(20) 
+        opt_layout.addWidget(lbl_sz); opt_layout.addWidget(self.g_imgsz)
+        opt_layout.addStretch() 
+        right_layout.addLayout(opt_layout)
+        
+        btn_layout1 = QHBoxLayout()
+        self.btn_save_config = QPushButton("💾 설정만 저장")
+        self.btn_save_config.setStyleSheet("background-color: #f3f4f6; border: 1px solid #d1d5db; padding: 5px; border-radius: 4px;")
+        self.btn_save_config.clicked.connect(self.save_config_dialog)
+        
+        self.btn_load_config = QPushButton("📂 설정만 불러오기")
+        self.btn_load_config.setStyleSheet("background-color: #f3f4f6; border: 1px solid #d1d5db; padding: 5px; border-radius: 4px;")
+        self.btn_load_config.clicked.connect(self.load_config_dialog)
+
+        self.btn_reset_all = QPushButton("🔄 초기화")
+        self.btn_reset_all.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 5px; border-radius: 4px;")
+        self.btn_reset_all.clicked.connect(self.reset_all_defaults)
+
+        self.btn_toggle_tooltip = QPushButton("💡 툴팁 끄기")
+        self.btn_toggle_tooltip.setStyleSheet("background-color: #fef08a; border: 1px solid #fde047; padding: 5px; border-radius: 4px; font-weight: bold; color: #854d0e;")
+        self.btn_toggle_tooltip.setCheckable(True)
+        self.btn_toggle_tooltip.toggled.connect(self.on_toggle_tooltips)
+        
+        btn_layout1.addWidget(self.btn_save_config)
+        btn_layout1.addWidget(self.btn_load_config)
+        btn_layout1.addWidget(self.btn_reset_all)
+        btn_layout1.addWidget(self.btn_toggle_tooltip)
+
+        btn_layout2 = QHBoxLayout()
+        self.btn_export_proj = QPushButton("📦 전체 백업 (모델+설정 내보내기)")
+        self.btn_export_proj.setStyleSheet("background-color: #dbeafe; border: 1px solid #93c5fd; padding: 5px; border-radius: 4px; font-weight: bold; color: #1e3a8a;")
+        self.btn_export_proj.clicked.connect(self.export_project_dialog)
+        
+        self.btn_import_proj = QPushButton("📥 전체 복구 (모델+설정 불러오기)")
+        self.btn_import_proj.setStyleSheet("background-color: #dbeafe; border: 1px solid #93c5fd; padding: 5px; border-radius: 4px; font-weight: bold; color: #1e3a8a;")
+        self.btn_import_proj.clicked.connect(self.import_project_dialog)
+        
+        btn_layout2.addWidget(self.btn_export_proj)
+        btn_layout2.addWidget(self.btn_import_proj)
+
+        right_layout.addLayout(btn_layout1)
+        right_layout.addLayout(btn_layout2)
+
+        g_layout.addLayout(path_layout, 5)
+        g_layout.addSpacing(20) 
+        g_layout.addLayout(right_layout, 5)
+        g_group.setLayout(g_layout); main_layout.addWidget(g_group)
+
+        self.tabs = QTabWidget(); main_layout.addWidget(self.tabs)
+        
+        self.setup_tab6()
+        self.setup_tab1()
+        self.setup_tab2()
+        self.setup_tab3()
+        self.setup_tab4()
+        self.setup_tab5()
+
+        self.w_base_ds.line_edit.textChanged.connect(self.sync_base_paths)
+        self.w_proc_ds.line_edit.textChanged.connect(self.sync_proc_paths)
+        self.w_proj_root.line_edit.textChanged.connect(self.sync_project_root)
+        self.btn_toggle_tooltip.setChecked(True)
+
+    def on_toggle_tooltips(self, checked):
+        if checked:
+            self.btn_toggle_tooltip.setText("💡 툴팁 켜기")
+            self.btn_toggle_tooltip.setStyleSheet("background-color: #e5e7eb; border: 1px solid #d1d5db; padding: 5px; border-radius: 4px; color: #6b7280;")
+            self.setup_tooltips(enable=False)
+            self.statusBar().showMessage("💡 툴팁 설명이 숨김 처리되었습니다.", 3000)
+        else:
+            self.btn_toggle_tooltip.setText("💡 툴팁 끄기")
+            self.btn_toggle_tooltip.setStyleSheet("background-color: #fef08a; border: 1px solid #fde047; padding: 5px; border-radius: 4px; font-weight: bold; color: #854d0e;")
+            self.setup_tooltips(enable=True)
+            self.statusBar().showMessage("💡 툴팁 설명이 다시 표시됩니다.", 3000)
+
+    def setup_tooltips(self, enable=True):
+        tooltips = {
+            self.w_proj_root: "프로젝트의 최상위 폴더입니다. 데이터셋과 워크스페이스가 이 경로 아래에 구성됩니다.",
+            self.w_base_ds: "라벨링되지 않은 원본 이미지와 라벨 파일(JSON/TXT)이 위치할 폴더입니다.",
+            self.w_proc_ds: "크롭 및 정제가 완료된 최종 학습용 데이터셋이 저장되는 폴더입니다.",
+            self.w_work_ds: "모델 학습, 평가, 재학습 등 모든 작업의 결과물(runs, weights)이 저장되는 폴더입니다.",
+            self.g_model: "학습의 기반이 될 사전 학습된 YOLO 모델을 선택합니다. (크기가 클수록 정밀하지만 VRAM 소모가 큽니다)",
+            self.g_imgsz: "모델 입력 이미지 크기입니다. 큰 부품 해상도에 맞춰 조절하세요.",
+            self.btn_save_config: "현재 탭에 설정된 모든 파라미터와 경로를 JSON 파일로 저장합니다.",
+            self.btn_load_config: "이전에 저장해둔 설정 파일(JSON)을 불러와 모든 UI에 덮어씁니다.",
+            self.btn_reset_all: "모든 파라미터를 시스템 기본값으로 초기화합니다. (경로 설정은 유지됩니다)",
+            self.btn_export_proj: "현재 프로젝트의 설정과 학습된 가중치(.pt)를 하나의 Zip 파일로 압축해 내보냅니다.",
+            self.btn_import_proj: "백업해둔 Zip 파일을 불러와 프로젝트 경로와 모델을 복구합니다.",
+            
+            self.t1_auto_crop: "라벨링된 객체의 바운딩 박스를 기준으로 여백을 두고 이미지를 자동으로 잘라냅니다.",
+            self.t1_margin: "자동 크롭 시 부품 주변에 남길 여백(픽셀) 크기입니다.",
+            self.t1_mx: "수동 크롭 시 X 좌표(좌측 상단)입니다.",
+            self.t1_my: "수동 크롭 시 Y 좌표(좌측 상단)입니다.",
+            self.t1_mw: "수동 크롭할 이미지의 너비(Width)입니다.",
+            self.t1_mh: "수동 크롭할 이미지의 높이(Height)입니다.",
+            self.t1_class_map: "학습에 사용할 클래스 목록입니다. (예: OK, NG) 한 줄에 하나씩 입력하며, 위에서부터 0번 인덱스가 부여됩니다.",
+            self.t1_clean: "전처리 시작 시 기존 출력 폴더(processed_dataset)에 쌓인 이전 데이터들을 모두 삭제합니다.",
+            self.t1_exif: "사진의 세로/가로 회전 정보(EXIF)를 보정하여 정방향으로 읽어옵니다.",
+            self.btn_scan_classes: "원본 라벨 데이터를 순회하며 존재하는 모든 클래스 이름을 자동으로 추출합니다.",
+            self.t1_btn_run: "설정된 옵션에 따라 크롭 및 YOLO 형식 변환 전처리를 시작합니다.",
+            
+            self.t2_epochs: "전체 데이터셋을 반복 학습할 최대 횟수입니다.",
+            self.t2_batch: "한 번에 학습할 이미지 수입니다. VRAM(OOM) 부족 시 이 값을 줄이세요.",
+            self.t2_workers: "데이터를 불러오는 CPU 스레드 수입니다.",
+            self.t2_patience: "설정된 횟수만큼 성능 개선이 없으면 조기 종료(Early Stopping)합니다.",
+            self.t2_seed: "난수 고정 시드값입니다. 실험의 완벽한 재현성을 위해 사용합니다.",
+            self.t2_folds: "K-Fold 교차 검증을 위한 분할 횟수입니다. 1로 설정하면 K-Fold 없이 단일 학습만 진행됩니다.",
+            self.t2_test_split: "전체 데이터 중 검증(Validation)용으로 빼둘 데이터의 비율입니다.",
+            self.t2_lcls: "분류(Classification) 오차에 대한 Loss 가중치입니다.",
+            self.t2_lbox: "바운딩 박스 위치 오차에 대한 Loss 가중치입니다.",
+            self.t2_ldfl: "분포 초점(Distribution Focal) Loss 가중치입니다. 박스 정밀도를 높여줍니다.",
+            self.t2_btn_run: "백그라운드 멀티프로세스로 학습을 시작합니다.",
+            self.t2_btn_stop: "현재 진행 중인 학습 프로세스를 강제로 종료하고 VRAM을 반환합니다.",
+            
+            self.t3_model: "평가에 사용할 학습 완료된 모델(.pt) 가중치 파일 경로입니다.",
+            self.t3_img: "평가를 진행할 검증용 이미지들이 있는 폴더입니다.",
+            self.t3_lbl: "정답(GT) 라벨 파일들이 있는 폴더입니다.",
+            self.t3_conf: "이 값 이상의 신뢰도를 가진 박스만 예측 결과로 인정합니다.",
+            self.t3_iou: "객체가 겹쳤을 때 중복(NMS)을 제거할 기준 값입니다.",
+            self.t3_match_iou: "정답 박스와 예측 박스의 면적이 이 값 이상 겹쳐야 정답으로 인정합니다.",
+            self.t3_max_det: "이미지 1장에서 탐지할 수 있는 최대 객체(부품) 개수입니다.",
+            self.t3_run_name: "평가 결과물이 저장될 하위 폴더의 이름입니다.",
+            self.t3_agnostic: "클래스(OK/NG)가 달라도 겹치는 박스는 중복으로 간주하고 NMS로 제거합니다.",
+            self.t3_save_rel: "오답으로 판정된 하드 이그잼플(Hard Example) 이미지들만 별도 폴더에 모아둡니다.",
+            self.t3_btn_run: "전체 검증 데이터셋에 대해 모델을 평가하고 오답 목록을 산출합니다.",
+            self.btn_send_t3_to_t5: "현재 평가 세팅(모델, 이미지 경로, 파라미터)을 거리 측정 탭으로 복사합니다.",
+            
+            self.t4_hard: "이전 평가 탭에서 걸러진 오답(Hard Example) 이미지 폴더 경로입니다.",
+            self.t4_orig: "오답 이미지에 대응하는 원본 정답 라벨이 있는 폴더 경로입니다.",
+            self.t4_base: "재학습의 뼈대가 될 베이스 모델(.pt) 경로입니다.",
+            self.t4_btn_retrain: "오답 데이터만 활용해 기존 모델의 취약점을 보완하는 추가 학습을 진행합니다.",
+            self.t4_eval_model_display: "재학습이 완료된 새로운 모델 가중치의 경로가 표시됩니다.",
+            self.t4_btn_eval: "강화된 재학습 모델로 전체 검증셋을 다시 평가하여 성능 향상률을 확인합니다.",
+            
+            self.t5_method: "부품 간 거리 측정 알고리즘을 선택합니다. (수평/수직, 최단 이웃 등)",
+            self.t5_knn_n: "가장 가까운 객체 몇 개(N)까지 거리를 측정할지 설정합니다. (KNN 방식 전용)",
+            self.t5_edge_thr: "테두리 간 거리가 이 임계값을 넘어가면 별도 유형으로 통계 분류됩니다. 콤마로 다중 입력 가능. (예: 40, 60)",
+            self.t5_skip_ng: "탐지된 객체 중 'NG' 불량 클래스가 포함된 객체는 거리 측정 대상에서 안전하게 제외합니다.",
+            self.t5_drop_odd: "탐지된 부품 쌍이 홀수 개일 때, 신뢰도(Confidence)가 가장 낮은 1개를 노이즈로 간주하고 버립니다.",
+            self.t5_color1: "거리 측정 선(수평선 또는 KNN 연결선)의 렌더링 색상을 지정합니다.",
+            self.t5_color2: "거리 측정 선(수직선)의 렌더링 색상을 지정합니다.",
+            self.t5_btn_run: "선택한 이미지 폴더 내 객체 간 거리를 도출하고 이상치(Outlier) 통계 및 시각화를 실행합니다.",
+            self.t5_chk_show_outliers: "IQR(사분위수 범위) 기준을 벗어난 비정상 간격(Outlier) 사진들만 모아서 봅니다.",
+            
+            self.t6_img_dir: "라벨링 작업을 진행할 원본 이미지 폴더 경로입니다.",
+            self.t6_lbl_dir: "작성한 라벨 데이터(TXT)가 실시간으로 저장될 폴더 경로입니다.",
+            self.t6_btn_load: "다른 경로에 있는 이미지들을 작업 폴더로 일괄 복사해오고 목록을 갱신합니다.",
+            self.btn_go_to_preprocess: "라벨링을 마치고 해당 폴더 경로들을 데이터 전처리 탭(Tab 1)으로 즉시 연동시킵니다.",
+            self.btn_auto_label: "현재 뷰에서 선택한 바운딩 박스를 템플릿 매칭하여 유사한 부품들을 자동 라벨링합니다.",
+            self.btn_auto_label_next: "현재 이미지의 라벨을 템플릿으로 삼아, 다음 사진의 유사 객체를 찾아 일괄 라벨링합니다.",
+            self.t6_auto_thr: "자동 라벨링 시 이 값 이상의 픽셀 유사도를 가져야 같은 객체로 판정합니다.",
+            self.t6_auto_nms: "자동 라벨링 시 박스가 겹칠 경우 중복 처리할 임계값입니다.",
+            self.btn_change_class: "리스트에서 선택한 라벨의 클래스를 팝업창을 통해 변경합니다.",
+            self.btn_delete_label: "리스트에서 선택한 라벨 박스를 완전히 삭제합니다."
+        }
+
+        for widget, tooltip in tooltips.items():
+            final_tooltip = tooltip if enable else ""
+            if hasattr(widget, 'setToolTip'):
+                if isinstance(widget, PathInputWidget):
+                    widget.line_edit.setToolTip(final_tooltip)
+                    widget.btn.setToolTip("폴더/파일 탐색기를 엽니다." if enable else "")
+                else:
+                    widget.setToolTip(final_tooltip)
+
+    def reset_all_defaults(self):
+        reply = QMessageBox.question(self, '초기화 확인', '모든 파라미터를 기본값으로 되돌리시겠습니까?\n(경로 설정은 유지됩니다)', QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            for widget in self.findChildren(QWidget):
+                default_val = widget.property("default_val")
+                if default_val is not None:
+                    if isinstance(widget, (QSpinBox, QDoubleSpinBox)): widget.setValue(default_val)
+                    elif isinstance(widget, QComboBox): widget.setCurrentText(default_val)
+                    elif isinstance(widget, QTextEdit): widget.setText(default_val)
+                    elif isinstance(widget, QLineEdit): widget.setText(default_val)
+                    elif isinstance(widget, QCheckBox): widget.setChecked(default_val)
+            if hasattr(self, 't1_class_map'): self.t1_class_map.setPlainText("OK\nNG")
+            if hasattr(self, 't6_class_map'): self.t6_class_map.setPlainText("OK\nNG")
+            self.statusBar().showMessage("🔄 모든 설정이 기본값으로 초기화되었습니다.", 3000)
+
+    def save_config_dialog(self):
+        text, ok = QInputDialog.getText(self, '설정 저장', '저장할 설정의 이름을 입력하세요:\n(빈칸으로 두면 날짜/시간으로 자동 생성됩니다)')
+        if ok:
+            config_data = self.config_builder.build(self)
+            success, result = self.config_manager.save_config(config_data, text.strip())
+            if success:
+                self.statusBar().showMessage(f"💾 설정이 성공적으로 저장되었습니다: {Path(result).name}", 5000)
+                QMessageBox.information(self, "저장 완료", f"설정이 저장되었습니다.\n{result}")
+            else:
+                QMessageBox.critical(self, "저장 실패", f"설정 저장 중 오류가 발생했습니다:\n{result}")
+
+    def load_config_dialog(self):
+        configs = self.config_manager.get_all_configs()
+        if not configs: 
+            QMessageBox.information(self, "알림", "저장된 설정 파일이 없습니다.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("설정 불러오기")
+        dialog.resize(400, 300)
+        layout = QVBoxLayout(dialog)
+        list_widget = QListWidget()
+        for f in configs: list_widget.addItem(f.name)
+        layout.addWidget(QLabel("불러올 설정을 선택하세요:"))
+        layout.addWidget(list_widget)
+
+        btn_layout = QHBoxLayout()
+        btn_load = QPushButton("불러오기")
+        btn_delete = QPushButton("삭제")
+        btn_cancel = QPushButton("취소")
+        btn_layout.addWidget(btn_load)
+        btn_layout.addWidget(btn_delete)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+
+        def load_selected():
+            if list_widget.currentItem():
+                file_name = list_widget.currentItem().text()
+                success, data = self.config_manager.load_config(self.config_manager.config_dir / file_name)
+                if success:
+                    self.apply_loaded_config(data)
+                    self.statusBar().showMessage(f"📂 설정을 불러왔습니다: {file_name}", 5000)
+                    dialog.accept()
+                else: 
+                    QMessageBox.critical(self, "오류", f"파일을 읽는 중 오류가 발생했습니다:\n{data}")
+
+        def delete_selected():
+            if list_widget.currentItem():
+                file_name = list_widget.currentItem().text()
+                file_path = self.config_manager.config_dir / file_name
+                reply = QMessageBox.question(dialog, '삭제 확인', f"'{file_name}' 설정을 삭제하시겠습니까?", QMessageBox.Yes | QMessageBox.No)
+                if reply == QMessageBox.Yes:
+                    file_path.unlink(missing_ok=True)
+                    list_widget.takeItem(list_widget.currentRow())
+
+        btn_load.clicked.connect(load_selected)
+        btn_delete.clicked.connect(delete_selected)
+        btn_cancel.clicked.connect(dialog.reject)
+        list_widget.itemDoubleClicked.connect(load_selected)
+        dialog.exec_()
+
+    def apply_loaded_config(self, c):
+        g = c.get("global", {})
+        if "proj_root" in g: self.w_proj_root.line_edit.setText(g["proj_root"])
+        if "base_ds" in g: self.w_base_ds.line_edit.setText(g["base_ds"])
+        if "proc_ds" in g: self.w_proc_ds.line_edit.setText(g["proc_ds"])
+        if "work_ds" in g: self.w_work_ds.line_edit.setText(g["work_ds"])
+        if "webhook_url" in g and g["webhook_url"].strip(): 
+            self.w_webhook.setText(g["webhook_url"])
+        if "model" in g: self.g_model.setCurrentText(g["model"])
+        if "imgsz" in g: self.g_imgsz.setCurrentText(g["imgsz"])
+        if "notify_error" in g: self.chk_noti_error.setChecked(g["notify_error"])
+        if "notify_task" in g: self.chk_noti_task.setChecked(g["notify_task"])
+        if "notify_fold" in g: self.chk_noti_fold.setChecked(g["notify_fold"])
+        if "notify_early_stop" in g: self.chk_noti_early_stop.setChecked(g["notify_early_stop"])
+
+        t1 = c.get("tab1", {})
+        if "auto_crop" in t1: self.t1_auto_crop.setChecked(t1["auto_crop"])
+        if "margin" in t1: self.t1_margin.setValue(t1["margin"])
+        if "mx" in t1: self.t1_mx.setValue(t1["mx"])
+        if "my" in t1: self.t1_my.setValue(t1["my"])
+        if "mw" in t1: self.t1_mw.setValue(t1["mw"])
+        if "mh" in t1: self.t1_mh.setValue(t1["mh"])
+        if "class_map" in t1: self.t1_class_map.setText(t1["class_map"])
+        if "clean" in t1: self.t1_clean.setChecked(t1["clean"])
+        if "exif" in t1: self.t1_exif.setChecked(t1["exif"])
+
+        t2 = c.get("tab2", {})
+        if "epochs" in t2: self.t2_epochs.setValue(t2["epochs"])
+        if "batch" in t2: self.t2_batch.setValue(t2["batch"])
+        if "workers" in t2: self.t2_workers.setValue(t2["workers"])
+        if "patience" in t2: self.t2_patience.setValue(t2["patience"])
+        if "seed" in t2: self.t2_seed.setValue(t2["seed"])
+        if "folds" in t2: self.t2_folds.setValue(t2["folds"])
+        if "test_split" in t2: self.t2_test_split.setValue(t2["test_split"])
+        if "lcls" in t2: self.t2_lcls.setValue(t2["lcls"])
+        if "lbox" in t2: self.t2_lbox.setValue(t2["lbox"])
+        if "ldfl" in t2: self.t2_ldfl.setValue(t2["ldfl"])
+        if "ah" in t2: self.t2_ah.setValue(t2["ah"])
+        if "as" in t2: self.t2_as.setValue(t2["as"])
+        if "av" in t2: self.t2_av.setValue(t2["av"])
+        if "adeg" in t2: self.t2_adeg.setValue(t2["adeg"])
+        if "atrans" in t2: self.t2_atrans.setValue(t2["atrans"])
+        if "ascale" in t2: self.t2_ascale.setValue(t2["ascale"])
+        if "ashear" in t2: self.t2_ashear.setValue(t2["ashear"])
+        if "afud" in t2: self.t2_afud.setValue(t2["afud"])
+        if "aflr" in t2: self.t2_aflr.setValue(t2["aflr"])
+        if "amos" in t2: self.t2_amos.setValue(t2["amos"])
+        if "amix" in t2: self.t2_amix.setValue(t2["amix"])
+        if "acp" in t2: self.t2_acp.setValue(t2["acp"])
+
+        t3 = c.get("tab3", {})
+        if "conf" in t3: self.t3_conf.setValue(t3["conf"])
+        if "iou" in t3: self.t3_iou.setValue(t3["iou"])
+        if "match_iou" in t3: self.t3_match_iou.setValue(t3["match_iou"])
+        if "max_det" in t3: self.t3_max_det.setValue(t3["max_det"])
+        if "run_name" in t3: self.t3_run_name.setText(t3["run_name"])
+        if "agnostic" in t3: self.t3_agnostic.setChecked(t3["agnostic"])
+        if "save_rel" in t3: self.t3_save_rel.setChecked(t3["save_rel"])
+
+        t4 = c.get("tab4", {})
+        if "epochs" in t4: self.t4_epochs.setValue(t4["epochs"])
+        if "batch" in t4: self.t4_batch.setValue(t4["batch"])
+        if "run" in t4: self.t4_run.setText(t4["run"])
+        if "lcls" in t4: self.t4_lcls.setValue(t4["lcls"])
+        if "lbox" in t4: self.t4_lbox.setValue(t4["lbox"])
+        if "ah" in t4: self.t4_ah.setValue(t4["ah"])
+        if "as" in t4: self.t4_as.setValue(t4["as"])
+        if "av" in t4: self.t4_av.setValue(t4["av"])
+        if "afud" in t4: self.t4_afud.setValue(t4["afud"])
+        if "aflr" in t4: self.t4_aflr.setValue(t4["aflr"])
+        if "amos" in t4: self.t4_amos.setValue(t4["amos"])
+        if "amix" in t4: self.t4_amix.setValue(t4["amix"])
+        if "acp" in t4: self.t4_acp.setValue(t4["acp"])
+        if "eval_conf" in t4: self.t4_conf.setValue(t4["eval_conf"])
+        if "eval_iou" in t4: self.t4_iou.setValue(t4["eval_iou"])
+        if "eval_match" in t4: self.t4_match_iou.setValue(t4["eval_match"])
+        if "eval_max" in t4: self.t4_max_det.setValue(t4["eval_max"])
+        if "eval_agnostic" in t4: self.t4_agnostic.setChecked(t4["eval_agnostic"])
+
+        t5 = c.get("tab5", {})
+        if "method" in t5: self.t5_method.setCurrentText(t5["method"])
+        if "conf" in t5: self.t5_conf.setValue(t5["conf"])
+        if "iou" in t5: self.t5_iou.setValue(t5["iou"])
+        if "max_det" in t5: self.t5_max_det.setValue(t5["max_det"])
+        if "agnostic" in t5: self.t5_agnostic.setChecked(t5["agnostic"])
+        if "knn_n" in t5: self.t5_knn_n.setValue(t5["knn_n"])
+        if "edge_thr" in t5: self.t5_edge_thr.setText(t5["edge_thr"])
+        if "skip_ng" in t5: self.t5_skip_ng.setChecked(t5["skip_ng"])
+        if "drop_odd" in t5: self.t5_drop_odd.setChecked(t5["drop_odd"])
+        if "color1" in t5: self.t5_color1.setCurrentText(t5["color1"])
+        if "color2" in t5: self.t5_color2.setCurrentText(t5["color2"])
+
+        t6 = c.get("tab6", {})
+        if "class_map" in t6: self.t6_class_map.setText(t6["class_map"])
+        if "color" in t6: self.t6_color_combo.setCurrentText(t6["color"])
+        if "auto_thr" in t6: self.t6_auto_thr.setValue(t6["auto_thr"])
+        if "auto_nms" in t6: self.t6_auto_nms.setValue(t6["auto_nms"])
+
+    def start_training_process(self, worker_func, args):
+        self.train_queue = multiprocessing.Queue()
+        self.training_process = multiprocessing.Process(target=worker_func, args=(args, self.train_queue))
+        self.training_process.start()
+        
+        self.monitor_thread = ProcessMonitorThread(self.train_queue, self.training_process)
+        self.monitor_thread.finished_ok.connect(self.on_training_finished)
+        self.monitor_thread.error.connect(self.on_training_fatal_error)
+        self.monitor_thread.start()
+        
+        self.t2_btn_run.setEnabled(False)
+        self.t4_btn_retrain.setEnabled(False)
+        self.t2_scroll.setEnabled(False)
+        self.t4_scroll.setEnabled(False)
+        self.g_model.setEnabled(False)
+        self.g_imgsz.setEnabled(False)
+        self.t2_btn_stop.setEnabled(True)
+        self.statusBar().showMessage(f"🏃 학습 진행 중... (터미널 로그를 확인하세요) PID: {self.training_process.pid}")
+
+    def stop_training(self):
+        if self.training_process and self.training_process.is_alive():
+            import platform, subprocess, os, signal
+            try:
+                if platform.system() == "Windows": 
+                    subprocess.call(["taskkill", "/F", "/T", "/PID", str(self.training_process.pid)])
+                else: 
+                    os.kill(self.training_process.pid, signal.SIGKILL)
+            except Exception: pass
+            
+            self._restore_training_ui()
+            self.statusBar().showMessage("🛑 학습이 강제 종료되었습니다.")
+            self.training_process = None
+
+    def on_training_finished(self, res):
+        self._restore_training_ui()
+        self.statusBar().showMessage("✅ 프로세스 완료")
+        
+        if res.get("success"):
+            if "metrics_summary" in res: 
+                self.show_kfold_metrics_dialog(res["metrics_summary"], res["msg"], res.get("best_fold", ""))
+            else: 
+                QMessageBox.information(self, "완료", res["msg"])
+
+            if res.get("best_model"): self.t3_model.line_edit.setText(res["best_model"])
+            if res.get("model_path"):
+                self.t4_eval_model_display.setText(res["model_path"]) 
+                self.t4_btn_eval.setEnabled(True)
+                self.statusBar().showMessage(f"✅ 재학습 모델 준비 완료: {Path(res['model_path']).name}")
+        else: 
+            QMessageBox.critical(self, "실패", res.get("error", "알 수 없는 오류"))
+        self.training_process = None
+
+    def on_training_fatal_error(self, error_msg):
+        self._restore_training_ui()
+        QMessageBox.critical(self, "비정상 종료", error_msg)
+        self.statusBar().showMessage("🛑 학습이 비정상 종료되었습니다.")
+        self.training_process = None
+
+    def _restore_training_ui(self):
+        self.t2_btn_run.setEnabled(True)
+        self.t4_btn_retrain.setEnabled(True)
+        self.t2_scroll.setEnabled(True)
+        self.t4_scroll.setEnabled(True)
+        self.g_model.setEnabled(True)
+        self.g_imgsz.setEnabled(True)
+        self.t2_btn_stop.setEnabled(False)
+
+    def show_kfold_metrics_dialog(self, metrics_data, title_msg, best_fold):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("K-Fold 교차 검증 상세 지표")
+        dialog.resize(650, 350) 
+        layout = QVBoxLayout(dialog)
+        lbl = QLabel(f"<b>{title_msg.replace(chr(10), '<br>')}</b><br><span style='color: #ef4444;'>⭐ <b>최우수 모델: Fold {best_fold}</b> (가중치 자동 저장됨)</span>")
+        layout.addWidget(lbl)
+
+        table = QTableWidget(len(metrics_data), 6)
+        table.setHorizontalHeaderLabels(["Fold", "mAP50", "mAP50-95", "Precision", "Recall", "Fitness"])
+        self._apply_table_style(table)
+        for i in range(table.columnCount()): table.horizontalHeader().setSectionResizeMode(i, QHeaderView.Stretch)
+        
+        for row, data in enumerate(metrics_data):
+            fold_name = str(data["Fold"])
+            table.setItem(row, 0, QTableWidgetItem(f"👑 Fold {fold_name}" if fold_name == str(best_fold) else fold_name))
+            table.setItem(row, 1, QTableWidgetItem(f"{data['mAP50']:.4f}"))
+            table.setItem(row, 2, QTableWidgetItem(f"{data['mAP50-95']:.4f}"))
+            table.setItem(row, 3, QTableWidgetItem(f"{data['Precision']:.4f}"))
+            table.setItem(row, 4, QTableWidgetItem(f"{data['Recall']:.4f}"))
+            table.setItem(row, 5, QTableWidgetItem(f"{data['Fitness']:.4f}")) 
+            for col in range(6): 
+                item = table.item(row, col); item.setTextAlignment(Qt.AlignCenter)
+                if fold_name == "Average":
+                    font = item.font(); font.setBold(True); item.setFont(font); item.setBackground(QColor("#dbeafe")) 
+                elif fold_name == str(best_fold):
+                    font = item.font(); font.setBold(True); item.setFont(font); item.setBackground(QColor("#fef08a")) 
+
+        layout.addWidget(table)
+        btn = QPushButton("확인")
+        btn.clicked.connect(dialog.accept)
+        layout.addWidget(btn)
+        dialog.exec_()
+
+    def select_prev_label_image(self):
+        curr_row = self.t6_list.currentRow()
+        if curr_row > 0: 
+            self.t6_list.setCurrentRow(curr_row - 1)
+            self.on_label_image_selected(self.t6_list.currentItem())
+
+    def select_next_label_image(self):
+        curr_row = self.t6_list.currentRow()
+        if curr_row < self.t6_list.count() - 1: 
+            self.t6_list.setCurrentRow(curr_row + 1)
+            self.on_label_image_selected(self.t6_list.currentItem())
+
+    def load_labeling_images(self):
+        src_dir = QFileDialog.getExistingDirectory(self, "복사해올 원본 이미지 폴더 선택")
+        if not src_dir: return
+        src_path = Path(src_dir)
+        target_dir = Path(self.t6_img_dir.get_path())
+        target_dir.mkdir(parents=True, exist_ok=True)
+        valid_exts = {".jpg", ".jpeg", ".png"}
+        files_to_copy = [f for f in src_path.iterdir() if f.suffix.lower() in valid_exts]
+        
+        if not files_to_copy:
+            QMessageBox.warning(self, "파일 없음", "선택한 폴더에 이미지 파일이 없습니다.")
+            return
+
+        copy_count = 0
+        QApplication.setOverrideCursor(Qt.WaitCursor) 
+        try:
+            for f in files_to_copy:
+                target_file = target_dir / f.name
+                if not target_file.exists():
+                    shutil.copy2(f, target_file) 
+                    copy_count += 1
+            
+            self.t6_list.clear()
+            for f in sorted(target_dir.iterdir()):
+                if f.suffix.lower() in valid_exts: 
+                    self.t6_list.addItem(f.name)
+        finally:
+            QApplication.restoreOverrideCursor()
+                
+        msg = f"작업 폴더로 {copy_count}장의 사진을 복사했습니다. (현재 목록: 총 {self.t6_list.count()}장)"
+        self.statusBar().showMessage(msg, 5000)
+        QMessageBox.information(self, "가져오기 완료", msg)
+
+    def on_label_image_selected(self, item):
+        img_path = Path(self.t6_img_dir.get_path()) / item.text()
+        success, cmap_or_error = self.parse_and_validate_class_map(self.t6_class_map.toPlainText())
+        if not success: 
+            QMessageBox.warning(self, "클래스 매핑 오류", cmap_or_error)
+            return
+            
+        class_names = [k for k, v in sorted(cmap_or_error.items(), key=lambda item: item[1])]
+        if not self.t6_view.load_image(str(img_path), class_names): 
+            QMessageBox.warning(self, "오류", "이미지를 불러올 수 없습니다.")
+            return
+
+        self.t6_label_list.clear()
+        lbl_dir = Path(self.t6_lbl_dir.get_path())
+        txt_path = lbl_dir / Path(item.text()).with_suffix(".txt").name
+        if txt_path.exists():
+            lines = txt_path.read_text(encoding="utf-8").strip().split('\n')
+            self.t6_view.load_existing_labels([line for line in lines if line.strip()])
+
+    def save_current_label(self, yolo_data):
+        current_item = self.t6_list.currentItem()
+        if not current_item: return
+        lbl_dir = Path(self.t6_lbl_dir.get_path())
+        lbl_dir.mkdir(parents=True, exist_ok=True)
+        txt_path = lbl_dir / Path(current_item.text()).with_suffix(".txt").name
+        
+        if yolo_data:
+            txt_path.write_text("\n".join(yolo_data), encoding="utf-8")
+            current_item.setBackground(QColor("#dcfce7"))
+        else:
+            if txt_path.exists():
+                txt_path.unlink()
+            current_item.setBackground(QColor("#ffffff"))
+                
+        self.statusBar().showMessage(f"✅ 라벨 저장 완료: {txt_path.name}", 2000)
+
+    def send_to_measure_tab(self, model_path, img_path, conf, iou, max_det, agnostic):
+        if not model_path or not Path(model_path).exists():
+            QMessageBox.warning(self, "경로 오류", "유효한 모델 경로가 없습니다.\n먼저 학습이나 평가를 완료해주세요.")
+            return
+        self.t5_model.line_edit.setText(model_path)
+        self.t5_img.line_edit.setText(img_path) 
+        self.t5_conf.setValue(conf)
+        self.t5_iou.setValue(iou)
+        self.t5_max_det.setValue(max_det)
+        self.t5_agnostic.setChecked(agnostic)
+        self.tabs.setCurrentIndex(5)
+        self.statusBar().showMessage("➡️ 현재 모델, 이미지 경로, 평가 설정이 거리 측정 탭으로 복사되었습니다.", 5000)
+
+    def sync_label_ui(self, yolo_data):
+        selected_rows = [item.row() for item in self.t6_label_list.selectedIndexes()]
+        self.t6_label_list.blockSignals(True)
+        self.t6_label_list.clear()
+        
+        for i, line in enumerate(yolo_data):
+            parts = line.split()
+            if len(parts) == 5:
+                class_id = int(parts[0])
+                class_name = self.t6_view.class_names[class_id] if class_id < len(self.t6_view.class_names) else f"ID {class_id}"
+                display_text = f"[{i+1}] {class_name} (X:{float(parts[1]):.3f}, Y:{float(parts[2]):.3f})"
+                self.t6_label_list.addItem(display_text)
+                
+        for row in selected_rows:
+            if 0 <= row < self.t6_label_list.count(): self.t6_label_list.item(row).setSelected(True)
+                
+        self.t6_label_list.blockSignals(False)
+        self.on_label_selection_changed() 
+        self.save_current_label(yolo_data)
+
+    def on_label_selection_changed(self):
+        selected_rows = [item.row() for item in self.t6_label_list.selectedIndexes()]
+        self.t6_view.select_boxes(selected_rows)
+
+    def on_delete_label_clicked(self):
+        selected_rows = [item.row() for item in self.t6_label_list.selectedIndexes()]
+        if selected_rows:
+            self.t6_view.delete_boxes(selected_rows)
+            self.t6_view.setFocus() 
+        else:
+            QMessageBox.warning(self, "선택 오류", "삭제할 라벨을 하나 이상 선택해주세요.")
+
+    def on_change_class_clicked(self):
+        selected_rows = [item.row() for item in self.t6_label_list.selectedIndexes()]
+        if selected_rows:
+            dialog = LabelDialog(self.t6_view.class_names, self)
+            if dialog.exec_() == QDialog.Accepted:
+                self.t6_view.update_boxes_class(selected_rows, dialog.get_class_index())
+            self.t6_view.setFocus() 
+        else:
+            QMessageBox.warning(self, "선택 오류", "클래스를 변경할 라벨을 하나 이상 선택해주세요.")
+
+    def run_auto_labeling(self):
+        threshold = self.t6_auto_thr.value()
+        success, result = self.t6_view.auto_label_similar(threshold, self.t6_auto_nms.value())
+        if not success: QMessageBox.warning(self, "오토 라벨링 실패", result)
+        else:
+            if result == 0: self.statusBar().showMessage("⚠️ 비슷한 객체를 찾지 못했습니다. 우측 하단의 유사도 값을 조금 낮춰보세요.", 4000)
+            else: self.statusBar().showMessage(f"✨ {result}개의 유사한 객체를 자동 라벨링했습니다! (단축키 Q로 실행 취소 가능)", 4000)
+
+    def run_auto_labeling_next(self):
+        if not self.t6_view.save_all_templates():
+            QMessageBox.warning(self, "안내", "현재 사진에 참고할 만한 라벨 박스가 없습니다.\n먼저 기준이 될 박스를 하나 이상 그려주세요.")
+            return
+
+        curr_row = self.t6_list.currentRow()
+        if curr_row < self.t6_list.count() - 1:
+            self.t6_list.setCurrentRow(curr_row + 1)
+            self.on_label_image_selected(self.t6_list.currentItem())
+        else:
+            QMessageBox.information(self, "안내", "마지막 사진입니다.")
+            return
+
+        threshold = self.t6_auto_thr.value()
+        success, result = self.t6_view.auto_label_from_saved_templates(threshold, self.t6_auto_nms.value())
+        if not success: QMessageBox.warning(self, "오토 라벨링 실패", result)
+        else:
+            if result == 0: self.statusBar().showMessage(f"⚠️ 다음 사진에서는 비슷한 객체를 하나도 찾지 못했습니다. (유사도: {threshold})", 4000)
+            else:
+                self.statusBar().showMessage(f"✨ 다음 사진에서 총 {result}개의 객체를 찾아 일괄 라벨링했습니다!", 4000)
+                self.sync_label_ui(self.t6_view.get_yolo_format())
+
+    def setup_tab6(self):
+        f = QFormLayout()
+        base_dir = Path(self.w_base_ds.get_path())
+        
+        self.t6_img_dir = PathInputWidget("작업할 이미지 폴더", True, str(base_dir/"image"))
+        self.t6_lbl_dir = PathInputWidget("라벨 저장 폴더 (.txt)", True, str(base_dir/"data"))
+        self.t6_class_map = QTextEdit()
+        self.t6_class_map.setPlainText("OK\nNG")
+        self.t6_class_map.setMaximumHeight(80)
+        self.t6_class_map.setToolTip("한 줄에 하나씩 클래스 이름만 입력하세요. (위에서부터 0번으로 자동 지정)")
+        
+        color_map = {
+            "노란색 (Yellow)": QColor(255, 255, 0, 180), "초록색 (Green)": QColor(0, 255, 0, 180),
+            "빨간색 (Red)": QColor(255, 0, 0, 180), "파란색 (Blue)": QColor(0, 0, 255, 180),
+            "청록색 (Cyan)": QColor(0, 255, 255, 180), "자주색 (Magenta)": QColor(255, 0, 255, 180),
+            "흰색 (White)": QColor(255, 255, 255, 180), "검은색 (Black)": QColor(0, 0, 0, 180)
+        }
+
+        def get_color_icon(color):
+            pixmap = QPixmap(16, 16); pixmap.fill(Qt.gray)
+            painter = QPainter(pixmap)
+            painter.fillRect(1, 1, 14, 14, QColor(color.red(), color.green(), color.blue()))
+            painter.end(); return QIcon(pixmap)
+
+        self.t6_color_combo = QComboBox()
+        for name, color in color_map.items(): self.t6_color_combo.addItem(get_color_icon(color), name)
+        self.t6_color_combo.setCurrentText("흰색 (White)")
+        self.t6_color_combo.currentTextChanged.connect(lambda name: self.t6_view.set_crosshair_color(color_map[name]))
+        
+        self.t6_btn_load = QPushButton("📂 이미지 목록 불러오기")
+        self.t6_btn_load.clicked.connect(self.load_labeling_images)
+        
+        self.btn_go_to_preprocess = QPushButton("➡️ 라벨링 완료 (전처리로 이동)")
+        self.btn_go_to_preprocess.setStyleSheet("background-color: #dbeafe; font-weight: bold; color: #1e3a8a;")
+        self.btn_go_to_preprocess.clicked.connect(self.go_to_preprocess_tab)
+
+        f.addRow(self.t6_img_dir)
+        f.addRow(self.t6_lbl_dir)
+        f.addRow(QLabel("클래스 목록 (엔터로 구분)"), self.t6_class_map)
+        f.addRow(QLabel("십자선 색상"), self.t6_color_combo)
+        
+        h_btns = QHBoxLayout()
+        h_btns.addWidget(self.t6_btn_load); h_btns.addWidget(self.btn_go_to_preprocess)
+        f.addRow(h_btns)
+
+        split = QSplitter(Qt.Horizontal)
+        left_w = QWidget(); left_l = QVBoxLayout(left_w)
+        left_l.addWidget(self._create_scroll(f))
+        
+        self.t6_list = QListWidget()
+        self.t6_list.itemClicked.connect(self.on_label_image_selected)
+        left_l.addWidget(QLabel("<b>이미지 목록</b>"))
+        left_l.addWidget(self.t6_list)
+        
+        right_w = QWidget()
+        right_l = QHBoxLayout(right_w)
+        
+        self.t6_view = LabelingView()
+        self.t6_view.box_added.connect(self.sync_label_ui)
+        self.t6_view.request_prev.connect(self.select_prev_label_image)
+        self.t6_view.request_next.connect(self.select_next_label_image)
+
+        side_panel = QWidget()
+        side_layout = QVBoxLayout(side_panel)
+        side_layout.setContentsMargins(10, 0, 0, 0)
+        side_layout.setAlignment(Qt.AlignTop)
+
+        help_text = ("<b>라벨링 영역 단축키</b><br>"
+                     "<span style='font-size:11px; color:#555;'>"
+                     "<b>Q/E</b>: 실행취소/다시실행<br>"
+                     "<b>S/W</b>: OK/NG 클래스 지정<br>"
+                     "<b>휠클릭 드래그</b>: 박스 위치이동<br>"
+                     "<b>좌클릭 드래그</b>: 크기 조절<br>"
+                     "<b>마우스 휠</b>: 화면 확대/축소<br>"
+                     "<b>우클릭 드래그</b>: 화면 이동<br>"
+                     "<b>Shift/Ctrl+클릭</b>: 다중 선택</span>")
+        
+        side_layout.addWidget(QLabel(help_text))
+        side_layout.addSpacing(15)
+        
+        auto_group = QGroupBox("자동 객체 찾기")
+        auto_layout = QVBoxLayout(auto_group)
+        
+        self.btn_auto_label = QPushButton("✨ 선택 객체 자동 찾기")
+        self.btn_auto_label.setStyleSheet("background-color: #fef08a; font-weight: bold; color: #854d0e; padding: 5px;")
+        self.btn_auto_label.clicked.connect(self.run_auto_labeling)
+
+        self.btn_auto_label_next = QPushButton("⏭️ 다음 사진 일괄 적용")
+        self.btn_auto_label_next.setStyleSheet("background-color: #fed7aa; font-weight: bold; color: #9a3412; padding: 5px;")
+        self.btn_auto_label_next.clicked.connect(self.run_auto_labeling_next)
+        
+        self.t6_auto_thr = QDoubleSpinBox()
+        self.t6_auto_thr.setRange(0.4, 0.99); self.t6_auto_thr.setValue(0.75); self.t6_auto_thr.setSingleStep(0.05)
+        h_thr = QHBoxLayout(); h_thr.addWidget(QLabel("<b>유사도:</b>")); h_thr.addWidget(self.t6_auto_thr); h_thr.addStretch()
+
+        self.t6_auto_nms = QDoubleSpinBox()
+        self.t6_auto_nms.setRange(0.0, 1.0); self.t6_auto_nms.setValue(0.3); self.t6_auto_nms.setSingleStep(0.05)
+        h_nms = QHBoxLayout(); h_nms.addWidget(QLabel("<b>NMS(중복제거):</b>")); h_nms.addWidget(self.t6_auto_nms); h_nms.addStretch()
+        
+        auto_layout.addLayout(h_thr); auto_layout.addLayout(h_nms)
+        auto_layout.addWidget(self.btn_auto_label); auto_layout.addWidget(self.btn_auto_label_next) 
+        side_layout.addWidget(auto_group)
+        side_layout.addSpacing(10)
+        
+        label_info_group = QGroupBox("현재 라벨 목록")
+        label_info_layout = QVBoxLayout(label_info_group)
+        label_info_layout.setContentsMargins(5, 5, 5, 5)
+        
+        self.t6_label_list = QListWidget()
+        self.t6_label_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.t6_label_list.itemSelectionChanged.connect(self.on_label_selection_changed)
+        
+        btn_layout = QHBoxLayout()
+        self.btn_change_class = QPushButton("🔄 변경")
+        self.btn_delete_label = QPushButton("🗑️ 삭제")
+        self.btn_change_class.clicked.connect(self.on_change_class_clicked)
+        self.btn_delete_label.clicked.connect(self.on_delete_label_clicked)
+        btn_layout.addWidget(self.btn_change_class); btn_layout.addWidget(self.btn_delete_label)
+        
+        label_info_layout.addWidget(self.t6_label_list, stretch=1)
+        label_info_layout.addLayout(btn_layout)
+        side_layout.addWidget(label_info_group, stretch=1)
+        
+        right_l.addWidget(self.t6_view, stretch=4)
+        right_l.addWidget(side_panel, stretch=1)
+        
+        split.addWidget(left_w); split.addWidget(right_w)
+        split.setSizes([300, 1100])
+        
+        layout = QVBoxLayout(); layout.addWidget(split)
+        tab = QWidget(); tab.setLayout(layout)
+        self.tabs.addTab(tab, "🖌️ 라벨링 툴")
+
+    def go_to_preprocess_tab(self):
+        if hasattr(self, 't1_class_map'): self.t1_class_map.setText(self.t6_class_map.toPlainText())
+        img_path = Path(self.t6_img_dir.get_path())
+        parent_dir = img_path.parent 
+        if parent_dir.exists():
+            self.w_base_ds.line_edit.setText(str(parent_dir))
+            self.w_proc_ds.line_edit.setText(str(parent_dir / "processed_dataset"))
+            self.tabs.setCurrentIndex(1)
+            self.statusBar().showMessage("➡️ 라벨링 완료! 경로가 연동되었습니다. [전처리 시작] 버튼을 눌러주세요.", 5000)
+
+    def browse_tab4_eval_model(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "평가할 YOLO 모델 선택", 
+            str(Path(self.w_work_ds.get_path()) / "runs" / "retrain_train"), 
+            "PyTorch Model (*.pt);;All Files (*)"
+        )
+        if path:
+            self.t4_eval_model_display.setText(path)
+            self.t4_btn_eval.setEnabled(True)
+            self.statusBar().showMessage(f"📂 모델 로드됨: {Path(path).name}", 3000)
+
+    def export_project_dialog(self):
+        t3_model = self.t3_model.get_path()
+        t4_model = self.t4_eval_model_display.text()
+
+        has_base = t3_model and Path(t3_model).exists()
+        has_retrained = t4_model and Path(t4_model).exists()
+
+        if not has_base and not has_retrained:
+            QMessageBox.warning(self, "경고", "내보낼 모델(.pt)을 찾을 수 없습니다.\n먼저 학습이나 재학습을 완료하거나 탭에 모델을 지정해주세요.")
+            return
+
+        proj_name = Path(self.w_proj_root.get_path()).name
+        default_save_name = f"{proj_name}.zip"
+
+        save_path, _ = QFileDialog.getSaveFileName(self, "프로젝트 내보내기 (Zip)", default_save_name, "Zip Files (*.zip)")
+        if not save_path: return
+
+        config_data = self.config_builder.build(self)
+        if "global" in config_data and "webhook_url" in config_data["global"]:
+            config_data["global"]["webhook_url"] = ""
+        final_json_data = {
+            "metadata": {
+                "saved_at": datetime.now().strftime("%Y%m%d_%H%M%S"), 
+                "type": "project_snapshot",
+                "has_base_model": has_base,
+                "has_retrained_model": has_retrained
+            },
+            "config": config_data
+        }
+
+        self.statusBar().showMessage("📦 프로젝트 내보내기 중...")
+        try:
+            with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("config.json", json.dumps(final_json_data, ensure_ascii=False, indent=4))
+                if has_base: zf.write(t3_model, "base_model.pt")
+                if has_retrained: zf.write(t4_model, "retrained_model.pt")
+            
+            QMessageBox.information(self, "내보내기 완료", f"모델과 설정이 성공적으로 저장되었습니다:\n{save_path}")
+            self.statusBar().showMessage(f"✅ 프로젝트 내보내기 완료: {Path(save_path).name}", 5000)
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"프로젝트 내보내기 중 오류 발생:\n{e}")
+            self.statusBar().clearMessage()
+
+    def import_project_dialog(self):
+        load_path, _ = QFileDialog.getOpenFileName(self, "프로젝트 불러오기 (Zip)", "", "Zip Files (*.zip)")
+        if not load_path: return
+    
+        import_name = Path(load_path).stem 
+        current_root_parent = Path(self.w_proj_root.get_path()).parent
+        new_proj_path = current_root_parent / import_name
+        
+        is_renamed = False
+        original_name = new_proj_path.name
+        counter = 1
+        while new_proj_path.exists():
+            is_renamed = True
+            new_proj_path = current_root_parent / f"{import_name}_{counter}"
+            counter += 1
+            
+        new_proj_path.mkdir(parents=True, exist_ok=True)
+        target_dir = new_proj_path / "workspace" / f"Imported_{import_name}"
+        target_dir.mkdir(parents=True, exist_ok=True)
+    
+        self.statusBar().showMessage(f"📥 '{new_proj_path.name}' 프로젝트를 구성하는 중...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        
+        try:
+            with zipfile.ZipFile(load_path, 'r') as zf: zf.extractall(target_dir)
+            
+            config_file = target_dir / "config.json"
+            config_data = {}
+            if config_file.exists():
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                config_data = data.get("config", {})
+    
+            self.w_proj_root.line_edit.setText(str(new_proj_path))
+            self.apply_loaded_config(config_data)
+            
+            legacy_model = target_dir / "model.pt"
+            base_model = target_dir / "base_model.pt"
+            retrained_model = target_dir / "retrained_model.pt"
+    
+            if base_model.exists():
+                model_path_str = str(base_model.resolve())
+                self.t3_model.line_edit.setText(model_path_str)
+                self.t4_base.line_edit.setText(model_path_str)
+                self.t5_model.line_edit.setText(model_path_str)
+            elif legacy_model.exists():  
+                model_path_str = str(legacy_model.resolve())
+                self.t3_model.line_edit.setText(model_path_str)
+                self.t4_base.line_edit.setText(model_path_str)
+                self.t5_model.line_edit.setText(model_path_str)
+    
+            if retrained_model.exists():
+                retrained_path_str = str(retrained_model.resolve())
+                self.t4_eval_model_display.setText(retrained_path_str) 
+                self.t4_btn_eval.setEnabled(True)
+                self.t5_model.line_edit.setText(retrained_path_str)
+            
+            self.config_manager.update_workspace_path(str(new_proj_path / "workspace"))
+            QApplication.restoreOverrideCursor()
+            
+            if is_renamed:
+                QMessageBox.warning(self, "⚠️ 이름 충돌 및 복구 완료", f"기존에 '{original_name}' 폴더가 이미 존재하여 이름이 변경되었습니다!\n\n📁 새 폴더명: {new_proj_path.name}\n\n데이터는 정상적으로 복구 및 연동되었으나,\n작업을 돌릴 때 경로가 맞는지 반드시 확인해주세요!")
+                self.statusBar().showMessage(f"⚠️ 폴더 이름 변경됨: {new_proj_path.name} 로 복구 완료", 7000)
+            else:
+                QMessageBox.information(self, "✅ 불러오기 완료", f"새 프로젝트가 깔끔하게 구성되었습니다.\n\n📁 루트: {new_proj_path.name}\n📦 복구 데이터: workspace/Imported_{import_name}\n\n모든 경로가 자동 연동되었습니다.")
+                self.statusBar().showMessage(f"✅ 프로젝트 불러오기 완료: {new_proj_path.name}", 5000)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "❌ 오류", f"프로젝트 불러오기 중 오류 발생:\n{e}")
+            self.statusBar().clearMessage()
+
+    def setup_tab1(self):
+        form = QFormLayout()
+        self.t1_auto_crop = QCheckBox(); self.t1_auto_crop.setChecked(True)
+        self.t1_margin = QSpinBox(); self.t1_margin.setRange(0, 500); self.t1_margin.setValue(50)
+        
+        h_crop = QHBoxLayout()
+        self.t1_mx = QSpinBox(); self.t1_my = QSpinBox(); self.t1_mw = QSpinBox(); self.t1_mh = QSpinBox()
+        self.t1_mw.setRange(1,9999); self.t1_mh.setRange(1,9999); self.t1_mw.setValue(1280); self.t1_mh.setValue(960)
+        for w, l in zip([self.t1_mx, self.t1_my, self.t1_mw, self.t1_mh], ["X", "Y", "W", "H"]):
+            h_crop.addWidget(QLabel(l)); h_crop.addWidget(w)
+        self.t1_auto_crop.stateChanged.connect(lambda state: [w.setEnabled(not state) for w in [self.t1_mx, self.t1_my, self.t1_mw, self.t1_mh]])
+        [w.setEnabled(False) for w in [self.t1_mx, self.t1_my, self.t1_mw, self.t1_mh]] 
+
+        self.t1_class_map = QTextEdit(); self.t1_class_map.setPlainText("OK\nNG"); self.t1_class_map.setMaximumHeight(80)
+        self.t1_clean = QCheckBox(); self.t1_clean.setChecked(True)
+        self.t1_exif = QCheckBox(); self.t1_exif.setChecked(True)
+
+        self.add_param(form, "자동 크롭", self.t1_auto_crop, True)
+        self.add_param(form, "자동 크롭 여백(px)", self.t1_margin, 50)
+        form.addRow("수동 크롭 영역", h_crop)
+        
+        self.btn_scan_classes = QPushButton("🔍 데이터셋에서 클래스 자동 추출")
+        self.btn_scan_classes.setStyleSheet("background-color: #dbeafe; font-weight: bold; color: #1e3a8a; padding: 5px;")
+        self.btn_scan_classes.clicked.connect(self.scan_classes_from_data)
+        
+        v_class_layout = QVBoxLayout()
+        v_class_layout.addWidget(self.t1_class_map)
+        v_class_layout.addWidget(self.btn_scan_classes)
+        form.addRow(QLabel("클래스 목록\n(엔터로 구분)"), v_class_layout)
+
+        self.add_param(form, "기존 출력 폴더 초기화", self.t1_clean, True)
+        self.add_param(form, "EXIF 회전 보정", self.t1_exif, True)
+        
+        self.t1_btn_run = QPushButton("🚀 전처리 시작"); self.t1_btn_run.clicked.connect(self.run_tab1)
+        self.t1_progress = QProgressBar(); self.t1_log = QTextEdit(); self.t1_log.setReadOnly(True)
+
+        self.t1_img_grid = ImageGridWidget(max_display=100)
+
+        split = QSplitter(Qt.Horizontal)
+        left_w = QWidget()
+        left_l = QVBoxLayout(left_w)
+        left_l.addWidget(self._create_scroll(form))
+        left_l.addWidget(self.t1_btn_run)
+        left_l.addWidget(self.t1_progress)
+        left_l.addWidget(self.t1_log)
+        
+        right_w = QWidget()
+        right_l = QVBoxLayout(right_w)
+        right_l.addWidget(QLabel("<b>전처리 결과 이미지 미리보기</b>"))
+        right_l.addWidget(self.t1_img_grid)
+        
+        split.addWidget(left_w); split.addWidget(right_w)
+        split.setSizes([600, 800])
+        layout = QVBoxLayout(); layout.addWidget(split)
+        tab = QWidget(); tab.setLayout(layout)
+        self.tabs.addTab(tab, "✂️ 데이터 전처리")
+
+    def run_tab1(self):
+        base_dir = Path(self.w_base_ds.get_path())
+        
+        is_valid, err = self.validate_paths(원본_데이터_dir=base_dir, 이미지_dir=base_dir/"image", 라벨_dir=base_dir/"data")
+        if not is_valid:
+            QMessageBox.warning(self, "경로 오류", err); return
+
+        success, cmap_or_error = self.parse_and_validate_class_map(self.t1_class_map.toPlainText())
+        if not success:
+            QMessageBox.warning(self, "클래스 매핑 오류", cmap_or_error); return
+
+        config = {
+            "base_dir": self.w_base_ds.get_path(), "processed_dir": self.w_proc_ds.get_path(),
+            "use_auto_crop": self.t1_auto_crop.isChecked(), "margin": self.t1_margin.value(),
+            "manual_crop": (self.t1_mx.value(), self.t1_my.value(), self.t1_mw.value(), self.t1_mh.value()),
+            "class_map": cmap_or_error, "clean_old": self.t1_clean.isChecked(), "use_exif": self.t1_exif.isChecked()
+        }
+        self.t1_btn_run.setEnabled(False)
+        self.t1_log.clear()
+        
+        self.statusBar().showMessage("✂️ 데이터 전처리 진행 중... 잠시만 기다려주세요.")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        
+        self.t1_thread = PreprocessThread(config)
+        self.t1_thread.progress.connect(self.t1_progress.setValue)
+        self.t1_thread.log_msg.connect(self.t1_log.append)
+        self.t1_thread.error.connect(lambda e: QMessageBox.critical(self, "오류", e))
+        self.t1_thread.finished_ok.connect(self.on_tab1_finished)
+        self.t1_thread.finished.connect(lambda: [
+            self.t1_btn_run.setEnabled(True), QApplication.restoreOverrideCursor(), self.statusBar().showMessage("✅ 전처리 완료", 5000)
+        ])
+        self.t1_thread.start()
+
+    def on_tab1_finished(self, ok_count):
+        QMessageBox.information(self, "완료", f"{ok_count}장 전처리 완료!")
+        proc_img_dir = Path(self.w_proc_ds.get_path()) / "images"
+        if proc_img_dir.exists():
+            valid_exts = {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}
+            img_files = [str(f) for f in proc_img_dir.iterdir() if f.suffix.lower() in valid_exts]
+            self.t1_img_grid.update_images(img_files)
+
+    def setup_tab2(self):
+        f = QFormLayout()
+        
+        self.t2_epochs = QSpinBox(); self.t2_epochs.setRange(1, 5000); self.t2_epochs.setValue(400)
+        self.t2_batch = QSpinBox(); self.t2_batch.setRange(1, 256); self.t2_batch.setValue(16)
+        self.t2_workers = QSpinBox(); self.t2_workers.setRange(0, 32); self.t2_workers.setValue(8)
+        self.t2_patience = QSpinBox(); self.t2_patience.setRange(0, 10000); self.t2_patience.setValue(100)
+        self.t2_seed = QSpinBox(); self.t2_seed.setRange(0, 999999); self.t2_seed.setValue(42)
+        self.t2_folds = QSpinBox(); self.t2_folds.setRange(1, 10); self.t2_folds.setValue(5)
+        self.t2_test_split = QDoubleSpinBox(); self.t2_test_split.setRange(0.05, 0.6); self.t2_test_split.setValue(0.2); self.t2_test_split.setSingleStep(0.05)
+        
+        self.t2_lcls = QDoubleSpinBox(); self.t2_lcls.setRange(0.1, 10.0); self.t2_lcls.setValue(0.5); self.t2_lcls.setSingleStep(0.1)
+        self.t2_lbox = QDoubleSpinBox(); self.t2_lbox.setRange(0.1, 20.0); self.t2_lbox.setValue(7.5); self.t2_lbox.setSingleStep(0.5)
+        self.t2_ldfl = QDoubleSpinBox(); self.t2_ldfl.setRange(0.1, 10.0); self.t2_ldfl.setValue(1.5); self.t2_ldfl.setSingleStep(0.1)
+
+        def make_dbl(rng, val, step): b = QDoubleSpinBox(); b.setRange(*rng); b.setDecimals(3 if step < 0.01 else 2); b.setSingleStep(step); b.setValue(val); return b
+        
+        self.t2_ah = make_dbl((0, 0.1), 0.015, 0.001); self.t2_as = make_dbl((0, 1.0), 0.7, 0.05); self.t2_av = make_dbl((0, 1.0), 0.4, 0.05)
+        self.t2_adeg = make_dbl((0, 45.0), 0.0, 1.0); self.t2_atrans = make_dbl((0, 0.5), 0.1, 0.01); self.t2_ascale = make_dbl((0, 1.0), 0.5, 0.05)
+        self.t2_ashear = make_dbl((0, 30.0), 0.0, 1.0); self.t2_afud = make_dbl((0, 1.0), 0.0, 0.05); self.t2_aflr = make_dbl((0, 1.0), 0.5, 0.05)
+        self.t2_amos = make_dbl((0, 1.0), 1.0, 0.05); self.t2_amix = make_dbl((0, 1.0), 0.0, 0.05); self.t2_acp = make_dbl((0, 1.0), 0.0, 0.05)
+
+        f.addRow(QLabel("<b>[기본 파라미터]</b>"))
+        self.add_param(f, "Epochs", self.t2_epochs, 400); self.add_param(f, "Batch", self.t2_batch, 16); self.add_param(f, "Workers", self.t2_workers, 8)
+        self.add_param(f, "Patience (조기 종료)", self.t2_patience, 100)
+        self.add_param(f, "Random Seed", self.t2_seed, 42)
+        self.add_param(f, "Fold 수", self.t2_folds, 5); self.add_param(f, "Test 분리 비율", self.t2_test_split, 0.2)
+        
+        f.addRow(QLabel("<br><b>[Loss 가중치]</b>"))
+        self.add_param(f, "cls", self.t2_lcls, 0.5); self.add_param(f, "box", self.t2_lbox, 7.5); self.add_param(f, "dfl", self.t2_ldfl, 1.5)
+        
+        f.addRow(QLabel("<br><b>[데이터 증강]</b>"))
+        self.add_param(f, "HSV(H)", self.t2_ah, 0.015); self.add_param(f, "HSV(S)", self.t2_as, 0.7); self.add_param(f, "HSV(V)", self.t2_av, 0.4)
+        self.add_param(f, "Degrees", self.t2_adeg, 0.0); self.add_param(f, "Translate", self.t2_atrans, 0.1); self.add_param(f, "Scale", self.t2_ascale, 0.5)
+        self.add_param(f, "Shear", self.t2_ashear, 0.0); self.add_param(f, "Flip UD", self.t2_afud, 0.0); self.add_param(f, "Flip LR", self.t2_aflr, 0.5)
+        self.add_param(f, "Mosaic", self.t2_amos, 1.0); self.add_param(f, "Mixup", self.t2_amix, 0.0); self.add_param(f, "Copy-Paste", self.t2_acp, 0.0)
+
+        self.t2_btn_run = QPushButton("🚀 K-Fold 학습 시작"); self.t2_btn_run.clicked.connect(self.run_tab2)
+        self.t2_btn_stop = QPushButton("🛑 강제 종료"); self.t2_btn_stop.clicked.connect(self.stop_training); self.t2_btn_stop.setEnabled(False)
+
+        l = QVBoxLayout()
+        self.t2_scroll = self._create_scroll(f); l.addWidget(self.t2_scroll)              
+        h = QHBoxLayout(); h.addWidget(self.t2_btn_run); h.addWidget(self.t2_btn_stop); l.addLayout(h)
+        tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "🏋️ K-Fold 학습")
+
+    def run_tab2(self):
+        if self.training_process and self.training_process.is_alive():
+            QMessageBox.warning(self, "경고", "이미 진행 중인 프로세스가 있습니다.")
+            return
+
+        proc_dir = Path(self.w_proc_ds.get_path())
+        is_valid, err = self.validate_paths(처리된_데이터_dir=proc_dir, 이미지_dir=proc_dir/"images", 라벨_dir=proc_dir/"labels")
+        if not is_valid:
+            QMessageBox.warning(self, "경로 오류", err); return
+            
+        if not self.g_model.currentText():
+            QMessageBox.warning(self, "입력 오류", "학습에 사용할 베이스 모델을 선택해주세요."); return
+
+        if self.t2_folds.value() == 1:
+            reply = QMessageBox.question(
+                self, '학습 방식 확인', 
+                f'Fold 수가 1개로 설정되어 있습니다.\nK-Fold 교차 검증 없이 단일 분할 학습으로 진행됩니다.\n(Train {int((1-self.t2_test_split.value())*100)}% : Val {int(self.t2_test_split.value()*100)}%)\n\n학습을 계속하시겠습니까?',
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            )
+            if reply == QMessageBox.No: return
+                
+        success, cmap_or_error = self.parse_and_validate_class_map(self.t1_class_map.toPlainText())
+        if not success:
+            QMessageBox.warning(self, "클래스 매핑 오류", cmap_or_error); return
+
+        args = {
+            "processed_dir": self.w_proc_ds.get_path(), "workspace_dir": self.w_work_ds.get_path(), 
+            "webhook_url": self.w_webhook.text().strip(),
+            "noti_flags": self.get_noti_flags(),
+            "model_name": self.g_model.currentText(), "imgsz": int(self.g_imgsz.currentText()),
+            "epochs": self.t2_epochs.value(), "batch": self.t2_batch.value(), "workers": self.t2_workers.value(), 
+            "patience": self.t2_patience.value(), "random_seed": self.t2_seed.value(), "deterministic": True,
+            "num_folds": self.t2_folds.value(), "test_split": self.t2_test_split.value(), "best_metric": "metrics/mAP50-95(B)", "second_metric": "metrics/mAP50(B)",
+            "class_names": list(cmap_or_error.keys()),
+            "aug": {"h": self.t2_ah.value(), "s": self.t2_as.value(), "v": self.t2_av.value(), "deg": self.t2_adeg.value(), "trans": self.t2_atrans.value(), "scale": self.t2_ascale.value(),
+                    "shear": self.t2_ashear.value(), "fud": self.t2_afud.value(), "flr": self.t2_aflr.value(), "mos": self.t2_amos.value(), "mix": self.t2_amix.value(), "cp": self.t2_acp.value()},
+            "loss": {"cls": self.t2_lcls.value(), "box": self.t2_lbox.value(), "dfl": self.t2_ldfl.value()}
+        }
+        self.start_training_process(_kfold_train_worker, args)
+
+    def setup_tab3(self):
+        f = QFormLayout(); proc_dir, work_dir = Path(self.w_proc_ds.get_path()), Path(self.w_work_ds.get_path())
+        self.t3_model = PathInputWidget("평가 모델 (.pt)", False, str(work_dir/"kfold"/"best_model.pt")); f.addRow(self.t3_model)
+        self.t3_img = PathInputWidget("평가 이미지", True, str(proc_dir/"images")); f.addRow(self.t3_img)
+        self.t3_lbl = PathInputWidget("정답 라벨", True, str(proc_dir/"labels")); f.addRow(self.t3_lbl)
+
+        self.t3_conf = QDoubleSpinBox(); self.t3_conf.setRange(0.01, 0.99); self.t3_conf.setValue(0.25); self.t3_conf.setSingleStep(0.01)
+        self.t3_iou = QDoubleSpinBox(); self.t3_iou.setRange(0.01, 0.99); self.t3_iou.setValue(0.45); self.t3_iou.setSingleStep(0.01)
+        self.t3_match_iou = QDoubleSpinBox(); self.t3_match_iou.setRange(0.01, 0.99); self.t3_match_iou.setValue(0.45); self.t3_match_iou.setSingleStep(0.01)
+        self.t3_max_det = QSpinBox(); self.t3_max_det.setRange(1, 999); self.t3_max_det.setValue(99)
+        self.t3_run_name = QLineEdit("check01")
+        self.t3_agnostic = QCheckBox(); self.t3_agnostic.setChecked(True)
+        self.t3_save_rel = QCheckBox(); self.t3_save_rel.setChecked(True)
+
+        self.add_param(f, "Confidence Threshold", self.t3_conf, 0.25)
+        self.add_param(f, "IoU (NMS)", self.t3_iou, 0.45)
+        self.add_param(f, "정답 매칭 IoU", self.t3_match_iou, 0.45)
+        self.add_param(f, "최대 탐지 수", self.t3_max_det, 99)
+        self.add_param(f, "실행 이름", self.t3_run_name, "check01")
+        self.add_param(f, "Agnostic NMS", self.t3_agnostic, True)
+        self.add_param(f, "오답 별도 저장 (재학습용)", self.t3_save_rel, True)
+
+        self.t3_btn_run = QPushButton("🔍 평가 및 오답 선별 실행"); self.t3_btn_run.clicked.connect(self.run_tab3)
+        self.btn_send_t3_to_t5 = QPushButton("➡️ 이 모델과 설정으로 거리 측정하기")
+        self.btn_send_t3_to_t5.setStyleSheet("background-color: #dbeafe; font-weight: bold; color: #1e3a8a;")
+        self.btn_send_t3_to_t5.clicked.connect(lambda: self.send_to_measure_tab(
+            self.t3_model.get_path(), self.t3_img.get_path(), self.t3_conf.value(),
+            self.t3_iou.value(), self.t3_max_det.value(), self.t3_agnostic.isChecked()
+        ))
+        
+        self.t3_table = QTableWidget(0, 5)
+        self.t3_table.setHorizontalHeaderLabels(["파일명", "상태", "예측 수", "정답 수", "사유"])
+        self._apply_table_style(self.t3_table)
+        header = self.t3_table.horizontalHeader()
+        for i in range(self.t3_table.columnCount()): header.setSectionResizeMode(i, QHeaderView.Stretch)
+        self.t3_table.setSortingEnabled(True)
+        self.t3_table.itemDoubleClicked.connect(self.on_t3_table_double_clicked)
+        self.t3_table.setToolTip("더블 클릭하면 해당 이미지를 원본 크기로 엽니다.")
+
+        self.t3_img_grid = ImageGridWidget(max_display=100)
+        self.t3_chk_show_all = QCheckBox("전체 평가 이미지 보기")
+        self.t3_chk_show_all.setEnabled(False)
+        self.t3_chk_show_all.stateChanged.connect(self.update_tab3_visualization)
+
+        split = QSplitter(Qt.Horizontal)
+        t_w = QWidget(); t_l = QVBoxLayout(t_w)
+        t_l.addWidget(self._create_scroll(f))
+        t_l.addWidget(self.t3_btn_run); t_l.addWidget(self.btn_send_t3_to_t5)
+        t_l.addWidget(QLabel("<b>평가 결과 목록</b> (더블 클릭하여 이미지 확인)")); t_l.addWidget(self.t3_table)
+        
+        i_w = QWidget(); i_l = QVBoxLayout(i_w)
+        i_header = QHBoxLayout(); i_header.addWidget(QLabel("<b>예측 결과 시각화</b>")); i_header.addStretch(1); i_header.addWidget(self.t3_chk_show_all)
+        i_l.addLayout(i_header); i_l.addWidget(self.t3_img_grid)
+        
+        split.addWidget(t_w); split.addWidget(i_w)
+        split.setSizes([700, 700])
+        l = QVBoxLayout(); l.addWidget(split)
+        tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "🔍 평가 & 선별")
+
+    def run_tab3(self):
+        is_valid, err = self.validate_paths(
+            평가모델_file=Path(self.t3_model.get_path()),
+            평가이미지_dir=Path(self.t3_img.get_path()),
+            정답라벨_dir=Path(self.t3_lbl.get_path())
+        )
+        if not is_valid:
+            QMessageBox.warning(self, "경로 오류", err); return
+
+        config = {
+            "eval_model_path": self.t3_model.get_path(), "eval_source": self.t3_img.get_path(), "gt_labels_path": self.t3_lbl.get_path(), "workspace_dir": self.w_work_ds.get_path(),
+            "eval_run_name": self.t3_run_name.text(), "eval_conf": self.t3_conf.value(), "eval_iou": self.t3_iou.value(), "match_iou": self.t3_match_iou.value(),
+            "max_det": self.t3_max_det.value(), "agnostic_nms": self.t3_agnostic.isChecked(), "save_relabel": self.t3_save_rel.isChecked()
+        }
+        self.t3_btn_run.setEnabled(False)
+        self.statusBar().showMessage("🔍 평가 및 오답 선별 진행 중... (데이터 크기에 따라 시간이 소요됩니다)")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        
+        self.t3_thread = EvalThread(config)
+        self.t3_thread.finished_ok.connect(self.on_tab3_finished)
+        self.t3_thread.error.connect(lambda e: QMessageBox.critical(self, "오류", e))
+        self.t3_thread.finished.connect(lambda: [
+            self.t3_btn_run.setEnabled(True), QApplication.restoreOverrideCursor(), self.statusBar().clearMessage()
+        ])
+        self.t3_thread.start()
+
+    def on_tab3_finished(self, df, wrong_imgs, all_imgs, stats):
+        self.t3_last_wrong_imgs = wrong_imgs
+        self.t3_last_all_imgs = all_imgs
+        
+        self.t3_table.setSortingEnabled(False) 
+        self.t3_table.setRowCount(len(df))     
+        
+        for i, row in df.iterrows():
+            self.t3_table.setItem(i, 0, QTableWidgetItem(str(row["파일명"])))
+            self.t3_table.setItem(i, 1, QTableWidgetItem(str(row["상태"])))
+            self.t3_table.setItem(i, 2, QTableWidgetItem(str(row["예측 수"])))
+            self.t3_table.setItem(i, 3, QTableWidgetItem(str(row["정답 수"])))
+            self.t3_table.setItem(i, 4, QTableWidgetItem(str(row["사유"])))
+            for col in range(5): self.t3_table.item(i, col).setTextAlignment(Qt.AlignCenter)
+            
+        self.t3_table.setSortingEnabled(True) 
+        self.t3_chk_show_all.setEnabled(True)
+        self.t3_chk_show_all.blockSignals(True)
+        self.t3_chk_show_all.setChecked(False)
+        self.t3_chk_show_all.blockSignals(False)
+        self.update_tab3_visualization()
+        
+        QMessageBox.information(self, "평가 완료", f"총 {stats['total']}개 중 {stats['correct']}개 정답, {stats['wrong']}개 오답 (정확도 {stats['acc']:.1f}%)")
+        if stats["wrong"] > 0 and stats["relabel_dir"]:
+            self.t4_hard.line_edit.setText(stats["relabel_dir"]); self.t4_orig.line_edit.setText(self.t3_lbl.get_path()); self.t4_base.line_edit.setText(self.t3_model.get_path())
+
+    def update_tab3_visualization(self):
+        if not hasattr(self, 't3_last_all_imgs'): return
+        if self.t3_chk_show_all.isChecked(): self.t3_img_grid.update_images(self.t3_last_all_imgs)
+        else: self.t3_img_grid.update_images(self.t3_last_wrong_imgs)
+
+    def on_t3_table_double_clicked(self, item):
+        if not hasattr(self, 't3_last_all_imgs'): return
+        row = item.row()
+        file_name = self.t3_table.item(row, 0).text()
+        try:
+            index = next(i for i, path in enumerate(self.t3_last_all_imgs) if Path(path).name == file_name)
+            dialog = ImagePreviewDialog(self.t3_last_all_imgs, index, self)
+            dialog.exec_()
+        except StopIteration:
+            QMessageBox.warning(self, "오류", "해당 이미지 파일을 찾을 수 없습니다.")
+
+    def setup_tab4(self):
+        main_split = QSplitter(Qt.Horizontal)
+        left_widget = QWidget(); left_layout = QVBoxLayout(left_widget); left_layout.setContentsMargins(0, 0, 0, 0)
+        sub_tabs = QTabWidget(); left_layout.addWidget(sub_tabs)
+
+        sub_tab1 = QWidget(); st1_layout = QVBoxLayout(sub_tab1)
+        f1 = QFormLayout()
+        proc_dir, work_dir = Path(self.w_proc_ds.get_path()), Path(self.w_work_ds.get_path())
+        self.t4_hard = PathInputWidget("오답(Hard) 폴더", True, "")
+        self.t4_orig = PathInputWidget("원본 정답 폴더", True, str(proc_dir/"labels"))
+        self.t4_base = PathInputWidget("베이스 모델 (.pt)", False, str(work_dir/"kfold"/"best_model.pt"))
+        f1.addRow(self.t4_hard); f1.addRow(self.t4_orig); f1.addRow(self.t4_base)
+        
+        self.t4_epochs = QSpinBox(); self.t4_epochs.setRange(1, 1000); self.t4_epochs.setValue(10)
+        self.t4_batch = QSpinBox(); self.t4_batch.setRange(1, 256); self.t4_batch.setValue(16)
+        self.t4_run = QLineEdit("retrain_hard_01")
+        self.t4_lcls = QDoubleSpinBox(); self.t4_lcls.setRange(0.1, 10.0); self.t4_lcls.setValue(0.5); self.t4_lcls.setSingleStep(0.1)
+        self.t4_lbox = QDoubleSpinBox(); self.t4_lbox.setRange(0.1, 20.0); self.t4_lbox.setValue(7.5); self.t4_lbox.setSingleStep(0.5)
+
+        def make_dbl(rng, val, step): b = QDoubleSpinBox(); b.setRange(*rng); b.setDecimals(3 if step < 0.01 else 2); b.setSingleStep(step); b.setValue(val); return b
+        self.t4_ah = make_dbl((0, 0.1), 0.015, 0.001); self.t4_as = make_dbl((0, 1.0), 0.7, 0.05); self.t4_av = make_dbl((0, 1.0), 0.4, 0.05)
+        self.t4_afud = make_dbl((0, 1.0), 0.0, 0.05); self.t4_aflr = make_dbl((0, 1.0), 0.5, 0.05); self.t4_amos = make_dbl((0, 1.0), 1.0, 0.05)
+        self.t4_amix = make_dbl((0, 1.0), 0.0, 0.05); self.t4_acp = make_dbl((0, 1.0), 0.0, 0.05)
+
+        f1.addRow(QLabel("<b>[기본 설정]</b>"))
+        self.add_param(f1, "Epochs", self.t4_epochs, 10); self.add_param(f1, "Batch", self.t4_batch, 16); self.add_param(f1, "Run Name", self.t4_run, "retrain_hard_01")
+        self.add_param(f1, "cls Loss", self.t4_lcls, 0.5); self.add_param(f1, "box Loss", self.t4_lbox, 7.5)
+        f1.addRow(QLabel("<br><b>[재학습 증강 설정]</b>"))
+        self.add_param(f1, "HSV(H)", self.t4_ah, 0.015); self.add_param(f1, "HSV(S)", self.t4_as, 0.7); self.add_param(f1, "HSV(V)", self.t4_av, 0.4)
+        self.add_param(f1, "Flip UD", self.t4_afud, 0.0); self.add_param(f1, "Flip LR", self.t4_aflr, 0.5); self.add_param(f1, "Mosaic", self.t4_amos, 1.0)
+        self.add_param(f1, "Mixup", self.t4_amix, 0.0); self.add_param(f1, "Copy-Paste", self.t4_acp, 0.0)
+
+        self.t4_scroll = self._create_scroll(f1); st1_layout.addWidget(self.t4_scroll)
+        self.t4_btn_retrain = QPushButton("🔁 Hard Example 재학습 시작"); self.t4_btn_retrain.setMinimumHeight(40); self.t4_btn_retrain.clicked.connect(self.run_tab4_retrain)
+        st1_layout.addWidget(self.t4_btn_retrain)
+
+        sub_tab2 = QWidget(); st2_layout = QVBoxLayout(sub_tab2)
+        eval_group = QGroupBox("최종 평가 설정"); eval_layout = QVBoxLayout(eval_group); f2 = QFormLayout()
+
+        self.t4_conf = QDoubleSpinBox(); self.t4_conf.setRange(0.01, 0.99); self.t4_conf.setValue(0.25); self.t4_conf.setSingleStep(0.01)
+        self.t4_iou = QDoubleSpinBox(); self.t4_iou.setRange(0.01, 0.99); self.t4_iou.setValue(0.45); self.t4_iou.setSingleStep(0.01)
+        self.t4_match_iou = QDoubleSpinBox(); self.t4_match_iou.setRange(0.01, 0.99); self.t4_match_iou.setValue(0.45); self.t4_match_iou.setSingleStep(0.01)
+        self.t4_max_det = QSpinBox(); self.t4_max_det.setRange(1, 999); self.t4_max_det.setValue(99)
+        self.t4_agnostic = QCheckBox(); self.t4_agnostic.setChecked(True)
+
+        h_eval_model = QHBoxLayout()
+        self.t4_eval_model_display = QLineEdit()
+        self.t4_eval_model_display.setReadOnly(True) 
+        self.t4_eval_model_display.setPlaceholderText("모델을 선택하거나 첫 번째 탭에서 재학습을 완료하세요.")
+        self.t4_eval_model_display.setStyleSheet("background-color: #f3f4f6; color: #374151; font-weight: bold;")
+        self.btn_t4_eval_browse = QPushButton("📂"); self.btn_t4_eval_browse.setToolTip("평가할 모델(.pt) 파일을 직접 선택합니다."); self.btn_t4_eval_browse.clicked.connect(self.browse_tab4_eval_model)
+        h_eval_model.addWidget(self.t4_eval_model_display); h_eval_model.addWidget(self.btn_t4_eval_browse)
+        
+        f2.addRow("평가 대상 모델:", h_eval_model)
+        self.add_param(f2, "Confidence Threshold", self.t4_conf, 0.25)
+        self.add_param(f2, "IoU (NMS)", self.t4_iou, 0.45)
+        self.add_param(f2, "정답 매칭 IoU", self.t4_match_iou, 0.45)
+        self.add_param(f2, "최대 탐지 수", self.t4_max_det, 99)
+        self.add_param(f2, "Agnostic NMS", self.t4_agnostic, True)
+        eval_layout.addLayout(f2)
+
+        self.t4_btn_eval = QPushButton("📊 재학습 모델 최종 평가 실행"); self.t4_btn_eval.setMinimumHeight(40); self.t4_btn_eval.clicked.connect(self.run_tab4_eval); self.t4_btn_eval.setEnabled(False)
+        eval_layout.addWidget(self.t4_btn_eval)
+        
+        self.btn_send_t4_to_t5 = QPushButton("➡️ 이 재학습 모델과 설정으로 거리 측정하기")
+        self.btn_send_t4_to_t5.setStyleSheet("background-color: #dbeafe; font-weight: bold; color: #1e3a8a;")
+        self.btn_send_t4_to_t5.clicked.connect(lambda: self.send_to_measure_tab(
+            self.t4_eval_model_display.text(), self.t3_img.get_path(), self.t4_conf.value(),
+            self.t4_iou.value(), self.t4_max_det.value(), self.t4_agnostic.isChecked()
+        ))
+        eval_layout.addWidget(self.btn_send_t4_to_t5)
+        st2_layout.addWidget(eval_group)
+
+        self.t4_table = QTableWidget(0, 5)
+        self.t4_table.setHorizontalHeaderLabels(["파일명", "상태", "예측 수", "정답 수", "사유"])
+        self._apply_table_style(self.t4_table)
+        header = self.t4_table.horizontalHeader()
+        for i in range(self.t4_table.columnCount()): header.setSectionResizeMode(i, QHeaderView.Stretch)
+        self.t4_table.setSortingEnabled(True)
+        self.t4_table.itemDoubleClicked.connect(self.on_t4_table_double_clicked)
+        self.t4_table.setToolTip("더블 클릭하면 해당 이미지를 원본 크기로 엽니다.")
+
+        st2_layout.addWidget(QLabel("<b>전체 데이터 최종 평가 결과</b> (더블 클릭하여 이미지 확인)")); st2_layout.addWidget(self.t4_table)
+        sub_tabs.addTab(sub_tab1, "⚙️ 1. 재학습 설정 및 실행"); sub_tabs.addTab(sub_tab2, "📊 2. 재학습 모델 최종 평가")
+        main_split.addWidget(left_widget)
+
+        right_widget = QWidget(); right_layout = QVBoxLayout(right_widget); right_layout.setContentsMargins(10, 0, 0, 0)
+        self.t4_chk_show_all = QCheckBox("전체 평가 이미지 보기"); self.t4_chk_show_all.setEnabled(False); self.t4_chk_show_all.stateChanged.connect(self.update_tab4_visualization)
+
+        r_header = QHBoxLayout(); r_header.addWidget(QLabel("<b>최종 예측 결과 시각화</b>")); r_header.addStretch(1); r_header.addWidget(self.t4_chk_show_all)
+        self.t4_img_grid = ImageGridWidget(max_display=100)
+        right_layout.addLayout(r_header); right_layout.addWidget(self.t4_img_grid)
+
+        main_split.addWidget(right_widget); main_split.setSizes([600, 800])
+        tab_layout = QVBoxLayout(); tab_layout.addWidget(main_split)
+        tab = QWidget(); tab.setLayout(tab_layout); self.tabs.addTab(tab, "🔁 재학습")
+
+    def run_tab4_retrain(self):
+        if self.training_process and self.training_process.is_alive():
+            QMessageBox.warning(self, "경고", "이미 진행 중인 프로세스가 있습니다."); return
+
+        is_valid, err = self.validate_paths(
+            오답_dir=Path(self.t4_hard.get_path()),
+            원본정답_dir=Path(self.t4_orig.get_path()),
+            베이스모델_file=Path(self.t4_base.get_path())
+        )
+        if not is_valid:
+            QMessageBox.warning(self, "경로 오류", err); return
+
+        success, cmap_or_error = self.parse_and_validate_class_map(self.t1_class_map.toPlainText())
+        if not success: QMessageBox.warning(self, "클래스 매핑 오류", cmap_or_error); return
+
+        args = {
+            "rt_hard_dir": self.t4_hard.get_path(), "rt_orig_labels": self.t4_orig.get_path(), "rt_base_model": self.t4_base.get_path(),
+            "workspace_dir": self.w_work_ds.get_path(), 
+            "webhook_url": self.w_webhook.text().strip(),
+            "noti_flags": self.get_noti_flags(),
+            "imgsz": int(self.g_imgsz.currentText()), "class_names": list(cmap_or_error.keys()),
+            "rt_epochs": self.t4_epochs.value(), "rt_batch": self.t4_batch.value(), "rt_run_name": self.t4_run.text(),
+            "rt_cls": self.t4_lcls.value(), "rt_box": self.t4_lbox.value(), "rt_flipud": self.t4_afud.value(), "rt_fliplr": self.t4_aflr.value(),
+            "rt_mosaic": self.t4_amos.value(), "rt_h": self.t4_ah.value(), "rt_s": self.t4_as.value(), "rt_v": self.t4_av.value(), "rt_mix": self.t4_amix.value(), "rt_cp": self.t4_acp.value()
+        }
+        self.t4_btn_eval.setEnabled(False)
+        self.start_training_process(_retrain_worker, args)
+
+    def run_tab4_eval(self):
+        from ultralytics import YOLO
+        import yaml
+        
+        is_valid, err = self.validate_paths(
+            평가모델_file=Path(self.t4_eval_model_display.text()),
+            평가이미지_dir=Path(self.t3_img.get_path()),
+            정답라벨_dir=Path(self.t3_lbl.get_path())
+        )
+        if not is_valid:
+            QMessageBox.warning(self, "경로 오류", err); return
+
+        model_to_eval = Path(self.t4_eval_model_display.text())
+        eval_img = Path(self.t3_img.get_path())
+        eval_lbl = Path(self.t3_lbl.get_path())
+
+        self.statusBar().showMessage("🔍 모델 정보 추출 및 평가 준비 중...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+
+        eval_yaml_dir = Path(self.w_work_ds.get_path()) / "eval_tmp"
+        try:
+            temp_model = YOLO(str(model_to_eval))
+            model_class_names = temp_model.names
+            num_classes = len(model_class_names)
+            class_names_list = [model_class_names[i] for i in range(num_classes)]
+            del temp_model
+            clear_vram()
+
+            eval_yaml_dir.mkdir(parents=True, exist_ok=True)
+            yaml_path = eval_yaml_dir / "eval_data.yaml"
+
+            yaml_data = {
+                "path": eval_img.parent.resolve().as_posix(), "train": eval_img.name, "val": eval_img.name,
+                "nc": num_classes, "names": class_names_list
+            }
+            yaml_path.write_text(yaml.dump(yaml_data, sort_keys=False), encoding="utf-8")
+
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "모델 로드 오류", f"모델에서 클래스 정보를 추출하는 데 실패했습니다:\n{e}")
+            return
+
+        config = {
+            "retrained_model": str(model_to_eval), "yaml_path": str(yaml_path), "eval_source": str(eval_img), "gt_labels_path": str(eval_lbl),
+            "workspace_dir": self.w_work_ds.get_path(), "eval_run_name": self.t4_run.text(), "eval_conf": self.t4_conf.value(),
+            "eval_iou": self.t4_iou.value(), "match_iou": self.t4_match_iou.value(), "max_det": self.t4_max_det.value(), "agnostic_nms": self.t4_agnostic.isChecked(),
+            "webhook_url": self.w_webhook.text().strip(),
+            "noti_flags": self.get_noti_flags()
+        }
+        
+        self.t4_btn_eval.setEnabled(False)
+        self.statusBar().showMessage(f"📊 재학습 모델 최종 평가 진행 중... (클래스: {class_names_list})")
+        
+        self.t4_thread = Tab4FinalEvalThread(config)
+        self.t4_thread.finished_ok.connect(self.on_tab4_eval_finished)
+        self.t4_thread.error.connect(lambda e: QMessageBox.critical(self, "오류", e))
+        
+        def cleanup_tmp():
+            if eval_yaml_dir.exists():
+                shutil.rmtree(eval_yaml_dir, ignore_errors=True)
+                
+        self.t4_thread.finished.connect(lambda: [
+            self.t4_btn_eval.setEnabled(True), QApplication.restoreOverrideCursor(), self.statusBar().clearMessage(), cleanup_tmp()
+        ])
+        self.t4_thread.start()
+
+    def on_tab4_eval_finished(self, df, wrong_imgs, all_imgs, stats, pr_curve):
+        self.t4_last_wrong_imgs = wrong_imgs
+        self.t4_last_all_imgs = all_imgs
+        self.t4_table.setSortingEnabled(False) 
+        self.t4_table.setRowCount(len(df))     
+        for i, row in df.iterrows():
+            self.t4_table.setItem(i, 0, QTableWidgetItem(str(row["파일명"])))
+            self.t4_table.setItem(i, 1, QTableWidgetItem(str(row["상태"])))
+            self.t4_table.setItem(i, 2, QTableWidgetItem(str(row["예측 수"])))
+            self.t4_table.setItem(i, 3, QTableWidgetItem(str(row["정답 수"])))
+            self.t4_table.setItem(i, 4, QTableWidgetItem(str(row["사유"])))
+            for col in range(5): self.t4_table.item(i, col).setTextAlignment(Qt.AlignCenter)
+        self.t4_table.setSortingEnabled(True) 
+        self.t4_chk_show_all.setEnabled(True)
+        self.t4_chk_show_all.blockSignals(True)
+        self.t4_chk_show_all.setChecked(False)
+        self.t4_chk_show_all.blockSignals(False)
+        self.update_tab4_visualization()
+        QMessageBox.information(self, "최종 평가 완료", f"전체 데이터 최종 평가\n총 {stats['total']}개 중 {stats['correct']}개 정답, {stats['wrong']}개 오답 (정확도 {stats['acc']:.1f}%)")
+
+    def update_tab4_visualization(self):
+        if not hasattr(self, 't4_last_all_imgs'): return
+        if self.t4_chk_show_all.isChecked(): self.t4_img_grid.update_images(self.t4_last_all_imgs)
+        else: self.t4_img_grid.update_images(self.t4_last_wrong_imgs)
+
+    def on_t4_table_double_clicked(self, item):
+        if not hasattr(self, 't4_last_all_imgs'): return
+        row = item.row()
+        file_name = self.t4_table.item(row, 0).text()
+        try:
+            index = next(i for i, path in enumerate(self.t4_last_all_imgs) if Path(path).name == file_name)
+            dialog = ImagePreviewDialog(self.t4_last_all_imgs, index, self)
+            dialog.exec_()
+        except StopIteration:
+            QMessageBox.warning(self, "오류", "해당 이미지 파일을 찾을 수 없습니다.")
+
+    def setup_tab5(self):
+        f = QFormLayout(); proc_dir, work_dir = Path(self.w_proc_ds.get_path()), Path(self.w_work_ds.get_path())
+        self.t5_model = PathInputWidget("거리 측정 모델", False, str(work_dir/"kfold"/"best_model.pt")); f.addRow(self.t5_model)
+        self.t5_img = PathInputWidget("분석할 이미지 폴더", True, str(proc_dir/"images")); f.addRow(self.t5_img)
+        
+        self.t5_method = QComboBox(); self.t5_method.addItems(["테두리 최단거리 (Edge)", "중심점 유클리드 (Center)", "가장 가까운 N개 이웃 (방향 무관)"])
+        self.t5_conf = QDoubleSpinBox(); self.t5_conf.setRange(0.01, 0.99); self.t5_conf.setValue(0.25); self.t5_conf.setSingleStep(0.01)
+        self.t5_iou = QDoubleSpinBox(); self.t5_iou.setRange(0.01, 0.99); self.t5_iou.setValue(0.45); self.t5_iou.setSingleStep(0.05)
+        self.t5_max_det = QSpinBox(); self.t5_max_det.setRange(1, 1000); self.t5_max_det.setValue(300)
+        self.t5_agnostic = QCheckBox(); self.t5_agnostic.setChecked(True)
+
+        self.t5_knn_n = QSpinBox(); self.t5_knn_n.setRange(1, 10); self.t5_knn_n.setValue(2)
+        self.t5_edge_thr = QLineEdit("60")
+        
+        self.t5_skip_ng = QCheckBox(); self.t5_skip_ng.setChecked(True)
+        self.t5_drop_odd = QCheckBox(); self.t5_drop_odd.setChecked(True)
+
+        color_map = {
+            "노란색 (Yellow)": QColor(255, 255, 0), "초록색 (Green)": QColor(0, 255, 0), "빨간색 (Red)": QColor(255, 0, 0),
+            "파란색 (Blue)": QColor(0, 0, 255), "청록색 (Cyan)": QColor(0, 255, 255), "자주색 (Magenta)": QColor(255, 0, 255), "흰색 (White)": QColor(255, 255, 255)
+        }
+
+        def get_color_icon(color):
+            pixmap = QPixmap(16, 16); pixmap.fill(Qt.gray); painter = QPainter(pixmap)
+            painter.fillRect(1, 1, 14, 14, color); painter.end(); return QIcon(pixmap)
+
+        self.t5_color1 = QComboBox(); self.t5_color2 = QComboBox()
+        for name, color in color_map.items():
+            icon = get_color_icon(color)
+            self.t5_color1.addItem(icon, name); self.t5_color2.addItem(icon, name)
+
+        self.t5_color1.setCurrentText("노란색 (Yellow)"); self.t5_color2.setCurrentText("청록색 (Cyan)")
+
+        self.add_param(f, "측정 방식", self.t5_method, "테두리 최단거리 (Edge)")
+        self.add_param(f, "Confidence", self.t5_conf, 0.25)
+        self.add_param(f, "IoU (NMS)", self.t5_iou, 0.45)
+        self.add_param(f, "최대 탐지 수", self.t5_max_det, 300)
+        self.add_param(f, "Agnostic NMS", self.t5_agnostic, True)
+        self.add_param(f, "N개 이웃 (KNN 전용)", self.t5_knn_n, 2)
+        self.add_param(f, "Edge 분류 임계값", self.t5_edge_thr, "60")
+        self.add_param(f, "'NG' 클래스 제외", self.t5_skip_ng, True)
+        self.add_param(f, "홀수 개체 시 최저 신뢰도 제거", self.t5_drop_odd, True)
+        self.add_param(f, "수평/KNN 선 색상", self.t5_color1, "노란색 (Yellow)") 
+        self.add_param(f, "수직 선 색상 (Edge)", self.t5_color2, "청록색 (Cyan)")
+
+        self.t5_btn_run = QPushButton("📏 측정 및 통계 분석 실행"); self.t5_btn_run.clicked.connect(self.run_tab5)
+        self.t5_progress = QProgressBar() 
+        self.t5_canvas = FigureCanvas(plt.Figure(figsize=(10, 4.5))); self.t5_canvas.setMinimumHeight(300)
+        self.t5_toolbar = NavigationToolbar(self.t5_canvas, self)
+        
+        self.t5_img_grid = ImageGridWidget(max_display=100)
+
+        self.t5_chk_show_outliers = QCheckBox("🚨 이상치(Outlier) 이미지만 필터링")
+        self.t5_chk_show_outliers.setStyleSheet("color: red; font-weight: bold;")
+        self.t5_chk_show_outliers.setEnabled(False) 
+        self.t5_chk_show_outliers.stateChanged.connect(self.update_tab5_visualization)
+
+        split = QSplitter(Qt.Horizontal) 
+        c_w = QWidget(); c_l = QVBoxLayout(c_w)
+        c_l.addWidget(self._create_scroll(f), stretch=1)
+        c_l.addWidget(self.t5_btn_run); c_l.addWidget(self.t5_progress)    
+        c_l.addWidget(QLabel("<b>데이터 분포 시각화</b>")); c_l.addWidget(self.t5_toolbar); c_l.addWidget(self.t5_canvas, stretch=2)
+        
+        i_w = QWidget(); i_l = QVBoxLayout(i_w)
+        i_header_layout = QHBoxLayout()
+        i_header_layout.addWidget(QLabel("<b>측정 결과 시각화</b>")); i_header_layout.addStretch(1); i_header_layout.addWidget(self.t5_chk_show_outliers)
+        
+        i_l.addLayout(i_header_layout); i_l.addWidget(self.t5_img_grid)
+        split.addWidget(c_w); split.addWidget(i_w); split.setSizes([700, 700]) 
+        
+        l = QVBoxLayout(); l.addWidget(split)
+        tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "📏 거리 측정")
+
+    def run_tab5(self):
+        is_valid, err = self.validate_paths(
+            측정모델_file=Path(self.t5_model.get_path()),
+            분석이미지_dir=Path(self.t5_img.get_path())
+        )
+        if not is_valid:
+            QMessageBox.warning(self, "경로 오류", err); return
+
+        config = {
+            "dist_model_path": self.t5_model.get_path(), "dist_source": self.t5_img.get_path(), "workspace_dir": self.w_work_ds.get_path(),
+            "measure_method": self.t5_method.currentText(), "dist_conf": self.t5_conf.value(), "dist_iou": self.t5_iou.value(),
+            "dist_max_det": self.t5_max_det.value(), "dist_agnostic": self.t5_agnostic.isChecked(), "n_neighbors": self.t5_knn_n.value(),
+            "edge_thresholds": self.t5_edge_thr.text(), "skip_ng": self.t5_skip_ng.isChecked(), "drop_odd_lowest": self.t5_drop_odd.isChecked(),
+            "color1": self.t5_color1.currentText(), "color2": self.t5_color2.currentText(),
+            "webhook_url": self.w_webhook.text().strip(),
+            "noti_flags": self.get_noti_flags()
+        }
+        self.t5_btn_run.setEnabled(False)
+        self.statusBar().showMessage("📏 거리 측정 및 분석 진행 중... (이미지 수에 따라 시간이 소요됩니다)")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.t5_progress.setValue(0)
+        
+        self.t5_thread = MeasureThread(config)
+        self.t5_thread.progress.connect(self.t5_progress.setValue) 
+        self.t5_thread.finished_ok.connect(self.on_tab5_finished)
+        self.t5_thread.error.connect(lambda e: QMessageBox.critical(self, "오류", e))
+        
+        self.t5_thread.finished.connect(lambda: [
+            self.t5_btn_run.setEnabled(True), QApplication.restoreOverrideCursor(), self.statusBar().clearMessage()
+        ])
+        self.t5_thread.start()
+
+    def on_tab5_finished(self, df_export, df_parsed, df_outliers, image_pairs):
+        msg = f"거리 측정 및 분석 완료! (총 {len(df_export)}건)\n\n📂 다음 파일들이 폴더에 저장되었습니다:\n - 원본 결과 테이블 (results.csv)\n - 유형별 상세 통계 요약 (statistics.csv)\n"
+        if not df_outliers.empty: msg += f" - 이상치 목록 (outliers.csv) 🚨 {len(df_outliers)}건!\n"
+            
+        QMessageBox.information(self, "측정 및 분석 완료", msg)
+        self.t5_last_df_outliers = df_outliers
+        self.t5_last_image_pairs = image_pairs
+
+        self.t5_chk_show_outliers.setEnabled(True)
+        self.t5_chk_show_outliers.blockSignals(True) 
+        self.t5_chk_show_outliers.setChecked(False)
+        self.t5_chk_show_outliers.blockSignals(False)
+
+        if not df_parsed.empty:
+            self.t5_canvas.figure.clear(); ax1 = self.t5_canvas.figure.add_subplot(121); ax2 = self.t5_canvas.figure.add_subplot(122)
+            sns.kdeplot(data=df_parsed, x="거리(px)", hue="구분", fill=True, ax=ax1, palette="Set1", alpha=0.5); ax1.set_title("KDE Plot")
+            sns.boxenplot(data=df_parsed, x="구분", y="거리(px)", ax=ax2, palette="Set1"); ax2.set_title("Boxen Plot")
+            if not df_outliers.empty: sns.scatterplot(data=df_outliers, x="구분", y="거리(px)", color="red", marker="X", s=100, ax=ax2, label="Outliers", zorder=5)
+            self.t5_canvas.figure.tight_layout(); self.t5_canvas.draw()
+        
+        self.update_tab5_visualization()
+
+    def update_tab5_visualization(self):
+        if not hasattr(self, 't5_last_image_pairs'): return
+        if self.t5_chk_show_outliers.isChecked():
+            if self.t5_last_df_outliers.empty: self.t5_img_grid.update_images([]) 
+            else:
+                outlier_files = set(self.t5_last_df_outliers["파일명"].tolist())
+                imgs = [item["_img_path"] for item in self.t5_last_image_pairs if item["파일명"] in outlier_files]
+                self.t5_img_grid.update_images(imgs)
+        else:
+            imgs = [item["_img_path"] for item in self.t5_last_image_pairs]
+            self.t5_img_grid.update_images(imgs)
+
+
+if __name__ == '__main__':
+    multiprocessing.freeze_support()
+    
+    app = QApplication(sys.argv)
+    font_name = "Malgun Gothic" if platform.system() == "Windows" else "AppleGothic"
+    app.setFont(QFont(font_name, 10))
+    plt.rcParams["font.family"] = font_name
+    plt.rcParams["axes.unicode_minus"] = False
+
+    window = MainWindow(); window.showMaximized()
+    sys.exit(app.exec_())
