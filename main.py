@@ -77,7 +77,7 @@ class ConfigManager:
     def update_workspace_path(self, workspace_path):
         self._workspace_path = Path(workspace_path)
         self._config_dir = self._workspace_path / "configs"
-        self._config_dir.mkdir(parents=True, exist_ok=True)
+        # 프로그램 시작 시 폴더를 강제 생성하지 않도록 mkdir 제거 (설정 저장 시 생성됨)
 
     def save_config(self, config_data, config_name):
         try:
@@ -195,13 +195,15 @@ class LogDatabase:
     """학습 및 재학습 이력을 SQLite DB에 저장하고 관리하는 클래스"""
     def __init__(self, db_path):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+        # 초기화 시점에는 폴더나 DB 파일을 생성하지 않습니다 (지연 생성)
 
-    def _init_db(self):
+    def _ensure_db(self):
+        """실제 DB 읽기/쓰기가 발생할 때 폴더와 테이블이 있는지 확인하고 생성합니다."""
+        if not self.db_path.parent.exists():
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            # 1. 기존 학습 기록 테이블
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS training_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -215,24 +217,23 @@ class LogDatabase:
                     config_json TEXT
                 )
             ''')
-            # 2. 평가 및 오답(Hard Example) 기록 테이블 추가
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS evaluation_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp TEXT,
-                    task_type TEXT,          -- 'Tab 3 Eval' 또는 'Tab 4 Final Eval'
+                    task_type TEXT,
                     model_name TEXT,
-                    total_imgs INTEGER,      -- 전체 평가 이미지 수
-                    wrong_count INTEGER,     -- 틀린 이미지 수
-                    accuracy REAL,           -- 정확도(%)
-                    wrong_images TEXT,       -- 틀린 이미지 파일명 목록 (JSON Array)
+                    total_imgs INTEGER,
+                    wrong_count INTEGER,
+                    accuracy REAL,
+                    wrong_images TEXT,
                     config_json TEXT
                 )
             ''')
             conn.commit()
 
     def insert_log(self, task_type, model_name, epochs, batch, best_map, save_dir, config_data):
-        """학습이 성공적으로 끝났을 때 기록을 저장합니다."""
+        self._ensure_db()
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
@@ -247,19 +248,19 @@ class LogDatabase:
             conn.commit()
 
     def get_all_logs(self):
-        """DB에서 전체 기록을 불러옵니다 (최신순)."""
+        if not self.db_path.exists(): 
+            return []
+        self._ensure_db()
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT timestamp, task_type, model_name, epochs, batch_size, best_map, save_dir, config_json FROM training_logs ORDER BY id DESC')
             return cursor.fetchall()
 
     def insert_eval_log(self, task_type, model_name, total, wrong, accuracy, wrong_imgs_list, config_data):
-        """평가 기록을 저장합니다."""
+        self._ensure_db()
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            # 파일 경로 전체가 아닌 파일명만 추출하여 저장 (프로젝트 폴더가 이동해도 찾을 수 있게)
             filenames = [Path(p).name for p in wrong_imgs_list]
-            
             cursor.execute('''
                 INSERT INTO evaluation_logs 
                 (timestamp, task_type, model_name, total_imgs, wrong_count, accuracy, wrong_images, config_json)
@@ -267,13 +268,15 @@ class LogDatabase:
             ''', (
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 task_type, model_name, total, wrong, accuracy, 
-                json.dumps(filenames, ensure_ascii=False), # 리스트를 JSON 문자열로 변환하여 저장
+                json.dumps(filenames, ensure_ascii=False),
                 json.dumps(config_data, ensure_ascii=False)
             ))
             conn.commit()
 
     def get_all_eval_logs(self):
-        """평가 기록을 불러옵니다 (최신순)."""
+        if not self.db_path.exists(): 
+            return []
+        self._ensure_db()
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT timestamp, task_type, model_name, total_imgs, wrong_count, accuracy, wrong_images, config_json FROM evaluation_logs ORDER BY id DESC')
@@ -294,22 +297,19 @@ def send_discord_webhook(webhook_url, content):
         print(f"디스코드 웹훅 발송 실패: {e}")
 
 def create_heartbeat_callback(webhook_url, start_time, total_epochs):
-    """10 Epoch마다 ETA와 Loss를 계산해 디스코드로 보내는 콜백 함수를 생성합니다."""
+    """100 Epoch마다 ETA와 Loss를 계산해 디스코드로 보내는 콜백 함수를 생성합니다."""
     def on_train_epoch_end(trainer):
         # trainer.epoch는 0부터 시작하므로 +1 해줍니다.
         current_epoch = trainer.epoch + 1
         
-        # 10 Epoch 단위로만 실행
-        if current_epoch % 10 == 0:
+        # 100 Epoch 단위로만 실행
+        if current_epoch % 100 == 0:
             elapsed_sec = time.time() - start_time
             avg_time_per_epoch = elapsed_sec / current_epoch
             remaining_epochs = total_epochs - current_epoch
             eta_sec = avg_time_per_epoch * remaining_epochs
             
-            # 초(sec)를 "HH:MM:SS" 형태의 직관적인 문자열로 변환
             eta_str = str(timedelta(seconds=int(eta_sec)))
-            
-            # 훈련 Loss 합계 계산 (trainer.tloss에 Box, Cls, DFL Loss가 텐서로 들어있음)
             total_loss = trainer.tloss.sum().item()
             
             msg = (
@@ -317,8 +317,6 @@ def create_heartbeat_callback(webhook_url, start_time, total_epochs):
                 f"📉 현재 Total Loss: `{total_loss:.4f}`\n"
                 f"⏳ 남은 예상 시간: `{eta_str}`"
             )
-            
-            # 기존에 만드신 디스코드 웹훅 발송 함수 호출
             send_discord_webhook(webhook_url, msg)
             
     return on_train_epoch_end
@@ -397,7 +395,6 @@ def _kfold_train_worker(args: dict, queue):
 
             model = YOLO(model_name)
             
-            # 🟢 콜백 부착
             if webhook_url and noti_flags.get("task"):
                 heartbeat_cb = create_heartbeat_callback(webhook_url, start_time, epochs)
                 model.add_callback("on_train_epoch_end", heartbeat_cb)
@@ -434,7 +431,6 @@ def _kfold_train_worker(args: dict, queue):
 
                 model   = YOLO(model_name)
                 
-                # 🟢 콜백 부착
                 if webhook_url and noti_flags.get("task"):
                     heartbeat_cb = create_heartbeat_callback(webhook_url, start_time, epochs)
                     model.add_callback("on_train_epoch_end", heartbeat_cb)
@@ -567,7 +563,6 @@ def _retrain_worker(args: dict, queue):
 
         model = YOLO(str(rt_base_model))
         
-        # 🟢 콜백 부착
         if webhook_url and noti_flags.get("task"):
             heartbeat_cb = create_heartbeat_callback(webhook_url, start_time, p["rt_epochs"])
             model.add_callback("on_train_epoch_end", heartbeat_cb)
@@ -2116,16 +2111,13 @@ class MainWindow(QMainWindow):
         else:
             self.base_dir = Path(__file__).resolve().parent
             
-        self.tmp_dir = self.base_dir / ".tmp"
-        self.tmp_dir.mkdir(exist_ok=True)
-        
         default_proj_path = self.base_dir / "MyProject"
         
         # 설정 관리자 초기화
         self.config_manager = ConfigManager(str(default_proj_path))
         self.config_builder = ConfigBuilder()
         
-        # 🟢 SQLite DB 초기화
+        # 🟢 SQLite DB 초기화 (이 시점에서는 파일을 굽지 않고 경로만 들고 있습니다)
         db_file_path = self.base_dir / "MyProject" / "workspace" / "training_history.db"
         self.log_db = LogDatabase(db_file_path)
 
@@ -2177,7 +2169,7 @@ class MainWindow(QMainWindow):
         self.w_work_ds.line_edit.setText(str(proj_dir / "workspace"))
         self.config_manager.update_workspace_path(str(proj_dir / "workspace"))
         
-        # 🟢 프로젝트가 변경되면 DB 경로도 변경
+        # 프로젝트가 변경되면 DB 경로도 변경
         db_file_path = proj_dir / "workspace" / "training_history.db"
         self.log_db = LogDatabase(db_file_path)
 
@@ -2381,7 +2373,6 @@ class MainWindow(QMainWindow):
         self.btn_toggle_tooltip.setCheckable(True)
         self.btn_toggle_tooltip.toggled.connect(self.on_toggle_tooltips)
         
-        # 🟢 DB 로그 뷰어 버튼
         self.btn_show_logs = QPushButton("📊 학습 이력(DB)")
         self.btn_show_logs.setStyleSheet("background-color: #e0e7ff; border: 1px solid #a5b4fc; padding: 5px; border-radius: 4px; font-weight: bold; color: #3730a3;")
         self.btn_show_logs.clicked.connect(self.show_log_viewer)
@@ -2750,7 +2741,6 @@ class MainWindow(QMainWindow):
             if "metrics_summary" in res: 
                 self.show_kfold_metrics_dialog(res["metrics_summary"], res["msg"], res.get("best_fold", ""))
                 
-                # 🟢 DB 기록: 평균 mAP 저장
                 avg_map = 0.0
                 for summary in res["metrics_summary"]:
                     if summary["Fold"] == "Average":
@@ -2768,7 +2758,6 @@ class MainWindow(QMainWindow):
                 )
             else: 
                 QMessageBox.information(self, "완료", res["msg"])
-                # 🟢 DB 기록: 재학습 완료
                 self.log_db.insert_log(
                     task_type="Hard Retrain",
                     model_name=Path(self.t4_base.get_path()).name,
@@ -3561,7 +3550,7 @@ class MainWindow(QMainWindow):
         self.t3_chk_show_all.blockSignals(False)
         self.update_tab3_visualization()
         
-        # 🟢 평가 로그 DB 기록
+        # 평가 로그 DB 기록
         current_config = self.config_builder.build(self)
         model_name = Path(self.t3_model.get_path()).name
         self.log_db.insert_eval_log(
