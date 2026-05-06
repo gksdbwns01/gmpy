@@ -29,14 +29,15 @@ JSON 형식으로 모든 파라미터 저장
 라벨링 작업 할 경우 폴더는 따로 백업해야됨
 웹훅>>
 https://discord.com/api/webhooks/1499309543136690248/cr2zCJUKE9MM1xgxetzuX-ZTWqatZZJXxwrI8TeYpeDIVRPWYsWxwgEt4RNqV2V0KVCu
+진행상황 알림은 10단위에서 100단위로 변경
+자동 보고서? 히스토리?는 db로
+-diff 하이라이트 기능(이전 설정과 뭐가 달라졌는지), 지연생성
 
 남은 예상시간 지우거나 개선
 -Closing dataloader mosaic 이후 딜레이 있음
 
-진행상황 알림은 10단위에서 100단위로 변경
 수신설정도 잠기도록
-자동 보고서? 히스토리?는 db로
-이전 설정과 뭐가 달라졌는지
+
 
 ui/ux 개선
 
