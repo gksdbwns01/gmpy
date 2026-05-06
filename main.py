@@ -10,9 +10,10 @@ import signal
 import re
 import gc
 import traceback
+import sqlite3
 import queue as qlib
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import zipfile
 import cv2
 import numpy as np
@@ -58,7 +59,7 @@ def clear_vram():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 0. 설정 저장 및 불러오기 관리자 (Config Manager & Builder)
+# 0. 설정 저장 및 불러오기, SQLite DB 관리자
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ConfigManager:
@@ -190,6 +191,95 @@ class ConfigBuilder:
         }
 
 
+class LogDatabase:
+    """학습 및 재학습 이력을 SQLite DB에 저장하고 관리하는 클래스"""
+    def __init__(self, db_path):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            # 1. 기존 학습 기록 테이블
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS training_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    task_type TEXT,
+                    model_name TEXT,
+                    epochs INTEGER,
+                    batch_size INTEGER,
+                    best_map REAL,
+                    save_dir TEXT,
+                    config_json TEXT
+                )
+            ''')
+            # 2. 평가 및 오답(Hard Example) 기록 테이블 추가
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS evaluation_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    task_type TEXT,          -- 'Tab 3 Eval' 또는 'Tab 4 Final Eval'
+                    model_name TEXT,
+                    total_imgs INTEGER,      -- 전체 평가 이미지 수
+                    wrong_count INTEGER,     -- 틀린 이미지 수
+                    accuracy REAL,           -- 정확도(%)
+                    wrong_images TEXT,       -- 틀린 이미지 파일명 목록 (JSON Array)
+                    config_json TEXT
+                )
+            ''')
+            conn.commit()
+
+    def insert_log(self, task_type, model_name, epochs, batch, best_map, save_dir, config_data):
+        """학습이 성공적으로 끝났을 때 기록을 저장합니다."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO training_logs 
+                (timestamp, task_type, model_name, epochs, batch_size, best_map, save_dir, config_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                task_type, model_name, epochs, batch, best_map, save_dir, 
+                json.dumps(config_data, ensure_ascii=False)
+            ))
+            conn.commit()
+
+    def get_all_logs(self):
+        """DB에서 전체 기록을 불러옵니다 (최신순)."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT timestamp, task_type, model_name, epochs, batch_size, best_map, save_dir, config_json FROM training_logs ORDER BY id DESC')
+            return cursor.fetchall()
+
+    def insert_eval_log(self, task_type, model_name, total, wrong, accuracy, wrong_imgs_list, config_data):
+        """평가 기록을 저장합니다."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            # 파일 경로 전체가 아닌 파일명만 추출하여 저장 (프로젝트 폴더가 이동해도 찾을 수 있게)
+            filenames = [Path(p).name for p in wrong_imgs_list]
+            
+            cursor.execute('''
+                INSERT INTO evaluation_logs 
+                (timestamp, task_type, model_name, total_imgs, wrong_count, accuracy, wrong_images, config_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                task_type, model_name, total, wrong, accuracy, 
+                json.dumps(filenames, ensure_ascii=False), # 리스트를 JSON 문자열로 변환하여 저장
+                json.dumps(config_data, ensure_ascii=False)
+            ))
+            conn.commit()
+
+    def get_all_eval_logs(self):
+        """평가 기록을 불러옵니다 (최신순)."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT timestamp, task_type, model_name, total_imgs, wrong_count, accuracy, wrong_images, config_json FROM evaluation_logs ORDER BY id DESC')
+            return cursor.fetchall()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. MULTIPROCESSING WORKERS (학습 및 재학습용)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -202,6 +292,36 @@ def send_discord_webhook(webhook_url, content):
         requests.post(webhook_url, json={"content": content}, timeout=5)
     except Exception as e:
         print(f"디스코드 웹훅 발송 실패: {e}")
+
+def create_heartbeat_callback(webhook_url, start_time, total_epochs):
+    """10 Epoch마다 ETA와 Loss를 계산해 디스코드로 보내는 콜백 함수를 생성합니다."""
+    def on_train_epoch_end(trainer):
+        # trainer.epoch는 0부터 시작하므로 +1 해줍니다.
+        current_epoch = trainer.epoch + 1
+        
+        # 10 Epoch 단위로만 실행
+        if current_epoch % 10 == 0:
+            elapsed_sec = time.time() - start_time
+            avg_time_per_epoch = elapsed_sec / current_epoch
+            remaining_epochs = total_epochs - current_epoch
+            eta_sec = avg_time_per_epoch * remaining_epochs
+            
+            # 초(sec)를 "HH:MM:SS" 형태의 직관적인 문자열로 변환
+            eta_str = str(timedelta(seconds=int(eta_sec)))
+            
+            # 훈련 Loss 합계 계산 (trainer.tloss에 Box, Cls, DFL Loss가 텐서로 들어있음)
+            total_loss = trainer.tloss.sum().item()
+            
+            msg = (
+                f"💓 **[학습 진행 상황]** {current_epoch} / {total_epochs} Epochs\n"
+                f"📉 현재 Total Loss: `{total_loss:.4f}`\n"
+                f"⏳ 남은 예상 시간: `{eta_str}`"
+            )
+            
+            # 기존에 만드신 디스코드 웹훅 발송 함수 호출
+            send_discord_webhook(webhook_url, msg)
+            
+    return on_train_epoch_end
 
 def _kfold_train_worker(args: dict, queue):
     import json, shutil, numpy as np, time
@@ -276,6 +396,12 @@ def _kfold_train_worker(args: dict, queue):
             )
 
             model = YOLO(model_name)
+            
+            # 🟢 콜백 부착
+            if webhook_url and noti_flags.get("task"):
+                heartbeat_cb = create_heartbeat_callback(webhook_url, start_time, epochs)
+                model.add_callback("on_train_epoch_end", heartbeat_cb)
+
             results = model.train(
                 data=str(data_yaml), epochs=epochs, patience=patience, imgsz=imgsz, batch=batch_size,
                 workers=workers, project=str(runs_dir), name="single_train",
@@ -307,6 +433,12 @@ def _kfold_train_worker(args: dict, queue):
                 )
 
                 model   = YOLO(model_name)
+                
+                # 🟢 콜백 부착
+                if webhook_url and noti_flags.get("task"):
+                    heartbeat_cb = create_heartbeat_callback(webhook_url, start_time, epochs)
+                    model.add_callback("on_train_epoch_end", heartbeat_cb)
+
                 results = model.train(
                     data=str(data_yaml), epochs=epochs, patience=patience, imgsz=imgsz, batch=batch_size,
                     workers=workers, project=str(runs_dir), name=f"fold_{fold_num}",
@@ -434,6 +566,12 @@ def _retrain_worker(args: dict, queue):
         yaml_rt.write_text(_yaml.dump(yaml_data, sort_keys=False), encoding="utf-8")
 
         model = YOLO(str(rt_base_model))
+        
+        # 🟢 콜백 부착
+        if webhook_url and noti_flags.get("task"):
+            heartbeat_cb = create_heartbeat_callback(webhook_url, start_time, p["rt_epochs"])
+            model.add_callback("on_train_epoch_end", heartbeat_cb)
+
         results = model.train(
             data=str(yaml_rt), epochs=p["rt_epochs"], imgsz=p["imgsz"], batch=p["rt_batch"],
             project=str(runs_dir), name=p["rt_run_name"], exist_ok=True,
@@ -473,6 +611,7 @@ def _retrain_worker(args: dict, queue):
     finally:
         clear_vram()
         queue.put(result)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. QTHREADS (비동기 처리 워커)
@@ -1507,6 +1646,217 @@ class LabelingView(QGraphicsView):
 # 3. GUI COMPONENTS & MAIN WINDOW
 # ══════════════════════════════════════════════════════════════════════════════
 
+class ConfigViewerDialog(QDialog):
+    """DB에 저장된 JSON 상세 설정을 예쁘게 보여주고 변경점을 하이라이트하는 팝업"""
+    def __init__(self, curr_config_str, prev_config_str=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("⚙️ 상세 설정 및 파라미터 내역 (변경점 비교)")
+        self.resize(700, 800)
+        
+        layout = QVBoxLayout(self)
+        
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setStyleSheet("background-color: #1e1e1e; border: 1px solid #333;")
+        
+        html_content = self.generate_diff_html(curr_config_str, prev_config_str)
+        text_edit.setHtml(html_content)
+            
+        layout.addWidget(text_edit)
+        
+        btn = QPushButton("닫기")
+        btn.clicked.connect(self.accept)
+        layout.addWidget(btn)
+
+    def generate_diff_html(self, curr_json_str, prev_json_str):
+        try:
+            curr = json.loads(curr_json_str)
+            prev = json.loads(prev_json_str) if prev_json_str else None
+            
+            html = "<pre style='font-family: Consolas, Courier New, monospace; font-size: 13px; color: #d4d4d4;'>"
+            if prev:
+                html += "<span style='color: #888;'>/* 바로 이전 기록(아래 행)과 비교하여 변경된 파라미터가 하이라이트됩니다 */</span><br><br>"
+            else:
+                html += "<span style='color: #888;'>/* 비교할 이전 기록이 없습니다 (최초 기록) */</span><br><br>"
+                
+            html += "{\n"
+            
+            all_top_keys = list(curr.keys())
+            for t_idx, top_key in enumerate(all_top_keys):
+                t_comma = "," if t_idx < len(all_top_keys) - 1 else ""
+                html += f"  <b style='color: #569cd6;'>\"{top_key}\"</b>: {{\n"
+                
+                curr_sub = curr.get(top_key, {})
+                prev_sub = prev.get(top_key, {}) if prev else curr_sub 
+                
+                if isinstance(curr_sub, dict):
+                    all_sub_keys = list(curr_sub.keys())
+                    for i, sub_key in enumerate(all_sub_keys):
+                        curr_val = curr_sub.get(sub_key)
+                        comma = "," if i < len(all_sub_keys) - 1 else ""
+                        
+                        if prev and sub_key in prev_sub:
+                            prev_val = prev_sub[sub_key]
+                            if curr_val != prev_val:
+                                c_val_str = json.dumps(curr_val, ensure_ascii=False)
+                                p_val_str = json.dumps(prev_val, ensure_ascii=False)
+                                html += f"      <span style='color: #9cdcfe;'>\"{sub_key}\"</span>: <span style='color: #f44747; text-decoration: line-through;'>{p_val_str}</span> <span style='color: #4ade80; font-weight:bold;'>➔ {c_val_str}</span>{comma}\n"
+                            else:
+                                c_val_str = json.dumps(curr_val, ensure_ascii=False)
+                                html += f"      <span style='color: #9cdcfe;'>\"{sub_key}\"</span>: <span style='color: #ce9178;'>{c_val_str}</span>{comma}\n"
+                        elif prev and sub_key not in prev_sub:
+                            c_val_str = json.dumps(curr_val, ensure_ascii=False)
+                            html += f"      <span style='color: #9cdcfe;'>\"{sub_key}\"</span>: <span style='color: #4ade80; font-weight:bold;'>{c_val_str} (NEW)</span>{comma}\n"
+                        else:
+                            c_val_str = json.dumps(curr_val, ensure_ascii=False)
+                            html += f"      <span style='color: #9cdcfe;'>\"{sub_key}\"</span>: <span style='color: #ce9178;'>{c_val_str}</span>{comma}\n"
+                else:
+                    html += f"      {json.dumps(curr_sub, ensure_ascii=False)}\n"
+                    
+                html += f"  }}{t_comma}\n"
+                
+            html += "}</pre>"
+            return html
+        except Exception as e:
+            return f"<pre>Error generating diff: {e}\n\n{curr_json_str}</pre>"
+
+
+class LogViewerDialog(QDialog):
+    def __init__(self, db_manager, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📊 프로젝트 통합 히스토리 (DB)")
+        self.resize(1000, 500)
+        self.db_manager = db_manager
+        
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        
+        # 1. 학습 이력 탭
+        self.train_tab = QWidget()
+        train_layout = QVBoxLayout(self.train_tab)
+        self.train_table = QTableWidget()
+        self.train_table.setColumnCount(8)
+        self.train_table.setHorizontalHeaderLabels(["일시", "유형", "사용 모델", "Epochs", "Batch", "최고 mAP", "저장 경로", "상세 설정"])
+        self.setup_table(self.train_table)
+        self.train_table.itemDoubleClicked.connect(self.on_train_table_double_clicked)
+        train_layout.addWidget(self.train_table)
+        self.tabs.addTab(self.train_tab, "🏋️ 학습 기록")
+        
+        # 2. 평가 및 오답 이력 탭
+        self.eval_tab = QWidget()
+        eval_layout = QVBoxLayout(self.eval_tab)
+        self.eval_table = QTableWidget()
+        self.eval_table.setColumnCount(8)
+        self.eval_table.setHorizontalHeaderLabels(["일시", "평가 단계", "평가 모델", "전체(장)", "오답(장)", "정확도(%)", "오답 목록", "상세 설정"])
+        self.setup_table(self.eval_table)
+        self.eval_table.itemDoubleClicked.connect(self.on_eval_table_double_clicked) 
+        
+        help_lbl = QLabel("💡 <b>팁:</b> 행을 더블 클릭하면 틀린 이미지(오답) 목록이나 상세 설정(파라미터)을 볼 수 있습니다.")
+        eval_layout.addWidget(help_lbl)
+        eval_layout.addWidget(self.eval_table)
+        self.tabs.addTab(self.eval_tab, "🔍 평가 및 오답 기록")
+        
+        self.load_data()
+
+    def setup_table(self, table):
+        table.setAlternatingRowColors(True)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+
+    def load_data(self):
+        # 학습 기록 로드
+        train_logs = self.db_manager.get_all_logs()
+        self.train_table.setRowCount(len(train_logs))
+        for r_idx, row in enumerate(train_logs):
+            for c_idx, val in enumerate(row):
+                if c_idx == 7: # config_json 컬럼
+                    item = QTableWidgetItem("보기 (더블클릭)")
+                    item.setForeground(QColor("blue"))
+                    font = QFont(); font.setUnderline(True); item.setFont(font)
+                    self.train_table.setProperty(f"config_{r_idx}", val)
+                else:
+                    item = QTableWidgetItem(f"{val:.4f}" if c_idx==5 and isinstance(val, float) and val>=0 else str(val))
+                item.setTextAlignment(Qt.AlignCenter)
+                self.train_table.setItem(r_idx, c_idx, item)
+        self.train_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.train_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        
+        # 평가 기록 로드
+        eval_logs = self.db_manager.get_all_eval_logs()
+        self.eval_table.setRowCount(len(eval_logs))
+        for r_idx, row in enumerate(eval_logs):
+            for c_idx, val in enumerate(row):
+                if c_idx == 5: val_str = f"{val:.1f}%"
+                elif c_idx == 6: # wrong_images (JSON)
+                    wrong_list = json.loads(val)
+                    val_str = f"{len(wrong_list)}개 파일 (더블클릭)" if wrong_list else "오답 없음"
+                    self.eval_table.setProperty(f"wrong_imgs_{r_idx}", val) # 데이터 은닉
+                elif c_idx == 7: # config_json
+                    val_str = "보기 (더블클릭)"
+                    self.eval_table.setProperty(f"config_{r_idx}", val)
+                else: val_str = str(val)
+                
+                item = QTableWidgetItem(val_str)
+                item.setTextAlignment(Qt.AlignCenter)
+                if c_idx == 6 and val_str != "오답 없음":
+                    item.setForeground(QColor("red"))
+                    item.setFont(QFont("Arial", 10, QFont.Bold))
+                elif c_idx == 7:
+                    item.setForeground(QColor("blue"))
+                    font = QFont(); font.setUnderline(True); item.setFont(font)
+                self.eval_table.setItem(r_idx, c_idx, item)
+        self.eval_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+
+    def on_train_table_double_clicked(self, item):
+        row = item.row()
+        col = item.column()
+        if col == 7: # 상세 설정 클릭
+            config_json = self.train_table.property(f"config_{row}")
+            # 🟢 현재 클릭한 행의 '바로 아래 행(이전 기록)' 파라미터 가져오기
+            prev_config_json = self.train_table.property(f"config_{row+1}") if row + 1 < self.train_table.rowCount() else None
+            
+            if config_json:
+                dialog = ConfigViewerDialog(config_json, prev_config_json, self)
+                dialog.exec_()
+
+    def on_eval_table_double_clicked(self, item):
+        row = item.row()
+        col = item.column()
+        
+        if col == 6: # 오답 목록 클릭
+            wrong_json = self.eval_table.property(f"wrong_imgs_{row}")
+            if not wrong_json: return
+            wrong_list = json.loads(wrong_json)
+            if not wrong_list: return
+            
+            list_str = "\n".join(wrong_list)
+            dialog = QDialog(self)
+            dialog.setWindowTitle("🚨 오답 이미지 파일 목록")
+            dialog.resize(300, 400)
+            l = QVBoxLayout(dialog)
+            l.addWidget(QLabel(f"총 <b>{len(wrong_list)}개</b>의 이미지를 틀렸습니다. (복사 가능)"))
+            
+            text_edit = QTextEdit()
+            text_edit.setPlainText(list_str)
+            text_edit.setReadOnly(True)
+            l.addWidget(text_edit)
+            
+            btn = QPushButton("닫기")
+            btn.clicked.connect(dialog.accept)
+            l.addWidget(btn)
+            dialog.exec_()
+            
+        elif col == 7: # 상세 설정 클릭
+            config_json = self.eval_table.property(f"config_{row}")
+            # 🟢 현재 클릭한 행의 '바로 아래 행(이전 기록)' 파라미터 가져오기
+            prev_config_json = self.eval_table.property(f"config_{row+1}") if row + 1 < self.eval_table.rowCount() else None
+            
+            if config_json:
+                dialog = ConfigViewerDialog(config_json, prev_config_json, self)
+                dialog.exec_()
+
+
 class PathInputWidget(QWidget):
     def __init__(self, label, is_folder=True, default_path=""):
         super().__init__()
@@ -1760,7 +2110,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("YOLO Training Pipeline (PyQt5)")
         self.resize(1400, 900)
-        import sys
+        
         if getattr(sys, 'frozen', False):
             self.base_dir = Path(sys.executable).parent
         else:
@@ -1770,8 +2120,14 @@ class MainWindow(QMainWindow):
         self.tmp_dir.mkdir(exist_ok=True)
         
         default_proj_path = self.base_dir / "MyProject"
+        
+        # 설정 관리자 초기화
         self.config_manager = ConfigManager(str(default_proj_path))
         self.config_builder = ConfigBuilder()
+        
+        # 🟢 SQLite DB 초기화
+        db_file_path = self.base_dir / "MyProject" / "workspace" / "training_history.db"
+        self.log_db = LogDatabase(db_file_path)
 
         self.training_process = None
         self.init_ui()
@@ -1820,6 +2176,10 @@ class MainWindow(QMainWindow):
         self.w_proc_ds.line_edit.setText(str(proj_dir / "processed_dataset"))
         self.w_work_ds.line_edit.setText(str(proj_dir / "workspace"))
         self.config_manager.update_workspace_path(str(proj_dir / "workspace"))
+        
+        # 🟢 프로젝트가 변경되면 DB 경로도 변경
+        db_file_path = proj_dir / "workspace" / "training_history.db"
+        self.log_db = LogDatabase(db_file_path)
 
     def parse_and_validate_class_map(self, text):
         import re
@@ -1943,7 +2303,6 @@ class MainWindow(QMainWindow):
         self.w_proc_ds = PathInputWidget("처리 폴더(processed)", True, str(default_proj / "processed_dataset"))
         self.w_work_ds = PathInputWidget("워크스페이스(workspace)", True, str(default_proj / "workspace"))
 
-        # 디스코드 알림 설정 추가 부분 복구
         self.w_webhook = QLineEdit()
         self.w_webhook.setMinimumWidth(300)
         self.w_webhook.setPlaceholderText("디스코드 웹훅 URL (알림을 받으려면 입력하세요)")
@@ -2022,10 +2381,16 @@ class MainWindow(QMainWindow):
         self.btn_toggle_tooltip.setCheckable(True)
         self.btn_toggle_tooltip.toggled.connect(self.on_toggle_tooltips)
         
+        # 🟢 DB 로그 뷰어 버튼
+        self.btn_show_logs = QPushButton("📊 학습 이력(DB)")
+        self.btn_show_logs.setStyleSheet("background-color: #e0e7ff; border: 1px solid #a5b4fc; padding: 5px; border-radius: 4px; font-weight: bold; color: #3730a3;")
+        self.btn_show_logs.clicked.connect(self.show_log_viewer)
+        
         btn_layout1.addWidget(self.btn_save_config)
         btn_layout1.addWidget(self.btn_load_config)
         btn_layout1.addWidget(self.btn_reset_all)
         btn_layout1.addWidget(self.btn_toggle_tooltip)
+        btn_layout1.addWidget(self.btn_show_logs)
 
         btn_layout2 = QHBoxLayout()
         self.btn_export_proj = QPushButton("📦 전체 백업 (모델+설정 내보내기)")
@@ -2060,6 +2425,11 @@ class MainWindow(QMainWindow):
         self.w_proc_ds.line_edit.textChanged.connect(self.sync_proc_paths)
         self.w_proj_root.line_edit.textChanged.connect(self.sync_project_root)
         self.btn_toggle_tooltip.setChecked(True)
+
+    def show_log_viewer(self):
+        """DB 로그 뷰어 팝업 열기"""
+        dialog = LogViewerDialog(self.log_db, self)
+        dialog.exec_()
 
     def on_toggle_tooltips(self, checked):
         if checked:
@@ -2358,9 +2728,9 @@ class MainWindow(QMainWindow):
 
     def stop_training(self):
         if self.training_process and self.training_process.is_alive():
-            import platform, subprocess, os, signal
             try:
                 if platform.system() == "Windows": 
+                    import subprocess
                     subprocess.call(["taskkill", "/F", "/T", "/PID", str(self.training_process.pid)])
                 else: 
                     os.kill(self.training_process.pid, signal.SIGKILL)
@@ -2375,10 +2745,39 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("✅ 프로세스 완료")
         
         if res.get("success"):
+            current_config = self.config_builder.build(self)
+            
             if "metrics_summary" in res: 
                 self.show_kfold_metrics_dialog(res["metrics_summary"], res["msg"], res.get("best_fold", ""))
+                
+                # 🟢 DB 기록: 평균 mAP 저장
+                avg_map = 0.0
+                for summary in res["metrics_summary"]:
+                    if summary["Fold"] == "Average":
+                        avg_map = summary.get("mAP50-95", 0.0)
+                        break
+                        
+                self.log_db.insert_log(
+                    task_type="K-Fold Train",
+                    model_name=self.g_model.currentText(),
+                    epochs=self.t2_epochs.value(),
+                    batch=self.t2_batch.value(),
+                    best_map=avg_map,
+                    save_dir=res.get("best_model", "경로 없음"),
+                    config_data=current_config
+                )
             else: 
                 QMessageBox.information(self, "완료", res["msg"])
+                # 🟢 DB 기록: 재학습 완료
+                self.log_db.insert_log(
+                    task_type="Hard Retrain",
+                    model_name=Path(self.t4_base.get_path()).name,
+                    epochs=self.t4_epochs.value(),
+                    batch=self.t4_batch.value(),
+                    best_map=-1.0, 
+                    save_dir=res.get("save_dir", "경로 없음"),
+                    config_data=current_config
+                )
 
             if res.get("best_model"): self.t3_model.line_edit.setText(res["best_model"])
             if res.get("model_path"):
@@ -3162,6 +3561,15 @@ class MainWindow(QMainWindow):
         self.t3_chk_show_all.blockSignals(False)
         self.update_tab3_visualization()
         
+        # 🟢 평가 로그 DB 기록
+        current_config = self.config_builder.build(self)
+        model_name = Path(self.t3_model.get_path()).name
+        self.log_db.insert_eval_log(
+            task_type="Tab 3 Eval", model_name=model_name,
+            total=stats['total'], wrong=stats['wrong'], accuracy=stats['acc'],
+            wrong_imgs_list=wrong_imgs, config_data=current_config
+        )
+
         QMessageBox.information(self, "평가 완료", f"총 {stats['total']}개 중 {stats['correct']}개 정답, {stats['wrong']}개 오답 (정확도 {stats['acc']:.1f}%)")
         if stats["wrong"] > 0 and stats["relabel_dir"]:
             self.t4_hard.line_edit.setText(stats["relabel_dir"]); self.t4_orig.line_edit.setText(self.t3_lbl.get_path()); self.t4_base.line_edit.setText(self.t3_model.get_path())
@@ -3391,6 +3799,16 @@ class MainWindow(QMainWindow):
         self.t4_chk_show_all.setChecked(False)
         self.t4_chk_show_all.blockSignals(False)
         self.update_tab4_visualization()
+        
+        # 🟢 최종 평가 로그 DB 기록
+        current_config = self.config_builder.build(self)
+        model_name = Path(self.t4_eval_model_display.text()).name
+        self.log_db.insert_eval_log(
+            task_type="Tab 4 Final Eval", model_name=model_name,
+            total=stats['total'], wrong=stats['wrong'], accuracy=stats['acc'],
+            wrong_imgs_list=wrong_imgs, config_data=current_config
+        )
+
         QMessageBox.information(self, "최종 평가 완료", f"전체 데이터 최종 평가\n총 {stats['total']}개 중 {stats['correct']}개 정답, {stats['wrong']}개 오답 (정확도 {stats['acc']:.1f}%)")
 
     def update_tab4_visualization(self):
@@ -3469,7 +3887,7 @@ class MainWindow(QMainWindow):
         split = QSplitter(Qt.Horizontal) 
         c_w = QWidget(); c_l = QVBoxLayout(c_w)
         c_l.addWidget(self._create_scroll(f), stretch=1)
-        c_l.addWidget(self.t5_btn_run); c_l.addWidget(self.t5_progress)    
+        c_l.addWidget(self.t5_btn_run); c_l.addWidget(self.t5_progress)   
         c_l.addWidget(QLabel("<b>데이터 분포 시각화</b>")); c_l.addWidget(self.t5_toolbar); c_l.addWidget(self.t5_canvas, stretch=2)
         
         i_w = QWidget(); i_l = QVBoxLayout(i_w)
