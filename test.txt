@@ -30,15 +30,12 @@ JSON 형식으로 모든 파라미터 저장
 웹훅>>
 https://discord.com/api/webhooks/1499309543136690248/cr2zCJUKE9MM1xgxetzuX-ZTWqatZZJXxwrI8TeYpeDIVRPWYsWxwgEt4RNqV2V0KVCu
 진행상황 알림은 10단위에서 100단위로 변경
+남은 예상시간 지움
 히스토리는 db로
 -diff 하이라이트 기능(이전 설정과 뭐가 달라졌는지), 지연생성
 
 가장 높은 설정 가져오기
-
-
-수신설정도 잠기도록
-
-남은 예상시간 지우거나 개선
+수신설정도 잠기도록 and 테스트 필요
 -Closing dataloader mosaic 이후 딜레이 있음
 
 

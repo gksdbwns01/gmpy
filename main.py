@@ -296,27 +296,23 @@ def send_discord_webhook(webhook_url, content):
     except Exception as e:
         print(f"디스코드 웹훅 발송 실패: {e}")
 
-def create_heartbeat_callback(webhook_url, start_time, total_epochs):
-    """100 Epoch마다 ETA와 Loss를 계산해 디스코드로 보내는 콜백 함수를 생성합니다."""
+def create_heartbeat_callback(webhook_url, total_epochs):
+    """100 Epoch마다 Loss를 계산해 디스코드로 보내는 콜백 함수를 생성합니다."""
     def on_train_epoch_end(trainer):
         # trainer.epoch는 0부터 시작하므로 +1 해줍니다.
         current_epoch = trainer.epoch + 1
         
         # 100 Epoch 단위로만 실행
         if current_epoch % 100 == 0:
-            elapsed_sec = time.time() - start_time
-            avg_time_per_epoch = elapsed_sec / current_epoch
-            remaining_epochs = total_epochs - current_epoch
-            eta_sec = avg_time_per_epoch * remaining_epochs
-            
-            eta_str = str(timedelta(seconds=int(eta_sec)))
+            # 훈련 Loss 합계 계산 (trainer.tloss에 Box, Cls, DFL Loss가 텐서로 들어있음)
             total_loss = trainer.tloss.sum().item()
             
             msg = (
                 f"💓 **[학습 진행 상황]** {current_epoch} / {total_epochs} Epochs\n"
-                f"📉 현재 Total Loss: `{total_loss:.4f}`\n"
-                f"⏳ 남은 예상 시간: `{eta_str}`"
+                f"📉 현재 Total Loss: `{total_loss:.4f}`"
             )
+            
+            # 기존에 만드신 디스코드 웹훅 발송 함수 호출
             send_discord_webhook(webhook_url, msg)
             
     return on_train_epoch_end
@@ -396,7 +392,7 @@ def _kfold_train_worker(args: dict, queue):
             model = YOLO(model_name)
             
             if webhook_url and noti_flags.get("task"):
-                heartbeat_cb = create_heartbeat_callback(webhook_url, start_time, epochs)
+                heartbeat_cb = create_heartbeat_callback(webhook_url, epochs)
                 model.add_callback("on_train_epoch_end", heartbeat_cb)
 
             results = model.train(
@@ -432,7 +428,7 @@ def _kfold_train_worker(args: dict, queue):
                 model   = YOLO(model_name)
                 
                 if webhook_url and noti_flags.get("task"):
-                    heartbeat_cb = create_heartbeat_callback(webhook_url, start_time, epochs)
+                    heartbeat_cb = create_heartbeat_callback(webhook_url, epochs)
                     model.add_callback("on_train_epoch_end", heartbeat_cb)
 
                 results = model.train(
@@ -564,7 +560,7 @@ def _retrain_worker(args: dict, queue):
         model = YOLO(str(rt_base_model))
         
         if webhook_url and noti_flags.get("task"):
-            heartbeat_cb = create_heartbeat_callback(webhook_url, start_time, p["rt_epochs"])
+            heartbeat_cb = create_heartbeat_callback(webhook_url, p["rt_epochs"])
             model.add_callback("on_train_epoch_end", heartbeat_cb)
 
         results = model.train(
@@ -2727,6 +2723,11 @@ class MainWindow(QMainWindow):
                     os.kill(self.training_process.pid, signal.SIGKILL)
             except Exception: pass
             
+            # 🟢 강제 종료 시 메인 UI에서 직접 디스코드 알림 발송
+            webhook_url = self.w_webhook.text().strip()
+            if webhook_url and self.chk_noti_error.isChecked():
+                send_discord_webhook(webhook_url, "🛑 **[학습 강제 종료]**\n사용자에 의해 학습 프로세스가 강제로 중단되었습니다.")
+            
             self._restore_training_ui()
             self.statusBar().showMessage("🛑 학습이 강제 종료되었습니다.")
             self.training_process = None
@@ -2778,6 +2779,15 @@ class MainWindow(QMainWindow):
         self.training_process = None
 
     def on_training_fatal_error(self, error_msg):
+        # 🟢 사용자가 '강제 종료' 버튼을 눌러서 발생한 종료라면 추가 에러 처리 안 함
+        if self.training_process is None:
+            return
+
+        # 🟢 OOM 등으로 진짜 비정상 종료된 경우 디스코드 알림 발송
+        webhook_url = self.w_webhook.text().strip()
+        if webhook_url and self.chk_noti_error.isChecked():
+            send_discord_webhook(webhook_url, f"❌ **[학습 비정상 종료]**\n프로세스가 예기치 않게 종료되었습니다. (메모리 부족 또는 크래시)\n상세: {error_msg}")
+
         self._restore_training_ui()
         QMessageBox.critical(self, "비정상 종료", error_msg)
         self.statusBar().showMessage("🛑 학습이 비정상 종료되었습니다.")
