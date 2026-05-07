@@ -2704,6 +2704,13 @@ class MainWindow(QMainWindow):
         self.monitor_thread.error.connect(self.on_training_fatal_error)
         self.monitor_thread.start()
         
+        # 알림 설정 잠금 (학습 도중 변경 불가)
+        self.w_webhook.setEnabled(False)
+        self.chk_noti_error.setEnabled(False)
+        self.chk_noti_task.setEnabled(False)
+        self.chk_noti_fold.setEnabled(False)
+        self.chk_noti_early_stop.setEnabled(False)
+        
         self.t2_btn_run.setEnabled(False)
         self.t4_btn_retrain.setEnabled(False)
         self.t2_scroll.setEnabled(False)
@@ -2794,6 +2801,13 @@ class MainWindow(QMainWindow):
         self.training_process = None
 
     def _restore_training_ui(self):
+        # 알림 설정 잠금 해제
+        self.w_webhook.setEnabled(True)
+        self.chk_noti_error.setEnabled(True)
+        self.chk_noti_task.setEnabled(True)
+        self.chk_noti_fold.setEnabled(True)
+        self.chk_noti_early_stop.setEnabled(True)
+        
         self.t2_btn_run.setEnabled(True)
         self.t4_btn_retrain.setEnabled(True)
         self.t2_scroll.setEnabled(True)

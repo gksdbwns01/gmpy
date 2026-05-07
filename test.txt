@@ -32,14 +32,14 @@ https://discord.com/api/webhooks/1499309543136690248/cr2zCJUKE9MM1xgxetzuX-ZTWqa
 진행상황 알림은 10단위에서 100단위로 변경
 남은 예상시간 지움
 히스토리는 db로
--diff 하이라이트 기능(이전 설정과 뭐가 달라졌는지), 지연생성
-
-가장 높은 설정 가져오기
+-diff 하이라이트 기능(이전 설정과 뭐가 달라졌는지), 폴더 지연생성
 수신설정도 잠기도록 and 테스트 필요
+
+db에서 가장 높은 설정 가져오기
 -Closing dataloader mosaic 이후 딜레이 있음
 
 
-자동 보고서?
+db를 통해 자동 보고서?
 
 ui/ux 개선
 
