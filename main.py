@@ -334,40 +334,65 @@ def _kfold_train_worker(args, queue):
 
         def run_auto_eval(model_path):
             model_eval = YOLO(str(model_path))
-            base_results = model_eval.predict(source=all_imgs, conf=0.01, iou=0.99, verbose=False)
+            # 1단계: 모든 후보군을 다 뽑아오기 위해 가장 널널한 기준으로 1회 추론
+            base_results = model_eval.predict(source=all_imgs, conf=0.01, iou=0.9, verbose=False)
+            
             def evaluate(test_conf, test_iou):
                 correct = 0
                 for idx, r in enumerate(base_results):
-                    valid_preds = [{"class": int(c.item()), "box": b.tolist(), "conf": cf.item()} for c, b, cf in zip(r.boxes.cls, r.boxes.xywhn, r.boxes.conf) if cf.item() >= test_conf]
-                    valid_preds.sort(key=lambda x: x["conf"], reverse=True); keep_preds = []
+                    # 메모리 내 필터링
+                    valid_preds = [{"class": int(c.item()), "box": b.tolist(), "conf": cf.item()} 
+                                   for c, b, cf in zip(r.boxes.cls, r.boxes.xywhn, r.boxes.conf) 
+                                   if cf.item() >= test_conf]
+                    
+                    valid_preds.sort(key=lambda x: x["conf"], reverse=True)
+                    keep_preds = []
                     for vp in valid_preds:
                         keep = True
                         for kp in keep_preds:
-                            if vp["class"] == kp["class"] and calc_iou(vp["box"], kp["box"]) > test_iou: keep = False; break
+                            if vp["class"] == kp["class"] and calc_iou(vp["box"], kp["box"]) > test_iou:
+                                keep = False; break
                         if keep: keep_preds.append(vp)
-                    gt_boxes = gt_data[idx]; is_correct = True
-                    if len(keep_preds) != len(gt_boxes): is_correct = False
+                        
+                    gt_boxes = gt_data[idx]
+                    is_correct = True
+                    if len(keep_preds) != len(gt_boxes): 
+                        is_correct = False
                     else:
                         matched = []
                         for pb in keep_preds:
                             found = False
                             for j, gb in enumerate(gt_boxes):
-                                if j not in matched and pb["class"] == gb["class"] and calc_iou(pb["box"], gb["box"]) >= match_iou_thr: found = True; matched.append(j); break
+                                if j not in matched and pb["class"] == gb["class"] and calc_iou(pb["box"], gb["box"]) >= match_iou_thr:
+                                    found = True; matched.append(j); break
                             if not found: is_correct = False; break
                     if is_correct: correct += 1
                 return (correct / total_imgs) * 100
-            best_trial_acc, best_c_conf, best_c_iou = -1.0, 0.25, 0.45
-            for c in np.arange(0.1, 0.9, 0.2):
-                for i in np.arange(0.3, 0.8, 0.2):
+
+            best_trial_acc, best_f_conf, best_f_iou = -1.0, 0.25, 0.45
+            
+            # [수정] 1단계: Coarse Search (전체 구간 0.1 단위 정밀 탐색)
+            for c in np.arange(0.1, 0.8, 0.1):
+                for i in np.arange(0.3, 0.7, 0.1):
                     acc = evaluate(c, i)
-                    if acc > best_trial_acc: best_trial_acc, best_c_conf, best_c_iou = acc, c, i
-            best_f_conf, best_f_iou = best_c_conf, best_c_iou
-            for c in np.arange(max(0.01, best_c_conf - 0.1), min(0.99, best_c_conf + 0.11), 0.05):
-                for i in np.arange(max(0.01, best_c_iou - 0.1), min(0.99, best_c_iou + 0.11), 0.05):
+                    # 점수가 더 높거나, 점수가 같더라도 Confidence가 더 높으면(더 깐깐한 기준) 업데이트
+                    if acc >= best_trial_acc: 
+                        best_trial_acc, best_f_conf, best_f_iou = acc, c, i
+
+            # [수정] 2단계: Fine Search (찾은 지점 주변을 0.01 단위로 아주 정밀하게 탐색)
+            start_c = max(0.01, best_f_conf - 0.05)
+            end_c = min(0.99, best_f_conf + 0.05)
+            start_i = max(0.01, best_f_iou - 0.05)
+            end_i = min(0.99, best_f_iou + 0.05)
+            
+            for c in np.arange(start_c, end_c, 0.01):
+                for i in np.arange(start_i, end_i, 0.01):
                     acc = evaluate(c, i)
-                    if acc > best_trial_acc: best_trial_acc, best_f_conf, best_f_iou = acc, c, i
+                    if acc >= best_trial_acc:
+                        best_trial_acc, best_f_conf, best_f_iou = acc, c, i
+            
             del model_eval; clear_vram()
-            return best_trial_acc, best_f_conf, best_f_iou
+            return best_trial_acc, round(float(best_f_conf), 2), round(float(best_f_iou), 2)
 
         fold_metrics, fold_save_dirs = [], {}
         splits = [(train_test_split(train_val, test_size=test_split, random_state=random_seed))] if num_folds == 1 else list(KFold(n_splits=num_folds, shuffle=True, random_state=random_seed).split(train_val))
