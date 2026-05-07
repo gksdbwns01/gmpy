@@ -37,15 +37,14 @@ https://discord.com/api/webhooks/1499309543136690248/cr2zCJUKE9MM1xgxetzuX-ZTWqa
 
 db에서 가장 높은 설정 가져오기
 -Closing dataloader mosaic 이후 딜레이 있음
-
-
 db를 통해 자동 보고서?
-
 ui/ux 개선
 
 학습속도
 결과에 따라 조언하는 llm?
 
+v1은 디스코드 기능 넣기 전
+v2는 디스코드 기능 넣고 개선판
 
 클래스 3개 되는지 확인하기
 slack이나 n8n, EmailJs
