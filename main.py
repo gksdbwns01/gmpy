@@ -1459,6 +1459,9 @@ class MainWindow(QMainWindow):
         proj_dir = Path(new_path); self.w_base_ds.line_edit.setText(str(proj_dir / "dataset")); self.w_proc_ds.line_edit.setText(str(proj_dir / "processed_dataset")); self.w_work_ds.line_edit.setText(str(proj_dir / "workspace"))
         self.config_manager.update_workspace_path(str(proj_dir / "workspace")); self.log_db = LogDatabase(proj_dir / "workspace" / "training_history.db")
 
+    def sync_work_paths(self, new_path):
+        if hasattr(self, 't3_model'): self.t3_model.line_edit.setText(str(Path(new_path) / "kfold" / "best_model.pt"))
+
     def parse_and_validate_class_map(self, text):
         cmap = {}; lines = [line.strip() for line in text.strip().split('\n') if line.strip()]
         if not lines: return False, "클래스명을 하나 이상 입력해주세요."
@@ -1579,7 +1582,7 @@ class MainWindow(QMainWindow):
         btn_layout2.addWidget(self.btn_export_proj); btn_layout2.addWidget(self.btn_import_proj); right_layout.addLayout(btn_layout1); right_layout.addLayout(btn_layout2)
         g_layout.addLayout(path_layout, 5); g_layout.addSpacing(20); g_layout.addLayout(right_layout, 5); g_group.setLayout(g_layout); main_layout.addWidget(g_group)
         self.tabs = QTabWidget(); main_layout.addWidget(self.tabs); self.setup_tab6(); self.setup_tab1(); self.setup_tab2(); self.setup_tab3(); self.setup_tab4(); self.setup_tab5()
-        self.w_base_ds.line_edit.textChanged.connect(self.sync_base_paths); self.w_proc_ds.line_edit.textChanged.connect(self.sync_proc_paths); self.w_proj_root.line_edit.textChanged.connect(self.sync_project_root)
+        self.w_base_ds.line_edit.textChanged.connect(self.sync_base_paths); self.w_proc_ds.line_edit.textChanged.connect(self.sync_proc_paths); self.w_proj_root.line_edit.textChanged.connect(self.sync_project_root); self.w_work_ds.line_edit.textChanged.connect(self.sync_work_paths)
 
     def show_log_viewer(self): LogViewerDialog(self.log_db, self).exec_()
 
