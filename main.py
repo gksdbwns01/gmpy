@@ -298,7 +298,6 @@ def _auto_threshold_worker(args, queue):
             x1_min, y1_min = b1[0] - b1[2]/2, b1[1] - b1[3]/2
             x1_max, y1_max = b1[0] + b1[2]/2, b1[1] + b1[3]/2
             x2_min, y2_min = b2[0] - b2[2]/2, b2[1] - b2[3]/2
-            x2_max, y2_max = b2[0] + b2[2]/2, b2[1] + b2[3]/2
 
             inter_xmin = max(x1_min, x2_min)
             inter_ymin = max(y1_min, y2_min)
@@ -573,9 +572,12 @@ class PreprocessThread(QThread):
     def __init__(self, config): super().__init__(); self.config = config
     def run(self):
         try:
-            from PIL import Image as PILImage, ImageOps
+            # ImageDraw 추가
+            from PIL import Image as PILImage, ImageOps, ImageDraw
             c = self.config; label_dir, image_dir = Path(c["base_dir"]) / "data", Path(c["base_dir"]) / "image"
             out_img, out_lbl = Path(c["processed_dir"]) / "images", Path(c["processed_dir"]) / "labels"
+            out_preview = Path(c["processed_dir"]) / "preview"  # 미리보기 폴더 경로 추가
+            
             if not label_dir.is_dir(): return self.error.emit(f"라벨 폴더 누락: {label_dir}")
 
             label_files = list(label_dir.glob("*.json")) + list(label_dir.glob("*.txt"))
@@ -609,7 +611,10 @@ class PreprocessThread(QThread):
 
             self.log_msg.emit(f"✂️ 크롭 영역 확정 → X={crop_x}, Y={crop_y}, W={crop_w}, H={crop_h}")
             if c["clean_old"] and Path(c["processed_dir"]).exists(): shutil.rmtree(c["processed_dir"])
+            
+            # preview 폴더도 생성
             out_img.mkdir(parents=True, exist_ok=True); out_lbl.mkdir(parents=True, exist_ok=True)
+            out_preview.mkdir(parents=True, exist_ok=True)
 
             ok_count = 0
             for i, lf in enumerate(label_files):
@@ -647,7 +652,39 @@ class PreprocessThread(QThread):
                             labels.append(f"{cid} {(fx1 + fw / 2) / acw:.6f} {(fy1 + fh / 2) / ach:.6f} {fw/acw:.6f} {fh/ach:.6f}")
 
                     (out_lbl / Path(img_id).with_suffix(".txt").name).write_text("\n".join(labels), encoding="utf-8")
-                    img.crop((crop_x, crop_y, crop_x + acw, crop_y + ach)).save(out_img / img_id)
+                    
+                    # 1. 학습용 원본 크롭 이미지 저장
+                    cropped_img = img.crop((crop_x, crop_y, crop_x + acw, crop_y + ach))
+                    cropped_img.save(out_img / img_id)
+                    
+                    # 2. 미리보기용 라벨 박스 그리기 및 저장
+                    preview_img = cropped_img.copy()
+                    draw = ImageDraw.Draw(preview_img)
+                    
+                    # 클래스 ID -> 이름 변환 매핑 (색상 팔레트 추가)
+                    id_to_name = {v: k for k, v in c["class_map"].items()}
+                    color_palette = ["#00FF00", "#FF0000", "#00FFFF", "#FFFF00", "#FF00FF", "#0000FF", "#FFA500"]
+
+                    for line in labels:
+                        parts = line.split()
+                        cid, cx, cy, nw, nh = int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+                        bw, bh = nw * acw, nh * ach
+                        bx1, by1 = (cx * acw) - (bw / 2), (cy * ach) - (bh / 2)
+                        
+                        # 클래스 이름 및 색상 지정
+                        class_name = id_to_name.get(cid, f"ID {cid}")
+                        color = color_palette[cid % len(color_palette)]
+                        
+                        # 테두리 박스 그리기
+                        draw.rectangle([bx1, by1, bx1 + bw, by1 + bh], outline=color, width=3)
+                        
+                        # 가독성을 위해 검은색 텍스트 그림자를 깐 뒤, 색상 텍스트 표시
+                        text_x, text_y = bx1 + 2, max(0, by1 - 15)
+                        draw.text((text_x + 1, text_y + 1), class_name, fill="black")
+                        draw.text((text_x, text_y), class_name, fill=color)
+
+                    preview_img.save(out_preview / img_id)
+                    
                     img.close(); ok_count += 1; self.progress.emit(int((i + 1) / len(label_files) * 100))
                 except Exception: continue
 
@@ -1664,7 +1701,7 @@ class MainWindow(QMainWindow):
         
         webhook_url = self.w_webhook.text().strip()
         if webhook_url and self.noti_flags.get("start"):
-            send_discord_webhook(webhook_url, "▶️ **[작업 시작]** 새로운 백그라운드 작업이 시작되었습니다.")
+            send_discord_webhook(webhook_url, "▶️ **[작업 시작]** 새로운 백그라운 작업이 시작되었습니다.")
 
         self.w_webhook.setEnabled(False); self.btn_webhook_settings.setEnabled(False)
         self.t2_btn_run.setEnabled(False); self.t2_btn_tune.setEnabled(False); self.t4_btn_retrain.setEnabled(False); self.t4_btn_auto_thr.setEnabled(False); self.t3_btn_auto_thr.setEnabled(False); self.t2_scroll.setEnabled(False); self.t4_scroll.setEnabled(False); self.g_model.setEnabled(False); self.g_imgsz.setEnabled(False); self.t2_btn_stop.setEnabled(True)
@@ -1948,9 +1985,12 @@ class MainWindow(QMainWindow):
         self.t1_thread.finished.connect(lambda: [self.t1_btn_run.setEnabled(True), QApplication.restoreOverrideCursor(), self.statusBar().showMessage("✅ 전처리 완료", 5000)]); self.t1_thread.start()
 
     def on_tab1_finished(self, ok_count):
-        QMessageBox.information(self, "완료", f"{ok_count}장 전처리 완료!"); proc_img_dir = Path(self.w_proc_ds.get_path()) / "images"
-        if proc_img_dir.exists(): self.t1_img_grid.update_images([str(f) for f in proc_img_dir.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}])
-
+        QMessageBox.information(self, "완료", f"{ok_count}장 전처리 완료!")
+        proc_preview_dir = Path(self.w_proc_ds.get_path()) / "preview"
+        target_dir = proc_preview_dir if proc_preview_dir.exists() else Path(self.w_proc_ds.get_path()) / "images"
+        
+        if target_dir.exists(): 
+            self.t1_img_grid.update_images([str(f) for f in target_dir.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}])
     def setup_tab2(self):
         f = QFormLayout(); self.t2_epochs = QSpinBox(); self.t2_epochs.setRange(1, 5000); self.t2_epochs.setValue(400); self.t2_batch = QSpinBox(); self.t2_batch.setRange(1, 256); self.t2_batch.setValue(16); self.t2_workers = QSpinBox(); self.t2_workers.setRange(0, 32); self.t2_workers.setValue(8); self.t2_patience = QSpinBox(); self.t2_patience.setRange(0, 10000); self.t2_patience.setValue(100); self.t2_seed = QSpinBox(); self.t2_seed.setRange(0, 999999); self.t2_seed.setValue(42); self.t2_folds = QSpinBox(); self.t2_folds.setRange(1, 10); self.t2_folds.setValue(5); self.t2_test_split = QDoubleSpinBox(); self.t2_test_split.setRange(0.05, 0.6); self.t2_test_split.setValue(0.2); self.t2_test_split.setSingleStep(0.05); self.t2_lcls = QDoubleSpinBox(); self.t2_lcls.setRange(0.1, 10.0); self.t2_lcls.setValue(0.5); self.t2_lcls.setSingleStep(0.1); self.t2_lbox = QDoubleSpinBox(); self.t2_lbox.setRange(0.1, 20.0); self.t2_lbox.setValue(7.5); self.t2_lbox.setSingleStep(0.5); self.t2_ldfl = QDoubleSpinBox(); self.t2_ldfl.setRange(0.1, 10.0); self.t2_ldfl.setValue(1.5); self.t2_ldfl.setSingleStep(0.1)
         def make_dbl(rng, val, step): b = QDoubleSpinBox(); b.setRange(*rng); b.setDecimals(3 if step < 0.01 else 2); b.setSingleStep(step); b.setValue(val); return b
@@ -2205,14 +2245,14 @@ class MainWindow(QMainWindow):
         self.t5_model = PathInputWidget("거리 측정 모델", False, str(work_dir/"kfold"/"best_model.pt")); f.addRow(self.t5_model); self.t5_img = PathInputWidget("분석할 이미지 폴더", True, str(proc_dir/"images")); f.addRow(self.t5_img)
         self.t5_method = QComboBox(); self.t5_method.addItems(["테두리 최단거리 (Edge)", "중심점 유클리드 (Center)", "가장 가까운 N개 이웃 (방향 무관)"])
         self.t5_conf = QDoubleSpinBox(); self.t5_conf.setRange(0.01, 0.99); self.t5_conf.setValue(0.25); self.t5_conf.setSingleStep(0.01); self.t5_iou = QDoubleSpinBox(); self.t5_iou.setRange(0.01, 0.99); self.t5_iou.setValue(0.45); self.t5_iou.setSingleStep(0.05); self.t5_max_det = QSpinBox(); self.t5_max_det.setRange(1, 1000); self.t5_max_det.setValue(300); self.t5_agnostic = QCheckBox(); self.t5_agnostic.setChecked(True)
-        self.t5_knn_n = QSpinBox(); self.t5_knn_n.setRange(1, 10); self.t5_knn_n.setValue(2); self.t5_edge_thr = QLineEdit("60"); self.t5_skip_ng = QCheckBox(); self.t5_skip_ng.setChecked(True); self.t5_drop_odd = QCheckBox(); self.t5_drop_odd.setChecked(True)
+        self.t5_knn_n = QSpinBox(); self.t5_knn_n.setRange(1, 10); self.t5_knn_n.setValue(2); self.t5_edge_thr = QLineEdit("60"); self.t5_skip_ng = QCheckBox(); self.t5_skip_ng.setChecked(True); self.t5_drop_odd = QCheckBox(); self.t5_drop_odd.setChecked(False)
         color_map = {"노란색 (Yellow)": QColor(255, 255, 0), "초록색 (Green)": QColor(0, 255, 0), "빨간색 (Red)": QColor(255, 0, 0), "파란색 (Blue)": QColor(0, 0, 255), "청록색 (Cyan)": QColor(0, 255, 255), "자주색 (Magenta)": QColor(255, 0, 255), "흰색 (White)": QColor(255, 255, 255)}
         def get_color_icon(color):
             pixmap = QPixmap(16, 16); pixmap.fill(Qt.gray); painter = QPainter(pixmap); painter.fillRect(1, 1, 14, 14, color); painter.end(); return QIcon(pixmap)
         self.t5_color1 = QComboBox(); self.t5_color2 = QComboBox()
         for name, color in color_map.items(): self.t5_color1.addItem(get_color_icon(color), name); self.t5_color2.addItem(get_color_icon(color), name)
         self.t5_color1.setCurrentText("노란색 (Yellow)"); self.t5_color2.setCurrentText("청록색 (Cyan)")
-        self.add_param(f, "측정 방식", self.t5_method, "테두리 최단거리 (Edge)"); self.add_param(f, "Confidence", self.t5_conf, 0.25); self.add_param(f, "IoU (NMS)", self.t5_iou, 0.45); self.add_param(f, "최대 탐지 수", self.t5_max_det, 300); self.add_param(f, "Agnostic NMS", self.t5_agnostic, True); self.add_param(f, "N개 이웃 (KNN 전용)", self.t5_knn_n, 2); self.add_param(f, "Edge 분류 임계값", self.t5_edge_thr, "60"); self.add_param(f, "'NG' 클래스 제외", self.t5_skip_ng, True); self.add_param(f, "홀수 개체 시 최저 신뢰도 제거", self.t5_drop_odd, True); self.add_param(f, "수평/KNN 선 색상", self.t5_color1, "노란색 (Yellow)"); self.add_param(f, "수직 선 색상 (Edge)", self.t5_color2, "청록색 (Cyan)")
+        self.add_param(f, "측정 방식", self.t5_method, "테두리 최단거리 (Edge)"); self.add_param(f, "Confidence", self.t5_conf, 0.25); self.add_param(f, "IoU (NMS)", self.t5_iou, 0.45); self.add_param(f, "최대 탐지 수", self.t5_max_det, 300); self.add_param(f, "Agnostic NMS", self.t5_agnostic, True); self.add_param(f, "N개 이웃 (KNN 전용)", self.t5_knn_n, 2); self.add_param(f, "Edge 분류 임계값", self.t5_edge_thr, "60"); self.add_param(f, "'NG' 클래스 제외", self.t5_skip_ng, True); self.add_param(f, "홀수 개체 시 최저 신뢰도 제거", self.t5_drop_odd, False); self.add_param(f, "수평/KNN 선 색상", self.t5_color1, "노란색 (Yellow)"); self.add_param(f, "수직 선 색상 (Edge)", self.t5_color2, "청록색 (Cyan)")
         self.t5_btn_run = QPushButton("📏 측정 및 통계 분석 실행"); self.t5_btn_run.clicked.connect(self.run_tab5); self.t5_progress = QProgressBar(); self.t5_canvas = FigureCanvas(plt.Figure(figsize=(10, 4.5))); self.t5_canvas.setMinimumHeight(300); self.t5_toolbar = NavigationToolbar(self.t5_canvas, self); self.t5_img_grid = ImageGridWidget(max_display=100)
         self.t5_chk_show_outliers = QCheckBox("🚨 이상치(Outlier) 이미지만 필터링"); self.t5_chk_show_outliers.setStyleSheet("color: red; font-weight: bold;"); self.t5_chk_show_outliers.setEnabled(False); self.t5_chk_show_outliers.stateChanged.connect(self.update_tab5_visualization)
         split = QSplitter(Qt.Horizontal); c_w = QWidget(); c_l = QVBoxLayout(c_w); c_l.addWidget(self._create_scroll(f), stretch=1); c_l.addWidget(self.t5_btn_run); c_l.addWidget(self.t5_progress); c_l.addWidget(QLabel("<b>데이터 분포 시각화</b>")); c_l.addWidget(self.t5_toolbar); c_l.addWidget(self.t5_canvas, stretch=2)
