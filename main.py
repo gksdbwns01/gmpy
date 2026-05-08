@@ -280,46 +280,74 @@ def _auto_threshold_worker(args, queue):
     import time, traceback, numpy as np
     from pathlib import Path
     from ultralytics import YOLO
-    start_time = time.time(); result = {"success": False, "task": "threshold", "error": "", "best_conf": 0.25, "best_iou": 0.45, "best_acc": 0.0, "msg": ""}
+    
+    start_time = time.time()
+    result = {"success": False, "task": "threshold", "error": "", "best_conf": 0.25, "best_iou": 0.45, "best_acc": 0.0, "msg": ""}
+    
     try:
-        model_path, img_dir, lbl_dir, match_iou_thr = args["model_path"], Path(args["img_dir"]), Path(args["lbl_dir"]), args["match_iou"]
+        model_path = Path(args["model_path"])
+        img_dir = Path(args["img_dir"])
+        lbl_dir = Path(args["lbl_dir"])
+        match_iou_thr = args.get("match_iou", 0.50)
+        
         model = YOLO(str(model_path))
         
         def calc_iou(b1, b2):
-            ax1,ay1,ax2,ay2 = b1[0]-b1[2]/2, b1[1]-b1[3]/2, b1[0]+b1[2]/2, b1[1]+b1[3]/2
-            bx1,by1,bx2,by2 = b2[0]-b2[2]/2, b2[1]-b2[3]/2, b2[0]+b2[2]/2, b2[1]+b2[3]/2
-            ix, iy = max(0, min(ax2,bx2)-max(ax1,bx1)), max(0, min(ay2,by2)-max(ay1,by1))
-            ia = ix*iy; return ia/((ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-ia+1e-6)
+            x1_min, y1_min = b1[0] - b1[2]/2, b1[1] - b1[3]/2
+            x1_max, y1_max = b1[0] + b1[2]/2, b1[1] + b1[3]/2
+            x2_min, y2_min = b2[0] - b2[2]/2, b2[1] - b2[3]/2
+            x2_max, y2_max = b2[0] + b2[2]/2, b2[1] + b2[3]/2
             
-        img_files = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpeg")); total_imgs = len(img_files)
+            inter_xmin = max(x1_min, x2_min)
+            inter_ymin = max(y1_min, y2_min)
+            inter_xmax = min(x1_max, x2_max)
+            inter_ymax = min(y1_max, y2_max)
+            
+            if inter_xmax < inter_xmin or inter_ymax < inter_ymin:
+                return 0.0
+                
+            inter_area = (inter_xmax - inter_xmin) * (inter_ymax - inter_ymin)
+            box1_area = (x1_max - x1_min) * (y1_max - y1_min)
+            box2_area = (x2_max - x2_min) * (y2_max - y2_min)
+            union_area = box1_area + box2_area - inter_area
+            
+            return inter_area / (union_area + 1e-6)
+
+        img_files = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpeg"))
+        total_imgs = len(img_files)
         if total_imgs == 0: raise ValueError("평가할 이미지가 없습니다.")
+
+        base_results = model.predict(source=[str(p) for p in img_files], conf=0.25, iou=0.45, verbose=False)
         
-        # 1. 베이스 예측 (미리 한 번만 예측하여 좌표 저장)
-        base_results = model.predict(source=[str(p) for p in img_files], conf=0.01, iou=0.99, verbose=False)
         gt_data = []
         for r in base_results:
-            img_name = Path(r.path).name; txt = lbl_dir / Path(img_name).with_suffix(".txt").name; boxes = []
+            img_name = Path(r.path).name
+            txt = lbl_dir / Path(img_name).with_suffix(".txt").name
+            boxes = []
             if txt.exists():
                 for line in txt.read_text().splitlines():
                     parts = line.strip().split()
-                    if len(parts) == 5: boxes.append({"class": int(parts[0]), "box": [float(x) for x in parts[1:]]})
+                    if len(parts) == 5:
+                        boxes.append({"class": int(parts[0]), "box": [float(x) for x in parts[1:]]})
             gt_data.append(boxes)
             
-        def evaluate(test_conf, test_iou):
+        def evaluate(test_conf, fixed_iou=0.45):
             total_tp, total_fp, total_fn = 0, 0, 0
+            per_image_results = []
             
             for idx, r in enumerate(base_results):
                 valid_preds = []
                 for cls_t, box_t, conf_t in zip(r.boxes.cls, r.boxes.xywhn, r.boxes.conf):
-                    if conf_t.item() >= test_conf: 
+                    if conf_t.item() >= test_conf:
                         valid_preds.append({"class": int(cls_t.item()), "box": box_t.tolist(), "conf": conf_t.item()})
+                
                 valid_preds.sort(key=lambda x: x["conf"], reverse=True)
                 
                 keep_preds = []
                 for vp in valid_preds:
                     keep = True
                     for kp in keep_preds:
-                        if vp["class"] == kp["class"] and calc_iou(vp["box"], kp["box"]) > test_iou: 
+                        if calc_iou(vp["box"], kp["box"]) > fixed_iou:
                             keep = False; break
                     if keep: keep_preds.append(vp)
                 
@@ -330,45 +358,62 @@ def _auto_threshold_worker(args, queue):
                 for pb in keep_preds:
                     best_iou, best_gt = 0.0, -1
                     for j, gb in enumerate(gt_boxes):
-                        if j not in matched_gt and pb["class"] == gb["class"]:
-                            iou = calc_iou(pb["box"], gb["box"])
-                            if iou > best_iou: 
-                                best_iou, best_gt = iou, j
-                                
-                    if best_iou >= match_iou_thr: 
+                        if j in matched_gt: continue
+                        if pb["class"] != gb["class"]: continue
+                        iou = calc_iou(pb["box"], gb["box"])
+                        if iou > best_iou: best_iou, best_gt = iou, j
+                    
+                    match_threshold = max(match_iou_thr, 0.5)
+                    if best_iou >= match_threshold:
                         tp += 1
                         matched_gt.add(best_gt)
-                    else: 
+                    else:
                         fp += 1
-                        
+                
                 fn = len(gt_boxes) - len(matched_gt)
                 total_tp += tp
                 total_fp += fp
                 total_fn += fn
                 
+                img_correct = (fp == 0 and fn == 0)
+                per_image_results.append(img_correct)
+                
+            image_accuracy = sum(per_image_results) / len(per_image_results) * 100 if per_image_results else 0.0
             precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
             recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
             f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-            return f1_score * 100
+            
+            combined_score = (f1_score * 100 * 0.6 + image_accuracy * 0.4)
+            return combined_score, f1_score * 100, image_accuracy
 
-        best_acc, best_c_conf, best_c_iou = -1.0, 0.25, 0.45
-        for c in np.arange(0.1, 0.9, 0.1):
-            for i in np.arange(0.3, 0.8, 0.1):
-                acc = evaluate(c, i)
-                if acc > best_acc: best_acc, best_c_conf, best_c_iou = acc, c, i
-                
-        best_f_conf, best_f_iou = best_c_conf, best_c_iou
-        for c in np.arange(max(0.01, best_c_conf - 0.05), min(0.99, best_c_conf + 0.06), 0.01):
-            for i in np.arange(max(0.01, best_c_iou - 0.05), min(0.99, best_c_iou + 0.06), 0.01):
-                acc = evaluate(c, i)
-                if acc > best_acc: best_acc, best_f_conf, best_f_iou = acc, c, i
-                
-        result["success"] = True; result["best_conf"] = round(float(best_f_conf), 2); result["best_iou"] = round(float(best_f_iou), 2); result["best_acc"] = round(float(best_acc), 1)
-        hours, rem = divmod(time.time() - start_time, 3600); mins, secs = divmod(rem, 60)
-        result["msg"] = f"🎯 Coarse-to-Fine 스레숄드 탐색 완료! (소요시간: {int(mins)}분 {int(secs)}초)\n\n📊 [최적 파라미터 (F1-Score 최대화)]\n- Confidence: {result['best_conf']}\n- NMS IoU: {result['best_iou']}\n- 최고 F1-Score: {result['best_acc']}%"
+        best_acc, best_f1, best_img_acc = -1.0, 0.0, 0.0
+        best_conf = 0.25
         
-    except Exception as e: result["error"] = traceback.format_exc()
-    finally: clear_vram(); queue.put(result)
+        for c in np.arange(0.20, 0.81, 0.05):
+            combined, f1, img_acc = evaluate(c, fixed_iou=0.45)
+            if combined > best_acc: best_acc, best_conf, best_f1, best_img_acc = combined, c, f1, img_acc
+            
+        fine_start = max(0.20, best_conf - 0.10)
+        fine_end = min(0.80, best_conf + 0.10)
+        
+        for c in np.arange(fine_start, fine_end + 0.01, 0.01):
+            combined, f1, img_acc = evaluate(c, fixed_iou=0.45)
+            if combined > best_acc: best_acc, best_conf, best_f1, best_img_acc = combined, c, f1, img_acc
+
+        result["success"] = True
+        result["best_conf"] = round(float(best_conf), 2)
+        result["best_iou"] = 0.45
+        result["best_acc"] = round(float(best_f1), 1)
+        
+        hours, rem = divmod(time.time() - start_time, 3600)
+        mins, secs = divmod(rem, 60)
+        result["msg"] = f"🎯 최적 스레숄드 탐색 완료! (소요시간: {int(mins)}분 {int(secs)}초)\n\n📊 [최적 파라미터]\n- Confidence: {result['best_conf']}\n- NMS IoU: {result['best_iou']} (고정)\n\n✅ [성능 지표]\n- F1-Score: {result['best_acc']}%\n- 이미지 정확도: {round(best_img_acc, 1)}%\n- 종합 점수: {round(best_acc, 1)}%"
+        
+    except Exception as e:
+        result["error"] = traceback.format_exc()
+    finally:
+        clear_vram()
+        queue.put(result)
 
 def _kfold_train_worker(args, queue):
     import json, shutil, numpy as np, time
@@ -629,7 +674,6 @@ class EvalThread(QThread):
                         parts = line.strip().split()
                         if len(parts) == 5: gt_boxes.append({"class": int(parts[0]), "box": [float(x) for x in parts[1:]]})
 
-                # TP, FP, FN Calculation for the image
                 matched_gt = set()
                 tp = fp = 0
                 for pb in pred_boxes:
@@ -639,7 +683,8 @@ class EvalThread(QThread):
                             iou = calc_iou(pb["box"], gb["box"])
                             if iou > best_iou:
                                 best_iou, best_gt = iou, j
-                    if best_iou >= c["match_iou"]:
+                    match_threshold = max(c.get("match_iou", 0.5), 0.5)
+                    if best_iou >= match_threshold:
                         tp += 1
                         matched_gt.add(best_gt)
                     else:
@@ -671,7 +716,7 @@ class EvalThread(QThread):
                 "total": total, 
                 "correct": total - wrong, 
                 "wrong": wrong, 
-                "acc": f1_score * 100, # DB 호환성을 위해 acc라는 키 이름 유지 (실제값은 F1-Score)
+                "acc": f1_score * 100,
                 "precision": precision * 100,
                 "recall": recall * 100,
                 "f1_score": f1_score * 100,
@@ -1701,7 +1746,7 @@ class MainWindow(QMainWindow):
         if not src_dir: return
         src_path = Path(src_dir); target_dir = Path(self.t6_img_dir.get_path()); target_dir.mkdir(parents=True, exist_ok=True); valid_exts = {".jpg", ".jpeg", ".png"}
         files_to_copy = [f for f in src_path.iterdir() if f.suffix.lower() in valid_exts]
-        if not files_to_copy: QMessageBox.warning(self, "파일 없음", "선택한 폴더에 이미지 파일이 없습니다."); return
+        if not files_to_copy: QMessageBox.warning(self, "파일 없음", "선택한 폴더에 이미지 파일이 무없습니다."); return
         copy_count = 0; QApplication.setOverrideCursor(Qt.WaitCursor) 
         try:
             for f in files_to_copy:
@@ -1976,8 +2021,8 @@ class MainWindow(QMainWindow):
 
     def setup_tab3(self):
         f = QFormLayout(); proc_dir, work_dir = Path(self.w_proc_ds.get_path()), Path(self.w_work_ds.get_path()); self.t3_model = PathInputWidget("평가 모델 (.pt)", False, str(work_dir/"kfold"/"best_model.pt")); f.addRow(self.t3_model); self.t3_img = PathInputWidget("평가 이미지", True, str(proc_dir/"images")); f.addRow(self.t3_img); self.t3_lbl = PathInputWidget("정답 라벨", True, str(proc_dir/"labels")); f.addRow(self.t3_lbl)
-        self.t3_conf = QDoubleSpinBox(); self.t3_conf.setRange(0.01, 0.99); self.t3_conf.setValue(0.25); self.t3_conf.setSingleStep(0.01); self.t3_iou = QDoubleSpinBox(); self.t3_iou.setRange(0.01, 0.99); self.t3_iou.setValue(0.45); self.t3_iou.setSingleStep(0.01); self.t3_match_iou = QDoubleSpinBox(); self.t3_match_iou.setRange(0.01, 0.99); self.t3_match_iou.setValue(0.45); self.t3_match_iou.setSingleStep(0.01); self.t3_max_det = QSpinBox(); self.t3_max_det.setRange(1, 999); self.t3_max_det.setValue(99); self.t3_run_name = QLineEdit("check01"); self.t3_agnostic = QCheckBox(); self.t3_agnostic.setChecked(True); self.t3_save_rel = QCheckBox(); self.t3_save_rel.setChecked(True)
-        self.add_param(f, "Confidence Threshold", self.t3_conf, 0.25); self.add_param(f, "IoU (NMS)", self.t3_iou, 0.45); self.add_param(f, "정답 매칭 IoU", self.t3_match_iou, 0.45); self.add_param(f, "최대 탐지 수", self.t3_max_det, 99); self.add_param(f, "실행 이름", self.t3_run_name, "check01"); self.add_param(f, "Agnostic NMS", self.t3_agnostic, True); self.add_param(f, "오답 별도 저장 (재학습용)", self.t3_save_rel, True)
+        self.t3_conf = QDoubleSpinBox(); self.t3_conf.setRange(0.01, 0.99); self.t3_conf.setValue(0.25); self.t3_conf.setSingleStep(0.01); self.t3_iou = QDoubleSpinBox(); self.t3_iou.setRange(0.01, 0.99); self.t3_iou.setValue(0.45); self.t3_iou.setSingleStep(0.01); self.t3_match_iou = QDoubleSpinBox(); self.t3_match_iou.setRange(0.01, 0.99); self.t3_match_iou.setValue(0.50); self.t3_match_iou.setSingleStep(0.01); self.t3_max_det = QSpinBox(); self.t3_max_det.setRange(1, 999); self.t3_max_det.setValue(99); self.t3_run_name = QLineEdit("check01"); self.t3_agnostic = QCheckBox(); self.t3_agnostic.setChecked(True); self.t3_save_rel = QCheckBox(); self.t3_save_rel.setChecked(True)
+        self.add_param(f, "Confidence Threshold", self.t3_conf, 0.25); self.add_param(f, "IoU (NMS)", self.t3_iou, 0.45); self.add_param(f, "정답 매칭 IoU", self.t3_match_iou, 0.50); self.add_param(f, "최대 탐지 수", self.t3_max_det, 99); self.add_param(f, "실행 이름", self.t3_run_name, "check01"); self.add_param(f, "Agnostic NMS", self.t3_agnostic, True); self.add_param(f, "오답 별도 저장 (재학습용)", self.t3_save_rel, True)
         self.t3_btn_run = QPushButton("🔍 평가 및 오답 선별 실행"); self.t3_btn_run.clicked.connect(self.run_tab3)
         self.t3_btn_auto_thr = QPushButton("🎯 이 모델의 최적 스레숄드 찾기 (F1-Score 기반)"); self.t3_btn_auto_thr.setStyleSheet("background-color: #fef08a; font-weight: bold; color: #854d0e;"); self.t3_btn_auto_thr.clicked.connect(self.run_auto_threshold)
         self.btn_send_t3_to_t5 = QPushButton("➡️ 이 모델과 설정으로 거리 측정하기"); self.btn_send_t3_to_t5.setStyleSheet("background-color: #dbeafe; font-weight: bold; color: #1e3a8a;"); self.btn_send_t3_to_t5.clicked.connect(lambda: self.send_to_measure_tab(self.t3_model.get_path(), self.t3_img.get_path(), self.t3_conf.value(), self.t3_iou.value(), self.t3_max_det.value(), self.t3_agnostic.isChecked()))
@@ -1995,7 +2040,17 @@ class MainWindow(QMainWindow):
         if self.training_process and self.training_process.is_alive(): QMessageBox.warning(self, "경고", "이미 진행 중입니다."); return
         is_valid, err = self.validate_paths(평가모델_file=Path(self.t3_model.get_path()), 평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
-        if QMessageBox.question(self, '스레숄드 탐색', '개발자님이 설정한 [정답 매칭 IoU] 기준에 맞춰, F1-Score(정밀도/재현율)를 최대로 만드는\n최적의 Confidence 및 NMS IoU 값을 탐색합니다.\n계속 진행하시겠습니까?', QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
+        
+        msg = ('개발자님이 설정한 [정답 매칭 IoU] 기준에 맞춰, F1-Score(정밀도/재현율)를 최대로 만드는\n'
+               '최적의 Confidence 값을 탐색합니다.\n\n'
+               '💡 최적 스레숄드 찾기 가이드:\n'
+               '- Confidence: 0.20~0.80 범위에서 탐색\n'
+               '- NMS IoU: 고정값 0.45 사용\n'
+               '- Match IoU: 0.50 이상 권장 (더 엄격한 검증)\n'
+               '주의: 데이터셋이 작으면 (< 100장) 오버피팅될 수 있으므로 주의하세요.\n\n'
+               '계속 진행하시겠습니까?')
+        
+        if QMessageBox.question(self, '스레숄드 탐색', msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
         args = {"model_path": self.t3_model.get_path(), "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t3_match_iou.value()}
         self.start_training_process(_auto_threshold_worker, args)
 
@@ -2040,9 +2095,9 @@ class MainWindow(QMainWindow):
         f1.addRow(QLabel("<br><b>[재학습 증강 설정]</b>")); self.add_param(f1, "HSV(H)", self.t4_ah, 0.015); self.add_param(f1, "HSV(S)", self.t4_as, 0.7); self.add_param(f1, "HSV(V)", self.t4_av, 0.4); self.add_param(f1, "Flip UD", self.t4_afud, 0.0); self.add_param(f1, "Flip LR", self.t4_aflr, 0.5); self.add_param(f1, "Mosaic", self.t4_amos, 1.0); self.add_param(f1, "Mixup", self.t4_amix, 0.0); self.add_param(f1, "Copy-Paste", self.t4_acp, 0.0)
         self.t4_scroll = self._create_scroll(f1); st1_layout.addWidget(self.t4_scroll); self.t4_btn_retrain = QPushButton("🔁 Hard Example 재학습 시작"); self.t4_btn_retrain.setMinimumHeight(40); self.t4_btn_retrain.clicked.connect(self.run_tab4_retrain); st1_layout.addWidget(self.t4_btn_retrain)
         sub_tab2 = QWidget(); st2_layout = QVBoxLayout(sub_tab2); eval_group = QGroupBox("최종 평가 설정"); eval_layout = QVBoxLayout(eval_group); f2 = QFormLayout()
-        self.t4_conf = QDoubleSpinBox(); self.t4_conf.setRange(0.01, 0.99); self.t4_conf.setValue(0.25); self.t4_conf.setSingleStep(0.01); self.t4_iou = QDoubleSpinBox(); self.t4_iou.setRange(0.01, 0.99); self.t4_iou.setValue(0.45); self.t4_iou.setSingleStep(0.01); self.t4_match_iou = QDoubleSpinBox(); self.t4_match_iou.setRange(0.01, 0.99); self.t4_match_iou.setValue(0.45); self.t4_match_iou.setSingleStep(0.01); self.t4_max_det = QSpinBox(); self.t4_max_det.setRange(1, 999); self.t4_max_det.setValue(99); self.t4_agnostic = QCheckBox(); self.t4_agnostic.setChecked(True)
+        self.t4_conf = QDoubleSpinBox(); self.t4_conf.setRange(0.01, 0.99); self.t4_conf.setValue(0.25); self.t4_conf.setSingleStep(0.01); self.t4_iou = QDoubleSpinBox(); self.t4_iou.setRange(0.01, 0.99); self.t4_iou.setValue(0.45); self.t4_iou.setSingleStep(0.01); self.t4_match_iou = QDoubleSpinBox(); self.t4_match_iou.setRange(0.01, 0.99); self.t4_match_iou.setValue(0.50); self.t4_match_iou.setSingleStep(0.01); self.t4_max_det = QSpinBox(); self.t4_max_det.setRange(1, 999); self.t4_max_det.setValue(99); self.t4_agnostic = QCheckBox(); self.t4_agnostic.setChecked(True)
         h_eval_model = QHBoxLayout(); self.t4_eval_model_display = QLineEdit(); self.t4_eval_model_display.setReadOnly(True); self.t4_eval_model_display.setPlaceholderText("모델을 선택하거나 첫 번째 탭에서 재학습을 완료하세요."); self.t4_eval_model_display.setStyleSheet("background-color: #f3f4f6; color: #374151; font-weight: bold;"); self.btn_t4_eval_browse = QPushButton("📂"); self.btn_t4_eval_browse.clicked.connect(self.browse_tab4_eval_model); h_eval_model.addWidget(self.t4_eval_model_display); h_eval_model.addWidget(self.btn_t4_eval_browse)
-        f2.addRow("평가 대상 모델:", h_eval_model); self.add_param(f2, "Confidence Threshold", self.t4_conf, 0.25); self.add_param(f2, "IoU (NMS)", self.t4_iou, 0.45); self.add_param(f2, "정답 매칭 IoU", self.t4_match_iou, 0.45); self.add_param(f2, "최대 탐지 수", self.t4_max_det, 99); self.add_param(f2, "Agnostic NMS", self.t4_agnostic, True); eval_layout.addLayout(f2)
+        f2.addRow("평가 대상 모델:", h_eval_model); self.add_param(f2, "Confidence Threshold", self.t4_conf, 0.25); self.add_param(f2, "IoU (NMS)", self.t4_iou, 0.45); self.add_param(f2, "정답 매칭 IoU", self.t4_match_iou, 0.50); self.add_param(f2, "최대 탐지 수", self.t4_max_det, 99); self.add_param(f2, "Agnostic NMS", self.t4_agnostic, True); eval_layout.addLayout(f2)
         
         h_eval_btns = QHBoxLayout()
         self.t4_btn_eval = QPushButton("📊 재학습 모델 최종 평가 실행"); self.t4_btn_eval.setMinimumHeight(40); self.t4_btn_eval.clicked.connect(self.run_tab4_eval); self.t4_btn_eval.setEnabled(False)
@@ -2070,7 +2125,15 @@ class MainWindow(QMainWindow):
         is_valid, err = self.validate_paths(평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
         
-        if QMessageBox.question(self, '스레숄드 탐색', '설정된 [정답 매칭 IoU] 기준에 맞춰, 재학습된 모델의 최적 Confidence 및 NMS IoU 값을 탐색합니다.\n진행하시겠습니까?', QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
+        msg = ('설정된 [정답 매칭 IoU] 기준에 맞춰, 재학습된 모델의 최적 Confidence 값을 탐색합니다.\n\n'
+               '💡 최적 스레숄드 찾기 가이드:\n'
+               '- Confidence: 0.20~0.80 범위에서 탐색\n'
+               '- NMS IoU: 고정값 0.45 사용\n'
+               '- Match IoU: 0.50 이상 권장 (더 엄격한 검증)\n'
+               '주의: 데이터셋이 작으면 (< 100장) 오버피팅될 수 있으므로 주의하세요.\n\n'
+               '진행하시겠습니까?')
+               
+        if QMessageBox.question(self, '스레숄드 탐색', msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
         
         args = {"model_path": model_path, "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t4_match_iou.value()}
         self.start_training_process(_auto_threshold_worker, args)
