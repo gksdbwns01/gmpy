@@ -657,8 +657,8 @@ class PreprocessThread(QThread):
                     cropped_img = img.crop((crop_x, crop_y, crop_x + acw, crop_y + ach))
                     cropped_img.save(out_img / img_id)
                     
-                    # 2. 미리보기용 라벨 박스 그리기 및 저장
-                    preview_img = cropped_img.copy()
+                    # 2. 미리보기용 라벨 박스 그리기 및 저장 (무채색 방지를 위해 RGB 강제 변환)
+                    preview_img = cropped_img.copy().convert("RGB")
                     draw = ImageDraw.Draw(preview_img)
                     
                     # 클래스 ID -> 이름 변환 매핑 (색상 팔레트 추가)
@@ -678,9 +678,8 @@ class PreprocessThread(QThread):
                         # 테두리 박스 그리기
                         draw.rectangle([bx1, by1, bx1 + bw, by1 + bh], outline=color, width=3)
                         
-                        # 가독성을 위해 검은색 텍스트 그림자를 깐 뒤, 색상 텍스트 표시
+                        # 그림자 없이 색상 텍스트만 표시
                         text_x, text_y = bx1 + 2, max(0, by1 - 15)
-                        draw.text((text_x + 1, text_y + 1), class_name, fill="black")
                         draw.text((text_x, text_y), class_name, fill=color)
 
                     preview_img.save(out_preview / img_id)
