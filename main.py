@@ -319,13 +319,10 @@ def _auto_threshold_worker(args, queue):
         total_imgs = len(img_files)
         if total_imgs == 0: raise ValueError("평가할 이미지가 없습니다.")
 
-        # 가장 넓은 범위로 단 1번 예측 (모든 후보 박스 캐싱)
-        base_results = model.predict(source=[str(p) for p in img_files], conf=0.01, iou=0.99, max_det=max_det, agnostic_nms=False, verbose=False)
-
+        # 정답 라벨 미리 로드 (캐싱)
         gt_data = []
-        for r in base_results:
-            img_name = Path(r.path).name
-            txt = lbl_dir / Path(img_name).with_suffix(".txt").name
+        for img_path in img_files:
+            txt = lbl_dir / Path(img_path).with_suffix(".txt").name
             boxes = []
             if txt.exists():
                 for line in txt.read_text().splitlines():
@@ -334,58 +331,43 @@ def _auto_threshold_worker(args, queue):
                         boxes.append({"class": int(parts[0]), "box": [float(x) for x in parts[1:]]})
             gt_data.append(boxes)
 
-        def simulate_prediction(test_conf, test_iou):
+        # 실제 YOLO 엔진을 돌려서 평가 탭과 100% 동일하게 평가하는 함수
+        def evaluate_real_yolo(test_conf, test_iou):
+            # 시뮬레이션 대신 실제 예측 수행 (메모리 관리를 위해 stream=True)
+            results = model.predict(source=[str(p) for p in img_files], conf=test_conf, iou=test_iou, 
+                                    max_det=max_det, agnostic_nms=agnostic, verbose=False, stream=True)
+            
             total_tp, total_fp, total_fn = 0, 0, 0
             img_correct_count = 0
 
-            for idx, r in enumerate(base_results):
-                valid_preds = []
-                for cls_t, box_t, conf_t in zip(r.boxes.cls, r.boxes.xywhn, r.boxes.conf):
-                    if conf_t.item() >= test_conf:
-                        valid_preds.append({
-                            "class": int(cls_t.item()),
-                            "box": box_t.tolist(),
-                            "conf": conf_t.item()
-                        })
-
-                valid_preds.sort(key=lambda x: x["conf"], reverse=True)
-
-                keep_preds = []
-                for vp in valid_preds:
-                    keep = True
-                    for kp in keep_preds:
-                        if agnostic or vp["class"] == kp["class"]:
-                            if calc_iou(vp["box"], kp["box"]) > test_iou:
-                                keep = False
-                                break
-                    if keep:
-                        keep_preds.append(vp)
-                        if len(keep_preds) >= max_det:
-                            break
-
+            for idx, r in enumerate(results):
+                # YOLO가 자체 NMS를 완료한 최종 결과 박스
+                pred_boxes = [{"class": int(cls.item()), "box": b.tolist()} for cls, b in zip(r.boxes.cls, r.boxes.xywhn)]
                 gt_boxes = gt_data[idx]
+
+                # 평가 탭과 100% 동일한 매칭 로직
                 matched_gt = set()
                 tp = fp = 0
-
-                for pb in keep_preds:
+                for pb in pred_boxes:
                     best_iou, best_gt = 0.0, -1
                     for j, gb in enumerate(gt_boxes):
-                        if j in matched_gt: continue
-                        if pb["class"] != gb["class"]: continue
-                        iou = calc_iou(pb["box"], gb["box"])
-                        if iou > best_iou: best_iou, best_gt = iou, j
-
+                        if j not in matched_gt and pb["class"] == gb["class"]:
+                            iou = calc_iou(pb["box"], gb["box"])
+                            if iou > best_iou:
+                                best_iou, best_gt = iou, j
+                    
                     if best_iou >= match_iou_thr:
                         tp += 1
                         matched_gt.add(best_gt)
                     else:
                         fp += 1
-
+                
                 fn = len(gt_boxes) - len(matched_gt)
                 total_tp += tp
                 total_fp += fp
                 total_fn += fn
 
+                # 완벽하게 일치하는 이미지 카운트
                 if fp == 0 and fn == 0:
                     img_correct_count += 1
 
@@ -393,6 +375,8 @@ def _auto_threshold_worker(args, queue):
             recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
             f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
 
+            # VRAM 정리
+            clear_vram()
             return img_correct_count, f1_score * 100
 
         best_img_correct = -1
@@ -400,25 +384,28 @@ def _auto_threshold_worker(args, queue):
         best_conf = 0.25
         best_iou = 0.45
 
-        # 1차 Coarse Grid Search
-        for c in np.arange(0.10, 0.90, 0.05):
-            for i in np.arange(0.10, 0.90, 0.05):
-                img_correct, f1 = simulate_prediction(c, i)
+        # 1차 Coarse 탐색: 넓은 범위, 큰 간격 (속도 최적화)
+        print("🔍 1차 Coarse 스레숄드 탐색 중...")
+        for c in [0.1, 0.3, 0.5, 0.7, 0.9]:
+            for i in [0.3, 0.5, 0.7]:
+                img_correct, f1 = evaluate_real_yolo(c, i)
+                # 1순위: 완벽한 이미지 장수, 2순위: F1-Score
                 if img_correct > best_img_correct or (img_correct == best_img_correct and f1 > best_f1):
                     best_img_correct = img_correct
                     best_f1 = f1
                     best_conf = c
                     best_iou = i
 
-        # 2차 Fine Grid Search
-        fine_c_start = max(0.01, best_conf - 0.05)
-        fine_c_end = min(0.99, best_conf + 0.05)
-        fine_i_start = max(0.01, best_iou - 0.05)
-        fine_i_end = min(0.99, best_iou + 0.05)
+        # 2차 Fine 탐색: 찾은 최적점 근처를 조밀하게 탐색
+        print(f"🎯 2차 Fine 탐색 중... (기준점: Conf {best_conf:.2f}, IoU {best_iou:.2f})")
+        fine_c_start = max(0.01, best_conf - 0.15)
+        fine_c_end = min(0.99, best_conf + 0.15)
+        fine_i_start = max(0.01, best_iou - 0.15)
+        fine_i_end = min(0.99, best_iou + 0.15)
 
-        for c in np.arange(fine_c_start, fine_c_end + 0.01, 0.01):
-            for i in np.arange(fine_i_start, fine_i_end + 0.01, 0.01):
-                img_correct, f1 = simulate_prediction(c, i)
+        for c in np.arange(fine_c_start, fine_c_end + 0.01, 0.05):
+            for i in np.arange(fine_i_start, fine_i_end + 0.01, 0.05):
+                img_correct, f1 = evaluate_real_yolo(c, i)
                 if img_correct > best_img_correct or (img_correct == best_img_correct and f1 > best_f1):
                     best_img_correct = img_correct
                     best_f1 = f1
@@ -436,8 +423,9 @@ def _auto_threshold_worker(args, queue):
                          f"📊 [최적 파라미터]\n"
                          f"- Confidence: {result['best_conf']}\n"
                          f"- NMS IoU: {result['best_iou']}\n\n"
-                         f"✅ [성능 예측]\n"
-                         f"- 완벽하게 맞춘 이미지: {best_img_correct}장 / {total_imgs}장\n"
+                         f"✅ [예상 성적 (실제 평가와 100% 동일)]\n"
+                         f"- 완벽 정답 이미지: {best_img_correct}장 / {total_imgs}장\n"
+                         f"- 예상 오답 이미지: {total_imgs - best_img_correct}장\n"
                          f"- F1-Score: {result['best_acc']}%")
 
     except Exception:
