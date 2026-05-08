@@ -64,7 +64,7 @@ class ConfigBuilder:
     @staticmethod
     def build(w):
         return {
-            "global": {"proj_root": w.w_proj_root.get_path(), "base_ds": w.w_base_ds.get_path(), "proc_ds": w.w_proc_ds.get_path(), "work_ds": w.w_work_ds.get_path(), "webhook_url": w.w_webhook.text(), "notify_error": w.chk_noti_error.isChecked(), "notify_task": w.chk_noti_task.isChecked(), "notify_fold": w.chk_noti_fold.isChecked(), "notify_early_stop": w.chk_noti_early_stop.isChecked(), "model": w.g_model.currentText(), "imgsz": w.g_imgsz.currentText()},
+            "global": {"proj_root": w.w_proj_root.get_path(), "base_ds": w.w_base_ds.get_path(), "proc_ds": w.w_proc_ds.get_path(), "work_ds": w.w_work_ds.get_path(), "webhook_url": w.w_webhook.text(), "noti_flags": w.get_noti_flags(), "model": w.g_model.currentText(), "imgsz": w.g_imgsz.currentText()},
             "tab1": {"auto_crop": w.t1_auto_crop.isChecked(), "margin": w.t1_margin.value(), "mx": w.t1_mx.value(), "my": w.t1_my.value(), "mw": w.t1_mw.value(), "mh": w.t1_mh.value(), "class_map": w.t1_class_map.toPlainText(), "clean": w.t1_clean.isChecked(), "exif": w.t1_exif.isChecked()},
             "tab2": {"epochs": w.t2_epochs.value(), "batch": w.t2_batch.value(), "workers": w.t2_workers.value(), "patience": w.t2_patience.value(), "seed": w.t2_seed.value(), "folds": w.t2_folds.value(), "test_split": w.t2_test_split.value(), "lcls": w.t2_lcls.value(), "lbox": w.t2_lbox.value(), "ldfl": w.t2_ldfl.value(), "ah": w.t2_ah.value(), "as": w.t2_as.value(), "av": w.t2_av.value(), "adeg": w.t2_adeg.value(), "atrans": w.t2_atrans.value(), "ascale": w.t2_ascale.value(), "ashear": w.t2_ashear.value(), "afud": w.t2_afud.value(), "aflr": w.t2_aflr.value(), "amos": w.t2_amos.value(), "amix": w.t2_amix.value(), "acp": w.t2_acp.value()},
             "tab3": {"conf": w.t3_conf.value(), "iou": w.t3_iou.value(), "match_iou": w.t3_match_iou.value(), "max_det": w.t3_max_det.value(), "run_name": w.t3_run_name.text(), "agnostic": w.t3_agnostic.isChecked(), "save_rel": w.t3_save_rel.isChecked()},
@@ -113,12 +113,77 @@ def send_discord_webhook(webhook_url, content):
     try: requests.post(webhook_url, json={"content": content}, timeout=5)
     except Exception: pass
 
-def create_heartbeat_callback(webhook_url, total_epochs):
+def create_heartbeat_callback(webhook_url, total_epochs, interval):
+    if interval <= 0: return lambda trainer: None
     def on_train_epoch_end(trainer):
         current_epoch = trainer.epoch + 1
-        if current_epoch % 100 == 0:
+        if current_epoch % interval == 0:
             send_discord_webhook(webhook_url, f"💓 **[학습 진행 상황]** {current_epoch} / {total_epochs} Epochs\n📉 현재 Total Loss: `{trainer.tloss.sum().item():.4f}`")
     return on_train_epoch_end
+
+class WebhookSettingsDialog(QDialog):
+    def __init__(self, current_flags, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("디스코드 웹훅 상세 설정")
+        self.resize(380, 420)
+        layout = QVBoxLayout(self)
+
+        grp_sys = QGroupBox("시스템 알림"); l_sys = QVBoxLayout(grp_sys)
+        self.chk_error = QCheckBox("🚨 에러 및 비정상 종료 (권장)")
+        self.chk_early_stop = QCheckBox("🛑 조기 종료 (Early Stop) 발동")
+        l_sys.addWidget(self.chk_error); l_sys.addWidget(self.chk_early_stop)
+        layout.addWidget(grp_sys)
+
+        grp_prog = QGroupBox("진행 상황 알림"); l_prog = QVBoxLayout(grp_prog)
+        self.chk_start = QCheckBox("▶️ 작업 시작 (학습, 튜닝 등)")
+        self.chk_fold = QCheckBox("📍 K-Fold 각 Fold 완료 시")
+        self.chk_tune = QCheckBox("🤖 Auto ML 세대별 탐색 진행 상황")
+        
+        h_epoch = QHBoxLayout()
+        self.chk_epoch = QCheckBox("💓 학습 에포크 진행 상황")
+        self.cmb_epoch = QComboBox()
+        self.cmb_epoch.addItems(["10 Epoch 마다", "50 Epoch 마다", "100 Epoch 마다", "500 Epoch 마다"])
+        h_epoch.addWidget(self.chk_epoch); h_epoch.addWidget(self.cmb_epoch)
+        l_prog.addWidget(self.chk_start); l_prog.addWidget(self.chk_fold); l_prog.addWidget(self.chk_tune); l_prog.addLayout(h_epoch)
+        layout.addWidget(grp_prog)
+
+        grp_task = QGroupBox("완료 알림"); l_task = QVBoxLayout(grp_task)
+        self.chk_task = QCheckBox("✅ 주요 작업 (전처리, 평가, 측정 등) 완료 시")
+        l_task.addWidget(self.chk_task)
+        layout.addWidget(grp_task)
+
+        self.chk_error.setChecked(current_flags.get("error", True))
+        self.chk_early_stop.setChecked(current_flags.get("early_stop", True))
+        self.chk_start.setChecked(current_flags.get("start", True))
+        self.chk_fold.setChecked(current_flags.get("fold", True))
+        self.chk_tune.setChecked(current_flags.get("tune", True))
+        self.chk_epoch.setChecked(current_flags.get("epoch", True))
+        self.chk_task.setChecked(current_flags.get("task", True))
+        
+        interval = current_flags.get("epoch_interval", 100)
+        idx = ["10", "50", "100", "500"].index(str(interval)) if str(interval) in ["10", "50", "100", "500"] else 2
+        self.cmb_epoch.setCurrentIndex(idx)
+        self.chk_epoch.stateChanged.connect(lambda state: self.cmb_epoch.setEnabled(state == Qt.Checked))
+        self.cmb_epoch.setEnabled(self.chk_epoch.isChecked())
+
+        btn_layout = QHBoxLayout()
+        btn_ok = QPushButton("저장"); btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton("취소"); btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_ok); btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+
+    def get_flags(self):
+        interval_map = {0: 10, 1: 50, 2: 100, 3: 500}
+        return {
+            "error": self.chk_error.isChecked(),
+            "early_stop": self.chk_early_stop.isChecked(),
+            "start": self.chk_start.isChecked(),
+            "fold": self.chk_fold.isChecked(),
+            "tune": self.chk_tune.isChecked(),
+            "epoch": self.chk_epoch.isChecked(),
+            "epoch_interval": interval_map[self.cmb_epoch.currentIndex()],
+            "task": self.chk_task.isChecked()
+        }
 
 def _tune_worker(args, queue):
     import time, traceback, yaml, shutil, random
@@ -135,6 +200,7 @@ def _tune_worker(args, queue):
         model_name, epochs, iterations = args["model_name"], args["epochs"], args["iterations"]
         batch_size, workers = args["batch"], args["workers"]
         webhook_url = args.get("webhook_url", "")
+        noti_flags = args.get("noti_flags", {})
         
         tune_base = workspace_dir / "runs" / "tune_custom"
         if tune_base.exists(): shutil.rmtree(tune_base)
@@ -166,17 +232,16 @@ def _tune_worker(args, queue):
         }
         import random
         rng = random.Random()
-        rng.seed(time.time()) # 현재 시간을 기준으로 완전한 랜덤성 보장
+        rng.seed(time.time())
         for i in range(iterations):
             current_params = best_params.copy()
-            if i > 0: # 2세대부터 변이 적용
+            if i > 0:
                 for k, (min_v, max_v) in bounds.items():
-                    if rng.random() < 0.5:  # 🚀 random.random() -> rng.random() 으로 변경
-                        mutation = rng.gauss(0, (max_v - min_v) * 0.1) # 🚀 random.gauss() -> rng.gauss() 로 변경
+                    if rng.random() < 0.5: 
+                        mutation = rng.gauss(0, (max_v - min_v) * 0.1)
                         current_params[k] = round(max(min_v, min(max_v, current_params[k] + mutation)), 4)
             
             model = YOLO(model_name)
-            # 튜닝용 미니 학습 (시간 단축을 위해 epochs는 작게)
             results = model.train(
                 data=str(data_yaml), epochs=min(epochs, 30), patience=5, batch=batch_size, 
                 workers=workers, project=str(tune_base), name=f"gen_{i+1}", seed=42, 
@@ -189,7 +254,6 @@ def _tune_worker(args, queue):
                 copy_paste=current_params['copy_paste'], verbose=False
             )
             
-            # 수정된 채점 방식: 튜닝 중에는 mAP를 혼합한 Fitness(잠재력)를 기준으로 방향을 잡습니다.
             mAP50 = results.results_dict.get('metrics/mAP50(B)', 0)
             mAP50_95 = results.results_dict.get('metrics/mAP50-95(B)', 0)
             fitness_score = ((0.1 * mAP50) + (0.9 * mAP50_95)) * 100
@@ -198,7 +262,8 @@ def _tune_worker(args, queue):
                 best_score = fitness_score
                 best_params = current_params.copy()
             
-            if webhook_url: send_discord_webhook(webhook_url, f"🤖 **[AutoML 탐색]** {i+1}/{iterations}세대 완료\n현재 세대 잠재력: {fitness_score:.1f}점\n🏆 역대 최고: {best_score:.1f}점")
+            if webhook_url and noti_flags.get("tune"): 
+                send_discord_webhook(webhook_url, f"🤖 **[AutoML 탐색]** {i+1}/{iterations}세대 완료\n현재 세대 잠재력: {fitness_score:.1f}점\n🏆 역대 최고: {best_score:.1f}점")
             del model; clear_vram()
 
         result["best_params"] = best_params
@@ -210,6 +275,7 @@ def _tune_worker(args, queue):
         result["error"] = traceback.format_exc()
     finally:
         clear_vram(); queue.put(result)
+
 def _auto_threshold_worker(args, queue):
     import time, traceback, numpy as np
     from pathlib import Path
@@ -285,7 +351,6 @@ def _kfold_train_worker(args, queue):
         patience, random_seed, deterministic, num_folds, test_split = args.get("patience", 100), args["random_seed"], args["deterministic"], args["num_folds"], args["test_split"]
         best_metric, second_metric, class_names = args["best_metric"], args["second_metric"], args["class_names"]
         aug, loss, webhook_url, noti_flags = args["aug"], args["loss"], args.get("webhook_url", ""), args.get("noti_flags", {})
-        match_iou_thr = args.get("match_iou", 0.45)
 
         kfold_base = workspace_dir / "kfold"; runs_dir = workspace_dir / "runs" / "kfold_train"
         img_map = {f.stem: f for f in sorted((processed_dir / "images").glob("*.jpg"))}
@@ -301,98 +366,12 @@ def _kfold_train_worker(args, queue):
         test_img_dir.mkdir(parents=True, exist_ok=True); test_lbl_dir.mkdir(parents=True, exist_ok=True)
         for img, lbl in test_files: shutil.copy(img, test_img_dir); shutil.copy(lbl, test_lbl_dir)
 
-        # 평가용 정답(GT) 데이터 미리 로드 (전체 이미지 대상)
-        all_imgs = [p[0] for p in paired]
-        total_imgs = len(all_imgs)
-        gt_data = []
-        for p in all_imgs:
-            txt = Path(p).parent.parent / "labels" / Path(p).with_suffix(".txt").name
-            boxes = []
-            if txt.exists():
-                for line in txt.read_text().splitlines():
-                    parts = line.strip().split()
-                    if len(parts) == 5: boxes.append({"class": int(parts[0]), "box": [float(x) for x in parts[1:]]})
-            gt_data.append(boxes)
-            
-        def calc_iou(b1, b2):
-            ax1,ay1,ax2,ay2 = b1[0]-b1[2]/2, b1[1]-b1[3]/2, b1[0]+b1[2]/2, b1[1]+b1[3]/2
-            bx1,by1,bx2,by2 = b2[0]-b2[2]/2, b2[1]-b2[3]/2, b2[0]+b2[2]/2, b2[1]+b2[3]/2
-            ix, iy = max(0, min(ax2,bx2)-max(ax1,bx1)), max(0, min(ay2,by2)-max(ay1,by1))
-            ia = ix*iy; return ia/((ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-ia+1e-6)
-
-        best_overall_acc = -1.0
-        best_overall_conf = 0.25
-        best_overall_iou = 0.45
-        perfect_fold = -1
-
         def check_early_stop(save_dir, fold_name):
             try:
                 df = pd.read_csv(Path(save_dir) / 'results.csv')
                 if len(df) < epochs and noti_flags.get("early_stop") and webhook_url:
                     send_discord_webhook(webhook_url, f"🛑 **[조기 종료 발동]**\nFold {fold_name}이(가) {len(df)} Epoch에서 종료되었습니다.")
             except: pass
-
-        def run_auto_eval(model_path):
-            model_eval = YOLO(str(model_path))
-            # 1단계: 모든 후보군을 다 뽑아오기 위해 가장 널널한 기준으로 1회 추론
-            base_results = model_eval.predict(source=all_imgs, conf=0.01, iou=0.9, verbose=False)
-            
-            def evaluate(test_conf, test_iou):
-                correct = 0
-                for idx, r in enumerate(base_results):
-                    # 메모리 내 필터링
-                    valid_preds = [{"class": int(c.item()), "box": b.tolist(), "conf": cf.item()} 
-                                   for c, b, cf in zip(r.boxes.cls, r.boxes.xywhn, r.boxes.conf) 
-                                   if cf.item() >= test_conf]
-                    
-                    valid_preds.sort(key=lambda x: x["conf"], reverse=True)
-                    keep_preds = []
-                    for vp in valid_preds:
-                        keep = True
-                        for kp in keep_preds:
-                            if vp["class"] == kp["class"] and calc_iou(vp["box"], kp["box"]) > test_iou:
-                                keep = False; break
-                        if keep: keep_preds.append(vp)
-                        
-                    gt_boxes = gt_data[idx]
-                    is_correct = True
-                    if len(keep_preds) != len(gt_boxes): 
-                        is_correct = False
-                    else:
-                        matched = []
-                        for pb in keep_preds:
-                            found = False
-                            for j, gb in enumerate(gt_boxes):
-                                if j not in matched and pb["class"] == gb["class"] and calc_iou(pb["box"], gb["box"]) >= match_iou_thr:
-                                    found = True; matched.append(j); break
-                            if not found: is_correct = False; break
-                    if is_correct: correct += 1
-                return (correct / total_imgs) * 100
-
-            best_trial_acc, best_f_conf, best_f_iou = -1.0, 0.25, 0.45
-            
-            # [수정] 1단계: Coarse Search (전체 구간 0.1 단위 정밀 탐색)
-            for c in np.arange(0.1, 0.8, 0.1):
-                for i in np.arange(0.3, 0.7, 0.1):
-                    acc = evaluate(c, i)
-                    # 점수가 더 높거나, 점수가 같더라도 Confidence가 더 높으면(더 깐깐한 기준) 업데이트
-                    if acc >= best_trial_acc: 
-                        best_trial_acc, best_f_conf, best_f_iou = acc, c, i
-
-            # [수정] 2단계: Fine Search (찾은 지점 주변을 0.01 단위로 아주 정밀하게 탐색)
-            start_c = max(0.01, best_f_conf - 0.05)
-            end_c = min(0.99, best_f_conf + 0.05)
-            start_i = max(0.01, best_f_iou - 0.05)
-            end_i = min(0.99, best_f_iou + 0.05)
-            
-            for c in np.arange(start_c, end_c, 0.01):
-                for i in np.arange(start_i, end_i, 0.01):
-                    acc = evaluate(c, i)
-                    if acc >= best_trial_acc:
-                        best_trial_acc, best_f_conf, best_f_iou = acc, c, i
-            
-            del model_eval; clear_vram()
-            return best_trial_acc, round(float(best_f_conf), 2), round(float(best_f_iou), 2)
 
         fold_metrics, fold_save_dirs = [], {}
         splits = [(train_test_split(train_val, test_size=test_split, random_state=random_seed))] if num_folds == 1 else list(KFold(n_splits=num_folds, shuffle=True, random_state=random_seed).split(train_val))
@@ -410,27 +389,17 @@ def _kfold_train_worker(args, queue):
             data_yaml.write_text(f"train: {tr_txt.resolve()}\nval: {vl_txt.resolve()}\ntest: {test_img_dir.resolve()}\nnc: {len(class_names)}\nnames: {class_names}\n")
 
             model = YOLO(model_name)
-            if webhook_url and noti_flags.get("task"): model.add_callback("on_train_epoch_end", create_heartbeat_callback(webhook_url, epochs))
+            if webhook_url and noti_flags.get("epoch"): 
+                model.add_callback("on_train_epoch_end", create_heartbeat_callback(webhook_url, epochs, noti_flags.get("epoch_interval", 100)))
             results = model.train(data=str(data_yaml), epochs=epochs, patience=patience, imgsz=imgsz, batch=batch_size, workers=workers, project=str(runs_dir), name=f"fold_{fold_num}" if num_folds > 1 else "single_train", seed=random_seed, deterministic=deterministic, hsv_h=aug["h"], hsv_s=aug["s"], hsv_v=aug["v"], degrees=aug["deg"], translate=aug["trans"], scale=aug["scale"], shear=aug["shear"], flipud=aug["fud"], fliplr=aug["flr"], mosaic=aug["mos"], mixup=aug["mix"], copy_paste=aug["cp"], cls=loss["cls"], box=loss["box"], dfl=loss["dfl"], verbose=True)
             fold_metrics.append(results.results_dict); fold_save_dirs[fold_num] = str(results.save_dir)
             check_early_stop(results.save_dir, str(fold_num))
             del model
             
-            # --- Auto-Eval Integration (End-to-End) ---
-            trained_model_path = Path(results.save_dir) / "weights" / "best.pt"
-            acc, b_conf, b_iou = run_auto_eval(trained_model_path)
-            if acc > best_overall_acc:
-                best_overall_acc, best_overall_conf, best_overall_iou = acc, b_conf, b_iou
-            
-            if acc >= 100.0:
-                perfect_fold = fold_num
-                if webhook_url and noti_flags.get("fold"): send_discord_webhook(webhook_url, f"🎉 **[100% 정답 달성!]** Fold {fold_num}에서 완벽한 모델을 찾았습니다. 남은 Fold 학습을 전면 취소합니다.")
-                break
-            else:
-                if webhook_url and noti_flags.get("fold"): send_discord_webhook(webhook_url, f"🏃 **[K-Fold 진행 중]** Fold {fold_num}/{num_folds} 완료! (최고 정답률: {best_overall_acc:.1f}%)")
+            if webhook_url and noti_flags.get("fold"): send_discord_webhook(webhook_url, f"🏃 **[K-Fold 진행 중]** Fold {fold_num}/{num_folds} 완료!")
 
         if fold_metrics:
-            best_n = perfect_fold if perfect_fold != -1 else (max(range(len(fold_metrics)), key=lambda i: (fold_metrics[i].get(best_metric, 0), fold_metrics[i].get(second_metric, 0))) + 1)
+            best_n = max(range(len(fold_metrics)), key=lambda i: (fold_metrics[i].get(best_metric, 0), fold_metrics[i].get(second_metric, 0))) + 1
             src = Path(fold_save_dirs[best_n]) / "weights" / "best.pt"
             dst = kfold_base / "best_model.pt"
             if src.exists():
@@ -438,12 +407,8 @@ def _kfold_train_worker(args, queue):
                 hours, rem = divmod(time.time() - start_time, 3600); mins, secs = divmod(rem, 60)
                 time_str = f"{int(hours)}시간 {int(mins)}분 {int(secs)}초" if hours else f"{int(mins)}분 {int(secs)}초"
                 result["success"] = True
-                result["msg"] = f"✅ 자동화 학습 및 평가 완료! (소요시간: {time_str})\n\n" + \
-                                (f"🎉 Fold {best_n}에서 100% 정답 달성하여 조기 종료되었습니다!\n" if perfect_fold != -1 else f"🏁 최고 성능 Fold: {best_n} (정답률 {best_overall_acc:.1f}%)\n") + \
-                                f"스레숄드 자동 튜닝 완료 (Conf: {best_overall_conf:.2f}, IoU: {best_overall_iou:.2f})"
+                result["msg"] = f"✅ 자동화 학습 완료! (소요시간: {time_str})\n\n🏁 최고 성능 Fold: {best_n}"
                 result["best_model"] = str(dst)
-                result["best_conf"] = best_overall_conf
-                result["best_iou"] = best_overall_iou
                 summary = [{"Fold": i + 1, "mAP50": fm.get("metrics/mAP50(B)", 0), "mAP50-95": fm.get("metrics/mAP50-95(B)", 0), "Precision": fm.get("metrics/precision(B)", 0), "Recall": fm.get("metrics/recall(B)", 0), "Fitness": (0.1 * fm.get("metrics/mAP50(B)", 0)) + (0.9 * fm.get("metrics/mAP50-95(B)", 0))} for i, fm in enumerate(fold_metrics)]
                 summary.append({"Fold": "Average", "mAP50": sum(m["mAP50"] for m in summary)/len(summary), "mAP50-95": sum(m["mAP50-95"] for m in summary)/len(summary), "Precision": sum(m["Precision"] for m in summary)/len(summary), "Recall": sum(m["Recall"] for m in summary)/len(summary), "Fitness": sum(m["Fitness"] for m in summary)/len(summary)})
                 result["metrics_summary"] = summary; result["best_fold"] = best_n
@@ -456,14 +421,13 @@ def _kfold_train_worker(args, queue):
         clear_vram(); queue.put(result)
 
 def _retrain_worker(args, queue):
-    import yaml as _yaml, shutil, time, numpy as np
+    import yaml as _yaml, shutil, time
     from ultralytics import YOLO
     from pathlib import Path
     start_time = time.time(); result = {"success": False, "task": "retrain", "error": "", "msg": "", "save_dir": "", "model_path": ""}
     try:
         p = args; retrain_ds = Path(p["workspace_dir"]) / "retrain"; runs_dir = Path(p["workspace_dir"]) / "runs" / "retrain_train"
         new_img, new_lbl = retrain_ds / "images" / "train", retrain_ds / "labels" / "train"
-        match_iou_thr = p.get("match_iou", 0.45)
         if retrain_ds.exists(): shutil.rmtree(retrain_ds)
         new_img.mkdir(parents=True, exist_ok=True); new_lbl.mkdir(parents=True, exist_ok=True)
 
@@ -480,7 +444,8 @@ def _retrain_worker(args, queue):
         yaml_rt.write_text(_yaml.dump({"path": retrain_ds.resolve().as_posix(), "train": "images/train", "val": "images/train", "nc": len(p["class_names"]), "names": p["class_names"]}, sort_keys=False), encoding="utf-8")
 
         model = YOLO(str(p["rt_base_model"]))
-        if p.get("webhook_url") and p.get("noti_flags", {}).get("task"): model.add_callback("on_train_epoch_end", create_heartbeat_callback(p["webhook_url"], p["rt_epochs"]))
+        if p.get("webhook_url") and p.get("noti_flags", {}).get("epoch"): 
+            model.add_callback("on_train_epoch_end", create_heartbeat_callback(p["webhook_url"], p["rt_epochs"], p.get("noti_flags", {}).get("epoch_interval", 100)))
         results = model.train(data=str(yaml_rt), epochs=p["rt_epochs"], imgsz=p["imgsz"], batch=p["rt_batch"], project=str(runs_dir), name=p["rt_run_name"], exist_ok=True, hsv_h=p["rt_h"], hsv_s=p["rt_s"], hsv_v=p["rt_v"], flipud=p["rt_flipud"], fliplr=p["rt_fliplr"], mosaic=p["rt_mosaic"], mixup=p["rt_mix"], copy_paste=p["rt_cp"], cls=p["rt_cls"], box=p["rt_box"], verbose=True)
 
         hours, rem = divmod(time.time() - start_time, 3600); mins, secs = divmod(rem, 60)
@@ -488,71 +453,8 @@ def _retrain_worker(args, queue):
         trained_model_path = Path(results.save_dir) / "weights" / "best.pt"
         del model
         
-        # --- Auto-Eval Integration ---
-        eval_img_dir, eval_lbl_dir = Path(p["eval_img_dir"]), Path(p["eval_lbl_dir"])
-        all_imgs = list(eval_img_dir.glob("*.jpg")) + list(eval_img_dir.glob("*.png")) + list(eval_img_dir.glob("*.jpeg"))
-        total_imgs = len(all_imgs)
-        gt_data = []
-        for p_img in all_imgs:
-            txt = eval_lbl_dir / Path(p_img).with_suffix(".txt").name
-            boxes = []
-            if txt.exists():
-                for line in txt.read_text().splitlines():
-                    parts = line.strip().split()
-                    if len(parts) == 5: boxes.append({"class": int(parts[0]), "box": [float(x) for x in parts[1:]]})
-            gt_data.append(boxes)
-            
-        def calc_iou(b1, b2):
-            ax1,ay1,ax2,ay2 = b1[0]-b1[2]/2, b1[1]-b1[3]/2, b1[0]+b1[2]/2, b1[1]+b1[3]/2
-            bx1,by1,bx2,by2 = b2[0]-b2[2]/2, b2[1]-b2[3]/2, b2[0]+b2[2]/2, b2[1]+b2[3]/2
-            ix, iy = max(0, min(ax2,bx2)-max(ax1,bx1)), max(0, min(ay2,by2)-max(ay1,by1))
-            ia = ix*iy; return ia/((ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-ia+1e-6)
-
-        model_eval = YOLO(str(trained_model_path))
-        base_results = model_eval.predict(source=[str(i) for i in all_imgs], conf=0.01, iou=0.99, verbose=False)
-        def evaluate(test_conf, test_iou):
-            correct = 0
-            for idx, r in enumerate(base_results):
-                valid_preds = [{"class": int(c.item()), "box": b.tolist(), "conf": cf.item()} for c, b, cf in zip(r.boxes.cls, r.boxes.xywhn, r.boxes.conf) if cf.item() >= test_conf]
-                valid_preds.sort(key=lambda x: x["conf"], reverse=True); keep_preds = []
-                for vp in valid_preds:
-                    keep = True
-                    for kp in keep_preds:
-                        if vp["class"] == kp["class"] and calc_iou(vp["box"], kp["box"]) > test_iou: keep = False; break
-                    if keep: keep_preds.append(vp)
-                gt_boxes = gt_data[idx]; is_correct = True
-                if len(keep_preds) != len(gt_boxes): is_correct = False
-                else:
-                    matched = []
-                    for pb in keep_preds:
-                        found = False
-                        for j, gb in enumerate(gt_boxes):
-                            if j not in matched and pb["class"] == gb["class"] and calc_iou(pb["box"], gb["box"]) >= match_iou_thr: found = True; matched.append(j); break
-                        if not found: is_correct = False; break
-                if is_correct: correct += 1
-            return (correct / total_imgs) * 100
-            
-        best_trial_acc, best_c_conf, best_c_iou = -1.0, 0.25, 0.45
-        for c in np.arange(0.1, 0.9, 0.2):
-            for i in np.arange(0.3, 0.8, 0.2):
-                acc = evaluate(c, i)
-                if acc > best_trial_acc: best_trial_acc, best_c_conf, best_c_iou = acc, c, i
-        best_f_conf, best_f_iou = best_c_conf, best_c_iou
-        for c in np.arange(max(0.01, best_c_conf - 0.1), min(0.99, best_c_conf + 0.11), 0.05):
-            for i in np.arange(max(0.01, best_c_iou - 0.1), min(0.99, best_c_iou + 0.11), 0.05):
-                acc = evaluate(c, i)
-                if acc > best_trial_acc: best_trial_acc, best_f_conf, best_f_iou = acc, c, i
-        del model_eval; clear_vram()
-
         result["success"] = True
-        result["best_conf"] = best_f_conf
-        result["best_iou"] = best_f_iou
-        
-        if best_trial_acc >= 100.0:
-            result["msg"] = f"🎉 재학습 완료 및 정답률 100% 달성! (소요시간: {time_str})\n\n스레숄드 자동 세팅 완료 (Conf {best_f_conf:.2f}, IoU {best_f_iou:.2f})\n저장: {results.save_dir}"
-        else:
-            result["msg"] = f"✅ 재학습 완료! (최고 정답률 {best_trial_acc:.1f}%)\n\n스레숄드 자동 세팅 완료 (Conf {best_f_conf:.2f}, IoU {best_f_iou:.2f})\n저장: {results.save_dir}"
-            
+        result["msg"] = f"✅ 재학습 완료! (소요시간: {time_str})\n저장: {results.save_dir}"
         result["save_dir"] = str(results.save_dir); result["model_path"] = str(trained_model_path)
     except Exception as e:
         result["error"] = traceback.format_exc()
@@ -1448,7 +1350,14 @@ class MainWindow(QMainWindow):
 
     def _apply_table_style(self, table): table.setAlternatingRowColors(True); table.setEditTriggers(QTableWidget.NoEditTriggers); table.setSelectionBehavior(QTableWidget.SelectRows)
 
-    def get_noti_flags(self): return {"error": self.chk_noti_error.isChecked(), "task": self.chk_noti_task.isChecked(), "fold": self.chk_noti_fold.isChecked(), "early_stop": self.chk_noti_early_stop.isChecked()}
+    def get_noti_flags(self):
+        return getattr(self, "noti_flags", {"error": True, "start": True, "early_stop": True, "fold": True, "tune": True, "epoch": True, "epoch_interval": 100, "task": True})
+
+    def show_webhook_settings(self):
+        dialog = WebhookSettingsDialog(self.get_noti_flags(), self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.noti_flags = dialog.get_flags()
+            self.statusBar().showMessage("⚙️ 알림 설정이 업데이트되었습니다.", 3000)
 
     def init_ui(self):
         main_widget = QWidget(); self.setCentralWidget(main_widget); main_layout = QVBoxLayout(main_widget)
@@ -1456,11 +1365,17 @@ class MainWindow(QMainWindow):
         path_layout = QVBoxLayout(); path_layout.setSpacing(2)
         self.w_proj_root = PathInputWidget("🌟 프로젝트 루트", True, str(self.base_dir / "MyProject")); self.w_proj_root.line_edit.setStyleSheet("background-color: #fffbeb; font-weight: bold; color: #92400e;")
         default_proj = Path(self.w_proj_root.get_path()); self.w_base_ds = PathInputWidget("원본 데이터(dataset)", True, str(default_proj / "dataset")); self.w_proc_ds = PathInputWidget("처리 폴더(processed)", True, str(default_proj / "processed_dataset")); self.w_work_ds = PathInputWidget("워크스페이스(workspace)", True, str(default_proj / "workspace"))
+        
         self.w_webhook = QLineEdit(); self.w_webhook.setMinimumWidth(300); self.w_webhook.setPlaceholderText("디스코드 웹훅 URL (알림을 받으려면 입력하세요)"); self.w_webhook.setStyleSheet("background-color: #f5f3ff; color: #4c1d95; border: 1px solid #ddd6fe; padding: 2px;")
         self.settings = QSettings("MyVisionProject", "YoloTrainerApp"); self.w_webhook.setText(self.settings.value("webhook_url", ""))
-        self.chk_noti_error = QCheckBox("🚨 에러/강제종료"); self.chk_noti_task = QCheckBox("⏳ 주요 작업 완료"); self.chk_noti_fold = QCheckBox("📍 K-Fold 진행"); self.chk_noti_early_stop = QCheckBox("🛑 조기 종료")
-        for chk in [self.chk_noti_error, self.chk_noti_task, self.chk_noti_fold, self.chk_noti_early_stop]: chk.setChecked(True); chk.setStyleSheet("font-size: 11px;")
-        webhook_h_layout = QHBoxLayout(); webhook_h_layout.setSpacing(10); webhook_h_layout.addWidget(QLabel("🔔 알림 웹훅:")); webhook_h_layout.addWidget(self.w_webhook, stretch=1); webhook_h_layout.addWidget(QLabel(" |  수신 설정:")); webhook_h_layout.addWidget(self.chk_noti_error); webhook_h_layout.addWidget(self.chk_noti_task); webhook_h_layout.addWidget(self.chk_noti_fold); webhook_h_layout.addWidget(self.chk_noti_early_stop); webhook_h_layout.addStretch(0)
+        
+        self.noti_flags = {"error": True, "start": True, "early_stop": True, "fold": True, "tune": True, "epoch": True, "epoch_interval": 100, "task": True}
+        self.btn_webhook_settings = QPushButton("⚙️ 알림 상세 설정")
+        self.btn_webhook_settings.setStyleSheet("background-color: #fce7f3; border: 1px solid #fbcfe8; font-weight: bold; color: #9d174d; padding: 3px 10px; border-radius: 4px;")
+        self.btn_webhook_settings.clicked.connect(self.show_webhook_settings)
+
+        webhook_h_layout = QHBoxLayout(); webhook_h_layout.setSpacing(10); webhook_h_layout.addWidget(QLabel("🔔 알림 웹훅:")); webhook_h_layout.addWidget(self.w_webhook, stretch=1); webhook_h_layout.addWidget(self.btn_webhook_settings); webhook_h_layout.addStretch(0)
+
         path_layout.addWidget(self.w_proj_root); path_layout.addWidget(self.w_base_ds); path_layout.addWidget(self.w_proc_ds); path_layout.addWidget(self.w_work_ds); path_layout.addSpacing(5); path_layout.addLayout(webhook_h_layout)
         right_layout = QVBoxLayout(); right_layout.setSpacing(2)
         gpu_info = f"🟢 {torch.cuda.get_device_name(0)} (VRAM: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.1f} GB)" if torch.cuda.is_available() else "GPU 없음 (CPU 연산)"
@@ -1532,12 +1447,9 @@ class MainWindow(QMainWindow):
         if "proc_ds" in g: self.w_proc_ds.line_edit.setText(g["proc_ds"])
         if "work_ds" in g: self.w_work_ds.line_edit.setText(g["work_ds"])
         if "webhook_url" in g and g["webhook_url"].strip(): self.w_webhook.setText(g["webhook_url"])
+        if "noti_flags" in g: self.noti_flags = g["noti_flags"]
         if "model" in g: self.g_model.setCurrentText(g["model"])
         if "imgsz" in g: self.g_imgsz.setCurrentText(g["imgsz"])
-        if "notify_error" in g: self.chk_noti_error.setChecked(g["notify_error"])
-        if "notify_task" in g: self.chk_noti_task.setChecked(g["notify_task"])
-        if "notify_fold" in g: self.chk_noti_fold.setChecked(g["notify_fold"])
-        if "notify_early_stop" in g: self.chk_noti_early_stop.setChecked(g["notify_early_stop"])
         t1 = c.get("tab1", {})
         if "auto_crop" in t1: self.t1_auto_crop.setChecked(t1["auto_crop"])
         if "margin" in t1: self.t1_margin.setValue(t1["margin"])
@@ -1619,8 +1531,13 @@ class MainWindow(QMainWindow):
     def start_training_process(self, worker_func, args):
         self.train_queue = multiprocessing.Queue(); self.training_process = multiprocessing.Process(target=worker_func, args=(args, self.train_queue)); self.training_process.start()
         self.monitor_thread = ProcessMonitorThread(self.train_queue, self.training_process); self.monitor_thread.finished_ok.connect(self.on_training_finished); self.monitor_thread.error.connect(self.on_training_fatal_error); self.monitor_thread.start()
-        self.w_webhook.setEnabled(False); self.chk_noti_error.setEnabled(False); self.chk_noti_task.setEnabled(False); self.chk_noti_fold.setEnabled(False); self.chk_noti_early_stop.setEnabled(False)
-        self.t2_btn_run.setEnabled(False); self.t2_btn_tune.setEnabled(False); self.t4_btn_retrain.setEnabled(False); self.t3_btn_auto_thr.setEnabled(False); self.t2_scroll.setEnabled(False); self.t4_scroll.setEnabled(False); self.g_model.setEnabled(False); self.g_imgsz.setEnabled(False); self.t2_btn_stop.setEnabled(True)
+        
+        webhook_url = self.w_webhook.text().strip()
+        if webhook_url and self.noti_flags.get("start"):
+            send_discord_webhook(webhook_url, "▶️ **[작업 시작]** 새로운 백그라운드 작업이 시작되었습니다.")
+
+        self.w_webhook.setEnabled(False); self.btn_webhook_settings.setEnabled(False)
+        self.t2_btn_run.setEnabled(False); self.t2_btn_tune.setEnabled(False); self.t4_btn_retrain.setEnabled(False); self.t4_btn_auto_thr.setEnabled(False); self.t3_btn_auto_thr.setEnabled(False); self.t2_scroll.setEnabled(False); self.t4_scroll.setEnabled(False); self.g_model.setEnabled(False); self.g_imgsz.setEnabled(False); self.t2_btn_stop.setEnabled(True)
         self.statusBar().showMessage(f"🏃 작업 진행 중... PID: {self.training_process.pid}")
 
     def stop_training(self):
@@ -1630,7 +1547,7 @@ class MainWindow(QMainWindow):
                 else: os.kill(self.training_process.pid, signal.SIGKILL)
             except Exception: pass
             webhook_url = self.w_webhook.text().strip()
-            if webhook_url and self.chk_noti_error.isChecked(): send_discord_webhook(webhook_url, "🛑 **[작업 강제 종료]**\n프로세스가 강제 중단되었습니다.")
+            if webhook_url and self.noti_flags.get("error"): send_discord_webhook(webhook_url, "🛑 **[작업 강제 종료]**\n프로세스가 강제 중단되었습니다.")
             self._restore_training_ui(); self.statusBar().showMessage("🛑 작업이 강제 종료되었습니다."); self.training_process = None
 
     def on_training_finished(self, res):
@@ -1671,47 +1588,25 @@ class MainWindow(QMainWindow):
                 self.log_db.insert_log(task_type="K-Fold Train", model_name=self.g_model.currentText(), epochs=self.t2_epochs.value(), batch=self.t2_batch.value(), best_map=avg_map, save_dir=res.get("best_model", "경로 없음"), config_data=current_config)
                 if res.get("best_model"): self.t3_model.line_edit.setText(res["best_model"])
                 
-                # New Feature: update threshold from res if available
-                if "best_conf" in res and "best_iou" in res:
-                    bc, bi = res["best_conf"], res["best_iou"]
-                    self.t3_conf.setValue(bc); self.t3_iou.setValue(bi)
-                    self.t4_conf.setValue(bc); self.t4_iou.setValue(bi)
-                    self.t5_conf.setValue(bc); self.t5_iou.setValue(bi)
-                    
-                    # [완전 자동화] 3번 탭(평가 선별)으로 자동 전환 후 평가 로직 실행
-                    self.tabs.setCurrentIndex(3)
-                    self.statusBar().showMessage("🔄 최적화된 파라미터로 자동 평가 및 오답 선별 작업을 시작합니다...")
-                    QTimer.singleShot(1000, self.run_tab3)
-                    
             elif task == "retrain":
-                if "best_conf" in res and "best_iou" in res:
-                    bc, bi = res["best_conf"], res["best_iou"]
-                    self.t3_conf.setValue(bc); self.t3_iou.setValue(bi)
-                    self.t4_conf.setValue(bc); self.t4_iou.setValue(bi)
-                    self.t5_conf.setValue(bc); self.t5_iou.setValue(bi)
-                    
                 QMessageBox.information(self, "완료", res["msg"])
                 self.log_db.insert_log(task_type="Hard Retrain", model_name=Path(self.t4_base.get_path()).name, epochs=self.t4_epochs.value(), batch=self.t4_batch.value(), best_map=-1.0, save_dir=res.get("save_dir", "경로 없음"), config_data=current_config)
                 if res.get("model_path"): 
                     self.t4_eval_model_display.setText(res["model_path"]); self.t4_btn_eval.setEnabled(True)
                     self.statusBar().showMessage(f"✅ 재학습 모델 준비 완료: {Path(res['model_path']).name}")
                     
-                    # [완전 자동화] 4번 탭(최종 평가)으로 자동 전환 후 재학습 결과 평가 실행
-                    self.tabs.setCurrentIndex(4)
-                    self.statusBar().showMessage("🔄 재학습된 모델로 자동 최종 평가를 시작합니다...")
-                    QTimer.singleShot(1000, self.run_tab4_eval)
         else: QMessageBox.critical(self, "실패", res.get("error", "알 수 없는 오류"))
         self.training_process = None
 
     def on_training_fatal_error(self, error_msg):
         if self.training_process is None: return
         webhook_url = self.w_webhook.text().strip()
-        if webhook_url and self.chk_noti_error.isChecked(): send_discord_webhook(webhook_url, f"❌ **[프로세스 비정상 종료]**\n상세: {error_msg}")
+        if webhook_url and self.noti_flags.get("error"): send_discord_webhook(webhook_url, f"❌ **[프로세스 비정상 종료]**\n상세: {error_msg}")
         self._restore_training_ui(); QMessageBox.critical(self, "비정상 종료", error_msg); self.statusBar().showMessage("🛑 프로세스가 비정상 종료되었습니다."); self.training_process = None
 
     def _restore_training_ui(self):
-        self.w_webhook.setEnabled(True); self.chk_noti_error.setEnabled(True); self.chk_noti_task.setEnabled(True); self.chk_noti_fold.setEnabled(True); self.chk_noti_early_stop.setEnabled(True)
-        self.t2_btn_run.setEnabled(True); self.t2_btn_tune.setEnabled(True); self.t4_btn_retrain.setEnabled(True); self.t3_btn_auto_thr.setEnabled(True); self.t2_scroll.setEnabled(True); self.t4_scroll.setEnabled(True); self.g_model.setEnabled(True); self.g_imgsz.setEnabled(True); self.t2_btn_stop.setEnabled(False)
+        self.w_webhook.setEnabled(True); self.btn_webhook_settings.setEnabled(True)
+        self.t2_btn_run.setEnabled(True); self.t2_btn_tune.setEnabled(True); self.t4_btn_retrain.setEnabled(True); self.t4_btn_auto_thr.setEnabled(True); self.t3_btn_auto_thr.setEnabled(True); self.t2_scroll.setEnabled(True); self.t4_scroll.setEnabled(True); self.g_model.setEnabled(True); self.g_imgsz.setEnabled(True); self.t2_btn_stop.setEnabled(False)
 
     def show_kfold_metrics_dialog(self, metrics_data, title_msg, best_fold):
         dialog = QDialog(self); dialog.setWindowTitle("K-Fold 교차 검증 상세 지표"); dialog.resize(650, 350); layout = QVBoxLayout(dialog)
@@ -1855,7 +1750,7 @@ class MainWindow(QMainWindow):
 
     def browse_tab4_eval_model(self):
         path, _ = QFileDialog.getOpenFileName(self, "평가할 YOLO 모델 선택", str(Path(self.w_work_ds.get_path()) / "runs" / "retrain_train"), "PyTorch Model (*.pt);;All Files (*)")
-        if path: self.t4_eval_model_display.setText(path); self.t4_btn_eval.setEnabled(True); self.statusBar().showMessage(f"📂 모델 로드됨: {Path(path).name}", 3000)
+        if path: self.t4_eval_model_display.setText(path); self.t4_btn_eval.setEnabled(True); self.t4_btn_auto_thr.setEnabled(True); self.statusBar().showMessage(f"📂 모델 로드됨: {Path(path).name}", 3000)
 
     def export_project_dialog(self):
         t3_model = self.t3_model.get_path(); t4_model = self.t4_eval_model_display.text(); has_base = t3_model and Path(t3_model).exists(); has_retrained = t4_model and Path(t4_model).exists()
@@ -1890,7 +1785,7 @@ class MainWindow(QMainWindow):
             legacy_model, base_model, retrained_model = target_dir / "model.pt", target_dir / "base_model.pt", target_dir / "retrained_model.pt"
             if base_model.exists() or legacy_model.exists():
                 model_path_str = str((base_model if base_model.exists() else legacy_model).resolve()); self.t3_model.line_edit.setText(model_path_str); self.t4_base.line_edit.setText(model_path_str); self.t5_model.line_edit.setText(model_path_str)
-            if retrained_model.exists(): retrained_path_str = str(retrained_model.resolve()); self.t4_eval_model_display.setText(retrained_path_str); self.t4_btn_eval.setEnabled(True); self.t5_model.line_edit.setText(retrained_path_str)
+            if retrained_model.exists(): retrained_path_str = str(retrained_model.resolve()); self.t4_eval_model_display.setText(retrained_path_str); self.t4_btn_eval.setEnabled(True); self.t4_btn_auto_thr.setEnabled(True); self.t5_model.line_edit.setText(retrained_path_str)
             self.config_manager.update_workspace_path(str(new_proj_path / "workspace")); QApplication.restoreOverrideCursor()
             if is_renamed: QMessageBox.warning(self, "⚠️ 이름 변경", f"기존에 '{original_name}' 폴더가 존재하여 이름이 변경되었습니다!\n새 폴더명: {new_proj_path.name}"); self.statusBar().showMessage(f"⚠️ 폴더 이름 변경됨: {new_proj_path.name} 로 복구 완료", 7000)
             else: QMessageBox.information(self, "✅ 불러오기 완료", f"루트: {new_proj_path.name}\n모든 경로가 연동되었습니다."); self.statusBar().showMessage(f"✅ 프로젝트 불러오기 완료: {new_proj_path.name}", 5000)
@@ -1917,7 +1812,7 @@ class MainWindow(QMainWindow):
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
         success, cmap_or_error = self.parse_and_validate_class_map(self.t1_class_map.toPlainText())
         if not success: QMessageBox.warning(self, "클래스 매핑 오류", cmap_or_error); return
-        config = {"base_dir": self.w_base_ds.get_path(), "processed_dir": self.w_proc_ds.get_path(), "use_auto_crop": self.t1_auto_crop.isChecked(), "margin": self.t1_margin.value(), "manual_crop": (self.t1_mx.value(), self.t1_my.value(), self.t1_mw.value(), self.t1_mh.value()), "class_map": cmap_or_error, "clean_old": self.t1_clean.isChecked(), "use_exif": self.t1_exif.isChecked()}
+        config = {"base_dir": self.w_base_ds.get_path(), "processed_dir": self.w_proc_ds.get_path(), "use_auto_crop": self.t1_auto_crop.isChecked(), "margin": self.t1_margin.value(), "manual_crop": (self.t1_mx.value(), self.t1_my.value(), self.t1_mw.value(), self.t1_mh.value()), "class_map": cmap_or_error, "clean_old": self.t1_clean.isChecked(), "use_exif": self.t1_exif.isChecked(), "webhook_url": self.w_webhook.text().strip(), "noti_flags": self.get_noti_flags()}
         self.t1_btn_run.setEnabled(False); self.t1_log.clear(); self.statusBar().showMessage("✂️ 데이터 전처리 진행 중... 잠시만 기다려주세요."); QApplication.setOverrideCursor(Qt.WaitCursor)
         self.t1_thread = PreprocessThread(config); self.t1_thread.progress.connect(self.t1_progress.setValue); self.t1_thread.log_msg.connect(self.t1_log.append); self.t1_thread.error.connect(lambda e: QMessageBox.critical(self, "오류", e)); self.t1_thread.finished_ok.connect(self.on_tab1_finished)
         self.t1_thread.finished.connect(lambda: [self.t1_btn_run.setEnabled(True), QApplication.restoreOverrideCursor(), self.statusBar().showMessage("✅ 전처리 완료", 5000)]); self.t1_thread.start()
@@ -1966,7 +1861,6 @@ class MainWindow(QMainWindow):
                                      f'총 {self.t2_tune_iterations.value()}번의 조합 탐색을 시작합니다.\n계속 진행하시겠습니까?',
                                      QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
 
-        # 핵심: UI의 현재 설정값들을 'initial_params'라는 이름으로 묶어서 전달함
         initial_params = {
             'box': self.t2_lbox.value(),
             'cls': self.t2_lcls.value(),
@@ -1994,12 +1888,14 @@ class MainWindow(QMainWindow):
             "batch": self.t2_batch.value(),
             "workers": self.t2_workers.value(),
             "class_names": list(cmap_or_error.keys()),
-            "initial_params": initial_params, # 이 부분이 추가되어야 에러가 안 납니다!
-            "match_iou": self.t3_match_iou.value(),
-            "webhook_url": self.w_webhook.text().strip()
+            "initial_params": initial_params,
+            "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value(),
+            "webhook_url": self.w_webhook.text().strip(),
+            "noti_flags": self.get_noti_flags()
         }
         
         self.start_training_process(_tune_worker, args)
+
     def run_tab2(self):
         if self.training_process and self.training_process.is_alive(): QMessageBox.warning(self, "경고", "이미 진행 중인 프로세스가 있습니다."); return
         proc_dir = Path(self.w_proc_ds.get_path()); is_valid, err = self.validate_paths(처리된_데이터_dir=proc_dir, 이미지_dir=proc_dir/"images", 라벨_dir=proc_dir/"labels")
@@ -2040,7 +1936,7 @@ class MainWindow(QMainWindow):
     def run_tab3(self):
         is_valid, err = self.validate_paths(평가모델_file=Path(self.t3_model.get_path()), 평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
-        config = {"eval_model_path": self.t3_model.get_path(), "eval_source": self.t3_img.get_path(), "gt_labels_path": self.t3_lbl.get_path(), "workspace_dir": self.w_work_ds.get_path(), "eval_run_name": self.t3_run_name.text(), "eval_conf": self.t3_conf.value(), "eval_iou": self.t3_iou.value(), "match_iou": self.t3_match_iou.value(), "max_det": self.t3_max_det.value(), "agnostic_nms": self.t3_agnostic.isChecked(), "save_relabel": self.t3_save_rel.isChecked()}
+        config = {"eval_model_path": self.t3_model.get_path(), "eval_source": self.t3_img.get_path(), "gt_labels_path": self.t3_lbl.get_path(), "workspace_dir": self.w_work_ds.get_path(), "eval_run_name": self.t3_run_name.text(), "eval_conf": self.t3_conf.value(), "eval_iou": self.t3_iou.value(), "match_iou": self.t3_match_iou.value(), "max_det": self.t3_max_det.value(), "agnostic_nms": self.t3_agnostic.isChecked(), "save_relabel": self.t3_save_rel.isChecked(), "webhook_url": self.w_webhook.text().strip(), "noti_flags": self.get_noti_flags()}
         self.t3_btn_run.setEnabled(False); self.statusBar().showMessage("🔍 평가 진행 중..."); QApplication.setOverrideCursor(Qt.WaitCursor)
         self.t3_thread = EvalThread(config); self.t3_thread.finished_ok.connect(self.on_tab3_finished); self.t3_thread.error.connect(lambda e: QMessageBox.critical(self, "오류", e)); self.t3_thread.finished.connect(lambda: [self.t3_btn_run.setEnabled(True), QApplication.restoreOverrideCursor(), self.statusBar().clearMessage()]); self.t3_thread.start()
 
@@ -2079,7 +1975,13 @@ class MainWindow(QMainWindow):
         self.t4_conf = QDoubleSpinBox(); self.t4_conf.setRange(0.01, 0.99); self.t4_conf.setValue(0.25); self.t4_conf.setSingleStep(0.01); self.t4_iou = QDoubleSpinBox(); self.t4_iou.setRange(0.01, 0.99); self.t4_iou.setValue(0.45); self.t4_iou.setSingleStep(0.01); self.t4_match_iou = QDoubleSpinBox(); self.t4_match_iou.setRange(0.01, 0.99); self.t4_match_iou.setValue(0.45); self.t4_match_iou.setSingleStep(0.01); self.t4_max_det = QSpinBox(); self.t4_max_det.setRange(1, 999); self.t4_max_det.setValue(99); self.t4_agnostic = QCheckBox(); self.t4_agnostic.setChecked(True)
         h_eval_model = QHBoxLayout(); self.t4_eval_model_display = QLineEdit(); self.t4_eval_model_display.setReadOnly(True); self.t4_eval_model_display.setPlaceholderText("모델을 선택하거나 첫 번째 탭에서 재학습을 완료하세요."); self.t4_eval_model_display.setStyleSheet("background-color: #f3f4f6; color: #374151; font-weight: bold;"); self.btn_t4_eval_browse = QPushButton("📂"); self.btn_t4_eval_browse.clicked.connect(self.browse_tab4_eval_model); h_eval_model.addWidget(self.t4_eval_model_display); h_eval_model.addWidget(self.btn_t4_eval_browse)
         f2.addRow("평가 대상 모델:", h_eval_model); self.add_param(f2, "Confidence Threshold", self.t4_conf, 0.25); self.add_param(f2, "IoU (NMS)", self.t4_iou, 0.45); self.add_param(f2, "정답 매칭 IoU", self.t4_match_iou, 0.45); self.add_param(f2, "최대 탐지 수", self.t4_max_det, 99); self.add_param(f2, "Agnostic NMS", self.t4_agnostic, True); eval_layout.addLayout(f2)
-        self.t4_btn_eval = QPushButton("📊 재학습 모델 최종 평가 실행"); self.t4_btn_eval.setMinimumHeight(40); self.t4_btn_eval.clicked.connect(self.run_tab4_eval); self.t4_btn_eval.setEnabled(False); eval_layout.addWidget(self.t4_btn_eval)
+        
+        h_eval_btns = QHBoxLayout()
+        self.t4_btn_eval = QPushButton("📊 재학습 모델 최종 평가 실행"); self.t4_btn_eval.setMinimumHeight(40); self.t4_btn_eval.clicked.connect(self.run_tab4_eval); self.t4_btn_eval.setEnabled(False)
+        self.t4_btn_auto_thr = QPushButton("🎯 재학습 모델 최적 스레숄드 자동 찾기"); self.t4_btn_auto_thr.setMinimumHeight(40); self.t4_btn_auto_thr.setStyleSheet("background-color: #fef08a; font-weight: bold; color: #854d0e;"); self.t4_btn_auto_thr.clicked.connect(self.run_tab4_auto_threshold)
+        h_eval_btns.addWidget(self.t4_btn_eval); h_eval_btns.addWidget(self.t4_btn_auto_thr)
+        eval_layout.addLayout(h_eval_btns)
+        
         self.btn_send_t4_to_t5 = QPushButton("➡️ 이 재학습 모델과 설정으로 거리 측정하기"); self.btn_send_t4_to_t5.setStyleSheet("background-color: #dbeafe; font-weight: bold; color: #1e3a8a;"); self.btn_send_t4_to_t5.clicked.connect(lambda: self.send_to_measure_tab(self.t4_eval_model_display.text(), self.t3_img.get_path(), self.t4_conf.value(), self.t4_iou.value(), self.t4_max_det.value(), self.t4_agnostic.isChecked())); eval_layout.addWidget(self.btn_send_t4_to_t5); st2_layout.addWidget(eval_group)
         self.t4_table = QTableWidget(0, 5); self.t4_table.setHorizontalHeaderLabels(["파일명", "상태", "예측 수", "정답 수", "사유"]); self._apply_table_style(self.t4_table); header = self.t4_table.horizontalHeader()
         for i in range(self.t4_table.columnCount()): header.setSectionResizeMode(i, QHeaderView.Stretch)
@@ -2088,6 +1990,22 @@ class MainWindow(QMainWindow):
         right_widget = QWidget(); right_layout = QVBoxLayout(right_widget); right_layout.setContentsMargins(10, 0, 0, 0); self.t4_chk_show_all = QCheckBox("전체 평가 이미지 보기"); self.t4_chk_show_all.setEnabled(False); self.t4_chk_show_all.stateChanged.connect(self.update_tab4_visualization)
         r_header = QHBoxLayout(); r_header.addWidget(QLabel("<b>최종 예측 결과 시각화</b>")); r_header.addStretch(1); r_header.addWidget(self.t4_chk_show_all); self.t4_img_grid = ImageGridWidget(max_display=100); right_layout.addLayout(r_header); right_layout.addWidget(self.t4_img_grid)
         main_split.addWidget(right_widget); main_split.setSizes([600, 800]); tab_layout = QVBoxLayout(); tab_layout.addWidget(main_split); tab = QWidget(); tab.setLayout(tab_layout); self.tabs.addTab(tab, "🔁 재학습")
+
+    def run_tab4_auto_threshold(self):
+        if self.training_process and self.training_process.is_alive(): 
+            QMessageBox.warning(self, "경고", "이미 진행 중입니다."); return
+        
+        model_path = self.t4_eval_model_display.text()
+        if not model_path or not Path(model_path).exists():
+            QMessageBox.warning(self, "경고", "먼저 재학습 모델을 불러오거나 재학습을 완료해주세요."); return
+            
+        is_valid, err = self.validate_paths(평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
+        if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
+        
+        if QMessageBox.question(self, '스레숄드 탐색', '설정된 [정답 매칭 IoU] 기준에 맞춰, 재학습된 모델의 최적 Confidence 및 NMS IoU 값을 탐색합니다.\n진행하시겠습니까?', QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
+        
+        args = {"model_path": model_path, "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t4_match_iou.value()}
+        self.start_training_process(_auto_threshold_worker, args)
 
     def run_tab4_retrain(self):
         if self.training_process and self.training_process.is_alive(): QMessageBox.warning(self, "경고", "이미 진행 중"); return
