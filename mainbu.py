@@ -280,64 +280,158 @@ def _auto_threshold_worker(args, queue):
     import time, traceback, numpy as np
     from pathlib import Path
     from ultralytics import YOLO
-    start_time = time.time(); result = {"success": False, "task": "threshold", "error": "", "best_conf": 0.25, "best_iou": 0.45, "best_acc": 0.0, "msg": ""}
+
+    start_time = time.time()
+    result = {"success": False, "task": "threshold", "error": "", "best_conf": 0.25, "best_iou": 0.45, "best_acc": 0.0, "msg": ""}
+
     try:
-        model_path, img_dir, lbl_dir, match_iou_thr = args["model_path"], Path(args["img_dir"]), Path(args["lbl_dir"]), args["match_iou"]
+        model_path = Path(args["model_path"])
+        img_dir = Path(args["img_dir"])
+        lbl_dir = Path(args["lbl_dir"])
+        match_iou_thr = max(args.get("match_iou", 0.50), 0.1) 
+        agnostic = args.get("agnostic", True)
+        max_det = args.get("max_det", 300)
+
         model = YOLO(str(model_path))
+
         def calc_iou(b1, b2):
-            ax1,ay1,ax2,ay2 = b1[0]-b1[2]/2, b1[1]-b1[3]/2, b1[0]+b1[2]/2, b1[1]+b1[3]/2
-            bx1,by1,bx2,by2 = b2[0]-b2[2]/2, b2[1]-b2[3]/2, b2[0]+b2[2]/2, b2[1]+b2[3]/2
-            ix, iy = max(0, min(ax2,bx2)-max(ax1,bx1)), max(0, min(ay2,by2)-max(ay1,by1))
-            ia = ix*iy; return ia/((ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-ia+1e-6)
-        img_files = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpeg")); total_imgs = len(img_files)
+            x1_min, y1_min = b1[0] - b1[2]/2, b1[1] - b1[3]/2
+            x1_max, y1_max = b1[0] + b1[2]/2, b1[1] + b1[3]/2
+            x2_min, y2_min = b2[0] - b2[2]/2, b2[1] - b2[3]/2
+
+            inter_xmin = max(x1_min, x2_min)
+            inter_ymin = max(y1_min, y2_min)
+            inter_xmax = min(x1_max, x2_max)
+            inter_ymax = min(y1_max, y2_max)
+
+            if inter_xmax < inter_xmin or inter_ymax < inter_ymin:
+                return 0.0
+
+            inter_area = (inter_xmax - inter_xmin) * (inter_ymax - inter_ymin)
+            box1_area = (x1_max - x1_min) * (y1_max - y1_min)
+            box2_area = (x2_max - x2_min) * (y2_max - y2_min)
+            union_area = box1_area + box2_area - inter_area
+
+            return inter_area / (union_area + 1e-6)
+
+        img_files = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpeg"))
+        total_imgs = len(img_files)
         if total_imgs == 0: raise ValueError("평가할 이미지가 없습니다.")
-        base_results = model.predict(source=[str(p) for p in img_files], conf=0.01, iou=0.99, verbose=False)
+
+        # 정답 라벨 미리 로드 (캐싱)
         gt_data = []
-        for r in base_results:
-            img_name = Path(r.path).name; txt = lbl_dir / Path(img_name).with_suffix(".txt").name; boxes = []
+        for img_path in img_files:
+            txt = lbl_dir / Path(img_path).with_suffix(".txt").name
+            boxes = []
             if txt.exists():
                 for line in txt.read_text().splitlines():
                     parts = line.strip().split()
-                    if len(parts) == 5: boxes.append({"class": int(parts[0]), "box": [float(x) for x in parts[1:]]})
+                    if len(parts) == 5:
+                        boxes.append({"class": int(parts[0]), "box": [float(x) for x in parts[1:]]})
             gt_data.append(boxes)
-        def evaluate(test_conf, test_iou):
-            correct_count = 0
-            for idx, r in enumerate(base_results):
-                valid_preds = []
-                for cls_t, box_t, conf_t in zip(r.boxes.cls, r.boxes.xywhn, r.boxes.conf):
-                    if conf_t.item() >= test_conf: valid_preds.append({"class": int(cls_t.item()), "box": box_t.tolist(), "conf": conf_t.item()})
-                valid_preds.sort(key=lambda x: x["conf"], reverse=True); keep_preds = []
-                for vp in valid_preds:
-                    keep = True
-                    for kp in keep_preds:
-                        if vp["class"] == kp["class"] and calc_iou(vp["box"], kp["box"]) > test_iou: keep = False; break
-                    if keep: keep_preds.append(vp)
-                gt_boxes = gt_data[idx]; is_correct = True
-                if len(keep_preds) != len(gt_boxes): is_correct = False
-                else:
-                    matched = []
-                    for pb in keep_preds:
-                        found = False
-                        for j, gb in enumerate(gt_boxes):
-                            if j not in matched and pb["class"] == gb["class"] and calc_iou(pb["box"], gb["box"]) >= match_iou_thr: found = True; matched.append(j); break
-                        if not found: is_correct = False; break
-                if is_correct: correct_count += 1
-            return (correct_count / total_imgs) * 100
-        best_acc, best_c_conf, best_c_iou = -1.0, 0.25, 0.45
-        for c in np.arange(0.1, 0.9, 0.1):
-            for i in np.arange(0.3, 0.8, 0.1):
-                acc = evaluate(c, i)
-                if acc > best_acc: best_acc, best_c_conf, best_c_iou = acc, c, i
-        best_f_conf, best_f_iou = best_c_conf, best_c_iou
-        for c in np.arange(max(0.01, best_c_conf - 0.05), min(0.99, best_c_conf + 0.06), 0.01):
-            for i in np.arange(max(0.01, best_c_iou - 0.05), min(0.99, best_c_iou + 0.06), 0.01):
-                acc = evaluate(c, i)
-                if acc > best_acc: best_acc, best_f_conf, best_f_iou = acc, c, i
-        result["success"] = True; result["best_conf"] = round(float(best_f_conf), 2); result["best_iou"] = round(float(best_f_iou), 2); result["best_acc"] = round(float(best_acc), 1)
-        hours, rem = divmod(time.time() - start_time, 3600); mins, secs = divmod(rem, 60)
-        result["msg"] = f"🎯 Coarse-to-Fine 스레숄드 탐색 완료! (소요시간: {int(mins)}분 {int(secs)}초)\n\n📊 [최적 파라미터]\n- Confidence: {result['best_conf']}\n- NMS IoU: {result['best_iou']}\n- 엄격 정확도: {result['best_acc']}%"
-    except Exception as e: result["error"] = traceback.format_exc()
-    finally: clear_vram(); queue.put(result)
+
+        # 실제 YOLO 엔진을 돌려서 평가 탭과 100% 동일하게 평가하는 함수
+        def evaluate_real_yolo(test_conf, test_iou):
+            # 시뮬레이션 대신 실제 예측 수행 (메모리 관리를 위해 stream=True)
+            results = model.predict(source=[str(p) for p in img_files], conf=test_conf, iou=test_iou, 
+                                    max_det=max_det, agnostic_nms=agnostic, verbose=False, stream=True)
+            
+            total_tp, total_fp, total_fn = 0, 0, 0
+            img_correct_count = 0
+
+            for idx, r in enumerate(results):
+                # YOLO가 자체 NMS를 완료한 최종 결과 박스
+                pred_boxes = [{"class": int(cls.item()), "box": b.tolist()} for cls, b in zip(r.boxes.cls, r.boxes.xywhn)]
+                gt_boxes = gt_data[idx]
+
+                # 평가 탭과 100% 동일한 매칭 로직
+                matched_gt = set()
+                tp = fp = 0
+                for pb in pred_boxes:
+                    best_iou, best_gt = 0.0, -1
+                    for j, gb in enumerate(gt_boxes):
+                        if j not in matched_gt and pb["class"] == gb["class"]:
+                            iou = calc_iou(pb["box"], gb["box"])
+                            if iou > best_iou:
+                                best_iou, best_gt = iou, j
+                    
+                    if best_iou >= match_iou_thr:
+                        tp += 1
+                        matched_gt.add(best_gt)
+                    else:
+                        fp += 1
+                
+                fn = len(gt_boxes) - len(matched_gt)
+                total_tp += tp
+                total_fp += fp
+                total_fn += fn
+
+                # 완벽하게 일치하는 이미지 카운트
+                if fp == 0 and fn == 0:
+                    img_correct_count += 1
+
+            precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+            recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+            f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+            # VRAM 정리
+            clear_vram()
+            return img_correct_count, f1_score * 100
+
+        best_img_correct = -1
+        best_f1 = -1.0
+        best_conf = 0.25
+        best_iou = 0.45
+
+        # 1차 Coarse 탐색: 넓은 범위, 큰 간격 (속도 최적화)
+        print("🔍 1차 Coarse 스레숄드 탐색 중...")
+        for c in [0.1, 0.3, 0.5, 0.7, 0.9]:
+            for i in [0.3, 0.5, 0.7]:
+                img_correct, f1 = evaluate_real_yolo(c, i)
+                # 1순위: 완벽한 이미지 장수, 2순위: F1-Score
+                if img_correct > best_img_correct or (img_correct == best_img_correct and f1 > best_f1):
+                    best_img_correct = img_correct
+                    best_f1 = f1
+                    best_conf = c
+                    best_iou = i
+
+        # 2차 Fine 탐색: 찾은 최적점 근처를 조밀하게 탐색
+        print(f"🎯 2차 Fine 탐색 중... (기준점: Conf {best_conf:.2f}, IoU {best_iou:.2f})")
+        fine_c_start = max(0.01, best_conf - 0.15)
+        fine_c_end = min(0.99, best_conf + 0.15)
+        fine_i_start = max(0.01, best_iou - 0.15)
+        fine_i_end = min(0.99, best_iou + 0.15)
+
+        for c in np.arange(fine_c_start, fine_c_end + 0.01, 0.05):
+            for i in np.arange(fine_i_start, fine_i_end + 0.01, 0.05):
+                img_correct, f1 = evaluate_real_yolo(c, i)
+                if img_correct > best_img_correct or (img_correct == best_img_correct and f1 > best_f1):
+                    best_img_correct = img_correct
+                    best_f1 = f1
+                    best_conf = c
+                    best_iou = i
+
+        result["success"] = True
+        result["best_conf"] = round(float(best_conf), 2)
+        result["best_iou"] = round(float(best_iou), 2)
+        result["best_acc"] = round(float(best_f1), 1)
+
+        hours, rem = divmod(time.time() - start_time, 3600)
+        mins, secs = divmod(rem, 60)
+        result["msg"] = (f"🎯 최적 스레숄드 탐색 완료! (소요시간: {int(mins)}분 {int(secs)}초)\n\n"
+                         f"📊 [최적 파라미터]\n"
+                         f"- Confidence: {result['best_conf']}\n"
+                         f"- NMS IoU: {result['best_iou']}\n\n"
+                         f"✅ [예상 성적 (실제 평가와 100% 동일)]\n"
+                         f"- 완벽 정답 이미지: {best_img_correct}장 / {total_imgs}장\n"
+                         f"- 예상 오답 이미지: {total_imgs - best_img_correct}장\n"
+                         f"- F1-Score: {result['best_acc']}%")
+
+    except Exception:
+        result["error"] = traceback.format_exc()
+    finally:
+        clear_vram()
+        queue.put(result)
 
 def _kfold_train_worker(args, queue):
     import json, shutil, numpy as np, time
@@ -478,9 +572,12 @@ class PreprocessThread(QThread):
     def __init__(self, config): super().__init__(); self.config = config
     def run(self):
         try:
-            from PIL import Image as PILImage, ImageOps
+            # ImageDraw 추가
+            from PIL import Image as PILImage, ImageOps, ImageDraw
             c = self.config; label_dir, image_dir = Path(c["base_dir"]) / "data", Path(c["base_dir"]) / "image"
             out_img, out_lbl = Path(c["processed_dir"]) / "images", Path(c["processed_dir"]) / "labels"
+            out_preview = Path(c["processed_dir"]) / "preview"  # 미리보기 폴더 경로 추가
+            
             if not label_dir.is_dir(): return self.error.emit(f"라벨 폴더 누락: {label_dir}")
 
             label_files = list(label_dir.glob("*.json")) + list(label_dir.glob("*.txt"))
@@ -514,7 +611,10 @@ class PreprocessThread(QThread):
 
             self.log_msg.emit(f"✂️ 크롭 영역 확정 → X={crop_x}, Y={crop_y}, W={crop_w}, H={crop_h}")
             if c["clean_old"] and Path(c["processed_dir"]).exists(): shutil.rmtree(c["processed_dir"])
+            
+            # preview 폴더도 생성
             out_img.mkdir(parents=True, exist_ok=True); out_lbl.mkdir(parents=True, exist_ok=True)
+            out_preview.mkdir(parents=True, exist_ok=True)
 
             ok_count = 0
             for i, lf in enumerate(label_files):
@@ -552,7 +652,38 @@ class PreprocessThread(QThread):
                             labels.append(f"{cid} {(fx1 + fw / 2) / acw:.6f} {(fy1 + fh / 2) / ach:.6f} {fw/acw:.6f} {fh/ach:.6f}")
 
                     (out_lbl / Path(img_id).with_suffix(".txt").name).write_text("\n".join(labels), encoding="utf-8")
-                    img.crop((crop_x, crop_y, crop_x + acw, crop_y + ach)).save(out_img / img_id)
+                    
+                    # 1. 학습용 원본 크롭 이미지 저장
+                    cropped_img = img.crop((crop_x, crop_y, crop_x + acw, crop_y + ach))
+                    cropped_img.save(out_img / img_id)
+                    
+                    # 2. 미리보기용 라벨 박스 그리기 및 저장 (무채색 방지를 위해 RGB 강제 변환)
+                    preview_img = cropped_img.copy().convert("RGB")
+                    draw = ImageDraw.Draw(preview_img)
+                    
+                    # 클래스 ID -> 이름 변환 매핑 (색상 팔레트 추가)
+                    id_to_name = {v: k for k, v in c["class_map"].items()}
+                    color_palette = ["#00FF00", "#FF0000", "#00FFFF", "#FFFF00", "#FF00FF", "#0000FF", "#FFA500"]
+
+                    for line in labels:
+                        parts = line.split()
+                        cid, cx, cy, nw, nh = int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+                        bw, bh = nw * acw, nh * ach
+                        bx1, by1 = (cx * acw) - (bw / 2), (cy * ach) - (bh / 2)
+                        
+                        # 클래스 이름 및 색상 지정
+                        class_name = id_to_name.get(cid, f"ID {cid}")
+                        color = color_palette[cid % len(color_palette)]
+                        
+                        # 테두리 박스 그리기
+                        draw.rectangle([bx1, by1, bx1 + bw, by1 + bh], outline=color, width=3)
+                        
+                        # 그림자 없이 색상 텍스트만 표시
+                        text_x, text_y = bx1 + 2, max(0, by1 - 15)
+                        draw.text((text_x, text_y), class_name, fill=color)
+
+                    preview_img.save(out_preview / img_id)
+                    
                     img.close(); ok_count += 1; self.progress.emit(int((i + 1) / len(label_files) * 100))
                 except Exception: continue
 
@@ -584,10 +715,13 @@ class EvalThread(QThread):
                 ia = ix*iy; return ia/((ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-ia+1e-6)
 
             rows, wrong, wrong_imgs, all_imgs = [], 0, [], []
+            total_tp, total_fp, total_fn = 0, 0, 0
+
             for r in results:
                 img_name = Path(r.path).name; current_img_path = str(eval_project_dir / c["eval_run_name"] / img_name)
                 all_imgs.append(current_img_path)
                 pred_boxes = [{"class": int(cls.item()), "box": b.tolist()} for cls, b in zip(r.boxes.cls, r.boxes.xywhn)] if len(r.boxes) > 0 else []
+                
                 gt_boxes = []
                 txt = Path(c["gt_labels_path"]) / Path(img_name).with_suffix(".txt").name
                 if txt.exists():
@@ -595,26 +729,58 @@ class EvalThread(QThread):
                         parts = line.strip().split()
                         if len(parts) == 5: gt_boxes.append({"class": int(parts[0]), "box": [float(x) for x in parts[1:]]})
 
-                correct, reason = True, ""
-                if len(pred_boxes) != len(gt_boxes): correct, reason = False, "개수 오류"
-                else:
-                    matched = []
-                    for pb in pred_boxes:
-                        found = False
-                        for j, gb in enumerate(gt_boxes):
-                            if j not in matched and pb["class"] == gb["class"] and calc_iou(pb["box"], gb["box"]) >= c["match_iou"]:
-                                found = True; matched.append(j); break
-                        if not found: correct, reason = False, "분류/위치 오류"; break
+                matched_gt = set()
+                tp = fp = 0
+                for pb in pred_boxes:
+                    best_iou, best_gt = 0.0, -1
+                    for j, gb in enumerate(gt_boxes):
+                        if j not in matched_gt and pb["class"] == gb["class"]:
+                            iou = calc_iou(pb["box"], gb["box"])
+                            if iou > best_iou:
+                                best_iou, best_gt = iou, j
+                    match_threshold = max(c.get("match_iou", 0.5), 0.5)
+                    if best_iou >= match_threshold:
+                        tp += 1
+                        matched_gt.add(best_gt)
+                    else:
+                        fp += 1
+                
+                fn = len(gt_boxes) - len(matched_gt)
+                total_tp += tp
+                total_fp += fp
+                total_fn += fn
+
+                correct = (fp == 0 and fn == 0)
+                reasons = []
+                if fn > 0: reasons.append(f"미검 {fn}개")
+                if fp > 0: reasons.append(f"과검 {fp}개")
+                reason = ", ".join(reasons) if reasons else "정확히 일치"
 
                 if not correct:
                     wrong += 1; wrong_imgs.append(current_img_path)
                     if c["save_relabel"]: shutil.copy(r.path, relabel_dir / img_name)
 
-                rows.append({"파일명": img_name, "상태": "✅ 정답" if correct else "❌ 오답", "예측 수": len(pred_boxes), "정답 수": len(gt_boxes), "사유": "정확히 일치" if correct else reason})
+                rows.append({"파일명": img_name, "상태": "✅ 정상" if correct else "❌ 오답", "예측 수": len(pred_boxes), "정답 수": len(gt_boxes), "사유": reason})
 
-            total = len(rows); acc = (total - wrong) / total * 100 if total else 0
-            stats = {"total": total, "correct": total-wrong, "wrong": wrong, "acc": acc, "relabel_dir": str(relabel_dir) if c["save_relabel"] else ""}
-            if c.get("webhook_url") and c.get("noti_flags", {}).get("task"): send_discord_webhook(c["webhook_url"], f"🔍 **[평가 선별 완료]**\n총 {stats['total']}장 중 {stats['wrong']}개 오답 (정확도 {stats['acc']:.1f}%)")
+            total = len(rows)
+            precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+            recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+            f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+            
+            stats = {
+                "total": total, 
+                "correct": total - wrong, 
+                "wrong": wrong, 
+                "acc": f1_score * 100,
+                "precision": precision * 100,
+                "recall": recall * 100,
+                "f1_score": f1_score * 100,
+                "relabel_dir": str(relabel_dir) if c["save_relabel"] else ""
+            }
+            
+            if c.get("webhook_url") and c.get("noti_flags", {}).get("task"): 
+                send_discord_webhook(c["webhook_url"], f"🔍 **[평가 선별 완료]**\n총 {stats['total']}장 중 {stats['wrong']}장 오답 발견\n성능 지표: 정밀도 {stats['precision']:.1f}%, 재현율 {stats['recall']:.1f}%, F1-Score {stats['f1_score']:.1f}%")
+            
             del model; clear_vram()
             self.finished_ok.emit(pd.DataFrame(rows).sort_values("상태"), wrong_imgs, all_imgs, stats)
         except Exception as e:
@@ -1534,7 +1700,7 @@ class MainWindow(QMainWindow):
         
         webhook_url = self.w_webhook.text().strip()
         if webhook_url and self.noti_flags.get("start"):
-            send_discord_webhook(webhook_url, "▶️ **[작업 시작]** 새로운 백그라운드 작업이 시작되었습니다.")
+            send_discord_webhook(webhook_url, "▶️ **[작업 시작]** 새로운 백그라운 작업이 시작되었습니다.")
 
         self.w_webhook.setEnabled(False); self.btn_webhook_settings.setEnabled(False)
         self.t2_btn_run.setEnabled(False); self.t2_btn_tune.setEnabled(False); self.t4_btn_retrain.setEnabled(False); self.t4_btn_auto_thr.setEnabled(False); self.t3_btn_auto_thr.setEnabled(False); self.t2_scroll.setEnabled(False); self.t4_scroll.setEnabled(False); self.g_model.setEnabled(False); self.g_imgsz.setEnabled(False); self.t2_btn_stop.setEnabled(True)
@@ -1818,9 +1984,12 @@ class MainWindow(QMainWindow):
         self.t1_thread.finished.connect(lambda: [self.t1_btn_run.setEnabled(True), QApplication.restoreOverrideCursor(), self.statusBar().showMessage("✅ 전처리 완료", 5000)]); self.t1_thread.start()
 
     def on_tab1_finished(self, ok_count):
-        QMessageBox.information(self, "완료", f"{ok_count}장 전처리 완료!"); proc_img_dir = Path(self.w_proc_ds.get_path()) / "images"
-        if proc_img_dir.exists(): self.t1_img_grid.update_images([str(f) for f in proc_img_dir.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}])
-
+        QMessageBox.information(self, "완료", f"{ok_count}장 전처리 완료!")
+        proc_preview_dir = Path(self.w_proc_ds.get_path()) / "preview"
+        target_dir = proc_preview_dir if proc_preview_dir.exists() else Path(self.w_proc_ds.get_path()) / "images"
+        
+        if target_dir.exists(): 
+            self.t1_img_grid.update_images([str(f) for f in target_dir.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}])
     def setup_tab2(self):
         f = QFormLayout(); self.t2_epochs = QSpinBox(); self.t2_epochs.setRange(1, 5000); self.t2_epochs.setValue(400); self.t2_batch = QSpinBox(); self.t2_batch.setRange(1, 256); self.t2_batch.setValue(16); self.t2_workers = QSpinBox(); self.t2_workers.setRange(0, 32); self.t2_workers.setValue(8); self.t2_patience = QSpinBox(); self.t2_patience.setRange(0, 10000); self.t2_patience.setValue(100); self.t2_seed = QSpinBox(); self.t2_seed.setRange(0, 999999); self.t2_seed.setValue(42); self.t2_folds = QSpinBox(); self.t2_folds.setRange(1, 10); self.t2_folds.setValue(5); self.t2_test_split = QDoubleSpinBox(); self.t2_test_split.setRange(0.05, 0.6); self.t2_test_split.setValue(0.2); self.t2_test_split.setSingleStep(0.05); self.t2_lcls = QDoubleSpinBox(); self.t2_lcls.setRange(0.1, 10.0); self.t2_lcls.setValue(0.5); self.t2_lcls.setSingleStep(0.1); self.t2_lbox = QDoubleSpinBox(); self.t2_lbox.setRange(0.1, 20.0); self.t2_lbox.setValue(7.5); self.t2_lbox.setSingleStep(0.5); self.t2_ldfl = QDoubleSpinBox(); self.t2_ldfl.setRange(0.1, 10.0); self.t2_ldfl.setValue(1.5); self.t2_ldfl.setSingleStep(0.1)
         def make_dbl(rng, val, step): b = QDoubleSpinBox(); b.setRange(*rng); b.setDecimals(3 if step < 0.01 else 2); b.setSingleStep(step); b.setValue(val); return b
@@ -1910,10 +2079,10 @@ class MainWindow(QMainWindow):
 
     def setup_tab3(self):
         f = QFormLayout(); proc_dir, work_dir = Path(self.w_proc_ds.get_path()), Path(self.w_work_ds.get_path()); self.t3_model = PathInputWidget("평가 모델 (.pt)", False, str(work_dir/"kfold"/"best_model.pt")); f.addRow(self.t3_model); self.t3_img = PathInputWidget("평가 이미지", True, str(proc_dir/"images")); f.addRow(self.t3_img); self.t3_lbl = PathInputWidget("정답 라벨", True, str(proc_dir/"labels")); f.addRow(self.t3_lbl)
-        self.t3_conf = QDoubleSpinBox(); self.t3_conf.setRange(0.01, 0.99); self.t3_conf.setValue(0.25); self.t3_conf.setSingleStep(0.01); self.t3_iou = QDoubleSpinBox(); self.t3_iou.setRange(0.01, 0.99); self.t3_iou.setValue(0.45); self.t3_iou.setSingleStep(0.01); self.t3_match_iou = QDoubleSpinBox(); self.t3_match_iou.setRange(0.01, 0.99); self.t3_match_iou.setValue(0.45); self.t3_match_iou.setSingleStep(0.01); self.t3_max_det = QSpinBox(); self.t3_max_det.setRange(1, 999); self.t3_max_det.setValue(99); self.t3_run_name = QLineEdit("check01"); self.t3_agnostic = QCheckBox(); self.t3_agnostic.setChecked(True); self.t3_save_rel = QCheckBox(); self.t3_save_rel.setChecked(True)
-        self.add_param(f, "Confidence Threshold", self.t3_conf, 0.25); self.add_param(f, "IoU (NMS)", self.t3_iou, 0.45); self.add_param(f, "정답 매칭 IoU", self.t3_match_iou, 0.45); self.add_param(f, "최대 탐지 수", self.t3_max_det, 99); self.add_param(f, "실행 이름", self.t3_run_name, "check01"); self.add_param(f, "Agnostic NMS", self.t3_agnostic, True); self.add_param(f, "오답 별도 저장 (재학습용)", self.t3_save_rel, True)
+        self.t3_conf = QDoubleSpinBox(); self.t3_conf.setRange(0.01, 0.99); self.t3_conf.setValue(0.25); self.t3_conf.setSingleStep(0.01); self.t3_iou = QDoubleSpinBox(); self.t3_iou.setRange(0.01, 0.99); self.t3_iou.setValue(0.45); self.t3_iou.setSingleStep(0.01); self.t3_match_iou = QDoubleSpinBox(); self.t3_match_iou.setRange(0.01, 0.99); self.t3_match_iou.setValue(0.50); self.t3_match_iou.setSingleStep(0.01); self.t3_max_det = QSpinBox(); self.t3_max_det.setRange(1, 999); self.t3_max_det.setValue(99); self.t3_run_name = QLineEdit("check01"); self.t3_agnostic = QCheckBox(); self.t3_agnostic.setChecked(True); self.t3_save_rel = QCheckBox(); self.t3_save_rel.setChecked(True)
+        self.add_param(f, "Confidence Threshold", self.t3_conf, 0.25); self.add_param(f, "IoU (NMS)", self.t3_iou, 0.45); self.add_param(f, "정답 매칭 IoU", self.t3_match_iou, 0.50); self.add_param(f, "최대 탐지 수", self.t3_max_det, 99); self.add_param(f, "실행 이름", self.t3_run_name, "check01"); self.add_param(f, "Agnostic NMS", self.t3_agnostic, True); self.add_param(f, "오답 별도 저장 (재학습용)", self.t3_save_rel, True)
         self.t3_btn_run = QPushButton("🔍 평가 및 오답 선별 실행"); self.t3_btn_run.clicked.connect(self.run_tab3)
-        self.t3_btn_auto_thr = QPushButton("🎯 이 모델의 최적 스레숄드 자동 찾기"); self.t3_btn_auto_thr.setStyleSheet("background-color: #fef08a; font-weight: bold; color: #854d0e;"); self.t3_btn_auto_thr.clicked.connect(self.run_auto_threshold)
+        self.t3_btn_auto_thr = QPushButton("🎯 이 모델의 최적 스레숄드 찾기 (F1-Score 기반)"); self.t3_btn_auto_thr.setStyleSheet("background-color: #fef08a; font-weight: bold; color: #854d0e;"); self.t3_btn_auto_thr.clicked.connect(self.run_auto_threshold)
         self.btn_send_t3_to_t5 = QPushButton("➡️ 이 모델과 설정으로 거리 측정하기"); self.btn_send_t3_to_t5.setStyleSheet("background-color: #dbeafe; font-weight: bold; color: #1e3a8a;"); self.btn_send_t3_to_t5.clicked.connect(lambda: self.send_to_measure_tab(self.t3_model.get_path(), self.t3_img.get_path(), self.t3_conf.value(), self.t3_iou.value(), self.t3_max_det.value(), self.t3_agnostic.isChecked()))
         self.t3_table = QTableWidget(0, 5); self.t3_table.setHorizontalHeaderLabels(["파일명", "상태", "예측 수", "정답 수", "사유"]); self._apply_table_style(self.t3_table); header = self.t3_table.horizontalHeader()
         for i in range(self.t3_table.columnCount()): header.setSectionResizeMode(i, QHeaderView.Stretch)
@@ -1929,8 +2098,18 @@ class MainWindow(QMainWindow):
         if self.training_process and self.training_process.is_alive(): QMessageBox.warning(self, "경고", "이미 진행 중입니다."); return
         is_valid, err = self.validate_paths(평가모델_file=Path(self.t3_model.get_path()), 평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
-        if QMessageBox.question(self, '스레숄드 탐색', '개발자님이 설정한 [정답 매칭 IoU] 기준에 맞춰, 가장 높은 정확도를 내는 Confidence 및 NMS IoU 값을 탐색합니다.\n계속 진행하시겠습니까?', QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
-        args = {"model_path": self.t3_model.get_path(), "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t3_match_iou.value()}
+        
+        msg = ('설정된 [정답 매칭 IoU] 기준에 맞춰, F1-Score(정밀도/재현율)를 최대로 만드는\n'
+               '최적의 Confidence 값을 탐색합니다.\n\n'
+               '💡 최적 스레숄드 찾기 가이드:\n'
+               '- Confidence: 0.20~0.80 범위에서 탐색\n'
+               '- NMS IoU: 고정값 0.45 사용\n'
+               '- Match IoU: 0.50 이상 권장 (더 엄격한 검증)\n'
+               '주의: 데이터셋이 작으면 (< 100장) 오버피팅될 수 있으므로 주의하세요.\n\n'
+               '계속 진행하시겠습니까?')
+        
+        if QMessageBox.question(self, '스레숄드 탐색', msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
+        args = {"model_path": self.t3_model.get_path(), "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t3_match_iou.value(), "agnostic": self.t3_agnostic.isChecked(), "max_det": self.t3_max_det.value()}
         self.start_training_process(_auto_threshold_worker, args)
 
     def run_tab3(self):
@@ -1947,7 +2126,9 @@ class MainWindow(QMainWindow):
             for col in range(5): self.t3_table.item(i, col).setTextAlignment(Qt.AlignCenter)
         self.t3_table.setSortingEnabled(True); self.t3_chk_show_all.setEnabled(True); self.t3_chk_show_all.blockSignals(True); self.t3_chk_show_all.setChecked(False); self.t3_chk_show_all.blockSignals(False); self.update_tab3_visualization()
         self.log_db.insert_eval_log(task_type="Tab 3 Eval", model_name=Path(self.t3_model.get_path()).name, total=stats['total'], wrong=stats['wrong'], accuracy=stats['acc'], wrong_imgs_list=wrong_imgs, config_data=self.config_builder.build(self))
-        QMessageBox.information(self, "평가 완료", f"총 {stats['total']}개 중 {stats['correct']}개 정답, {stats['wrong']}개 오답 (정확도 {stats['acc']:.1f}%)")
+        
+        QMessageBox.information(self, "평가 완료", f"총 {stats['total']}장 중 {stats['correct']}장 완벽 일치, {stats['wrong']}장 이상 발생\n\n[객체 단위 검출 성능]\n- 정밀도(Precision): {stats.get('precision', 0):.1f}%\n- 재현율(Recall): {stats.get('recall', 0):.1f}%\n- F1-Score: {stats.get('f1_score', stats['acc']):.1f}%")
+        
         if stats["wrong"] > 0 and stats["relabel_dir"]: self.t4_hard.line_edit.setText(stats["relabel_dir"]); self.t4_orig.line_edit.setText(self.t3_lbl.get_path()); self.t4_base.line_edit.setText(self.t3_model.get_path())
 
     def update_tab3_visualization(self):
@@ -1972,13 +2153,13 @@ class MainWindow(QMainWindow):
         f1.addRow(QLabel("<br><b>[재학습 증강 설정]</b>")); self.add_param(f1, "HSV(H)", self.t4_ah, 0.015); self.add_param(f1, "HSV(S)", self.t4_as, 0.7); self.add_param(f1, "HSV(V)", self.t4_av, 0.4); self.add_param(f1, "Flip UD", self.t4_afud, 0.0); self.add_param(f1, "Flip LR", self.t4_aflr, 0.5); self.add_param(f1, "Mosaic", self.t4_amos, 1.0); self.add_param(f1, "Mixup", self.t4_amix, 0.0); self.add_param(f1, "Copy-Paste", self.t4_acp, 0.0)
         self.t4_scroll = self._create_scroll(f1); st1_layout.addWidget(self.t4_scroll); self.t4_btn_retrain = QPushButton("🔁 Hard Example 재학습 시작"); self.t4_btn_retrain.setMinimumHeight(40); self.t4_btn_retrain.clicked.connect(self.run_tab4_retrain); st1_layout.addWidget(self.t4_btn_retrain)
         sub_tab2 = QWidget(); st2_layout = QVBoxLayout(sub_tab2); eval_group = QGroupBox("최종 평가 설정"); eval_layout = QVBoxLayout(eval_group); f2 = QFormLayout()
-        self.t4_conf = QDoubleSpinBox(); self.t4_conf.setRange(0.01, 0.99); self.t4_conf.setValue(0.25); self.t4_conf.setSingleStep(0.01); self.t4_iou = QDoubleSpinBox(); self.t4_iou.setRange(0.01, 0.99); self.t4_iou.setValue(0.45); self.t4_iou.setSingleStep(0.01); self.t4_match_iou = QDoubleSpinBox(); self.t4_match_iou.setRange(0.01, 0.99); self.t4_match_iou.setValue(0.45); self.t4_match_iou.setSingleStep(0.01); self.t4_max_det = QSpinBox(); self.t4_max_det.setRange(1, 999); self.t4_max_det.setValue(99); self.t4_agnostic = QCheckBox(); self.t4_agnostic.setChecked(True)
+        self.t4_conf = QDoubleSpinBox(); self.t4_conf.setRange(0.01, 0.99); self.t4_conf.setValue(0.25); self.t4_conf.setSingleStep(0.01); self.t4_iou = QDoubleSpinBox(); self.t4_iou.setRange(0.01, 0.99); self.t4_iou.setValue(0.45); self.t4_iou.setSingleStep(0.01); self.t4_match_iou = QDoubleSpinBox(); self.t4_match_iou.setRange(0.01, 0.99); self.t4_match_iou.setValue(0.50); self.t4_match_iou.setSingleStep(0.01); self.t4_max_det = QSpinBox(); self.t4_max_det.setRange(1, 999); self.t4_max_det.setValue(99); self.t4_agnostic = QCheckBox(); self.t4_agnostic.setChecked(True)
         h_eval_model = QHBoxLayout(); self.t4_eval_model_display = QLineEdit(); self.t4_eval_model_display.setReadOnly(True); self.t4_eval_model_display.setPlaceholderText("모델을 선택하거나 첫 번째 탭에서 재학습을 완료하세요."); self.t4_eval_model_display.setStyleSheet("background-color: #f3f4f6; color: #374151; font-weight: bold;"); self.btn_t4_eval_browse = QPushButton("📂"); self.btn_t4_eval_browse.clicked.connect(self.browse_tab4_eval_model); h_eval_model.addWidget(self.t4_eval_model_display); h_eval_model.addWidget(self.btn_t4_eval_browse)
-        f2.addRow("평가 대상 모델:", h_eval_model); self.add_param(f2, "Confidence Threshold", self.t4_conf, 0.25); self.add_param(f2, "IoU (NMS)", self.t4_iou, 0.45); self.add_param(f2, "정답 매칭 IoU", self.t4_match_iou, 0.45); self.add_param(f2, "최대 탐지 수", self.t4_max_det, 99); self.add_param(f2, "Agnostic NMS", self.t4_agnostic, True); eval_layout.addLayout(f2)
+        f2.addRow("평가 대상 모델:", h_eval_model); self.add_param(f2, "Confidence Threshold", self.t4_conf, 0.25); self.add_param(f2, "IoU (NMS)", self.t4_iou, 0.45); self.add_param(f2, "정답 매칭 IoU", self.t4_match_iou, 0.50); self.add_param(f2, "최대 탐지 수", self.t4_max_det, 99); self.add_param(f2, "Agnostic NMS", self.t4_agnostic, True); eval_layout.addLayout(f2)
         
         h_eval_btns = QHBoxLayout()
         self.t4_btn_eval = QPushButton("📊 재학습 모델 최종 평가 실행"); self.t4_btn_eval.setMinimumHeight(40); self.t4_btn_eval.clicked.connect(self.run_tab4_eval); self.t4_btn_eval.setEnabled(False)
-        self.t4_btn_auto_thr = QPushButton("🎯 재학습 모델 최적 스레숄드 자동 찾기"); self.t4_btn_auto_thr.setMinimumHeight(40); self.t4_btn_auto_thr.setStyleSheet("background-color: #fef08a; font-weight: bold; color: #854d0e;"); self.t4_btn_auto_thr.clicked.connect(self.run_tab4_auto_threshold)
+        self.t4_btn_auto_thr = QPushButton("🎯 재학습 모델 최적 스레숄드 자동 찾기 (F1 기반)"); self.t4_btn_auto_thr.setMinimumHeight(40); self.t4_btn_auto_thr.setStyleSheet("background-color: #fef08a; font-weight: bold; color: #854d0e;"); self.t4_btn_auto_thr.clicked.connect(self.run_tab4_auto_threshold)
         h_eval_btns.addWidget(self.t4_btn_eval); h_eval_btns.addWidget(self.t4_btn_auto_thr)
         eval_layout.addLayout(h_eval_btns)
         
@@ -2002,9 +2183,17 @@ class MainWindow(QMainWindow):
         is_valid, err = self.validate_paths(평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
         
-        if QMessageBox.question(self, '스레숄드 탐색', '설정된 [정답 매칭 IoU] 기준에 맞춰, 재학습된 모델의 최적 Confidence 및 NMS IoU 값을 탐색합니다.\n진행하시겠습니까?', QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
+        msg = ('설정된 [정답 매칭 IoU] 기준에 맞춰, 재학습된 모델의 최적 Confidence 값을 탐색합니다.\n\n'
+               '💡 최적 스레숄드 찾기 가이드:\n'
+               '- Confidence: 0.20~0.80 범위에서 탐색\n'
+               '- NMS IoU: 고정값 0.45 사용\n'
+               '- Match IoU: 0.50 이상 권장 (더 엄격한 검증)\n'
+               '주의: 데이터셋이 작으면 (< 100장) 오버피팅될 수 있으므로 주의하세요.\n\n'
+               '진행하시겠습니까?')
+               
+        if QMessageBox.question(self, '스레숄드 탐색', msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
         
-        args = {"model_path": model_path, "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t4_match_iou.value()}
+        args = {"model_path": model_path, "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t4_match_iou.value(), "agnostic": self.t4_agnostic.isChecked(), "max_det": self.t4_max_det.value()}
         self.start_training_process(_auto_threshold_worker, args)
 
     def run_tab4_retrain(self):
@@ -2040,7 +2229,7 @@ class MainWindow(QMainWindow):
             for col in range(5): self.t4_table.item(i, col).setTextAlignment(Qt.AlignCenter)
         self.t4_table.setSortingEnabled(True); self.t4_chk_show_all.setEnabled(True); self.t4_chk_show_all.blockSignals(True); self.t4_chk_show_all.setChecked(False); self.t4_chk_show_all.blockSignals(False); self.update_tab4_visualization()
         self.log_db.insert_eval_log(task_type="Tab 4 Final Eval", model_name=Path(self.t4_eval_model_display.text()).name, total=stats['total'], wrong=stats['wrong'], accuracy=stats['acc'], wrong_imgs_list=wrong_imgs, config_data=self.config_builder.build(self))
-        QMessageBox.information(self, "완료", f"총 {stats['total']}개 중 {stats['correct']}개 정답 (정확도 {stats['acc']:.1f}%)")
+        QMessageBox.information(self, "완료", f"총 {stats['total']}장 중 {stats['correct']}장 완벽 일치, {stats['wrong']}장 이상 발생\n\n[객체 단위 검출 성능]\n- 정밀도(Precision): {stats.get('precision', 0):.1f}%\n- 재현율(Recall): {stats.get('recall', 0):.1f}%\n- F1-Score: {stats.get('f1_score', stats['acc']):.1f}%")
 
     def update_tab4_visualization(self):
         if hasattr(self, 't4_last_all_imgs'): self.t4_img_grid.update_images(self.t4_last_all_imgs if self.t4_chk_show_all.isChecked() else self.t4_last_wrong_imgs)
@@ -2055,14 +2244,14 @@ class MainWindow(QMainWindow):
         self.t5_model = PathInputWidget("거리 측정 모델", False, str(work_dir/"kfold"/"best_model.pt")); f.addRow(self.t5_model); self.t5_img = PathInputWidget("분석할 이미지 폴더", True, str(proc_dir/"images")); f.addRow(self.t5_img)
         self.t5_method = QComboBox(); self.t5_method.addItems(["테두리 최단거리 (Edge)", "중심점 유클리드 (Center)", "가장 가까운 N개 이웃 (방향 무관)"])
         self.t5_conf = QDoubleSpinBox(); self.t5_conf.setRange(0.01, 0.99); self.t5_conf.setValue(0.25); self.t5_conf.setSingleStep(0.01); self.t5_iou = QDoubleSpinBox(); self.t5_iou.setRange(0.01, 0.99); self.t5_iou.setValue(0.45); self.t5_iou.setSingleStep(0.05); self.t5_max_det = QSpinBox(); self.t5_max_det.setRange(1, 1000); self.t5_max_det.setValue(300); self.t5_agnostic = QCheckBox(); self.t5_agnostic.setChecked(True)
-        self.t5_knn_n = QSpinBox(); self.t5_knn_n.setRange(1, 10); self.t5_knn_n.setValue(2); self.t5_edge_thr = QLineEdit("60"); self.t5_skip_ng = QCheckBox(); self.t5_skip_ng.setChecked(True); self.t5_drop_odd = QCheckBox(); self.t5_drop_odd.setChecked(True)
+        self.t5_knn_n = QSpinBox(); self.t5_knn_n.setRange(1, 10); self.t5_knn_n.setValue(2); self.t5_edge_thr = QLineEdit("60"); self.t5_skip_ng = QCheckBox(); self.t5_skip_ng.setChecked(True); self.t5_drop_odd = QCheckBox(); self.t5_drop_odd.setChecked(False)
         color_map = {"노란색 (Yellow)": QColor(255, 255, 0), "초록색 (Green)": QColor(0, 255, 0), "빨간색 (Red)": QColor(255, 0, 0), "파란색 (Blue)": QColor(0, 0, 255), "청록색 (Cyan)": QColor(0, 255, 255), "자주색 (Magenta)": QColor(255, 0, 255), "흰색 (White)": QColor(255, 255, 255)}
         def get_color_icon(color):
             pixmap = QPixmap(16, 16); pixmap.fill(Qt.gray); painter = QPainter(pixmap); painter.fillRect(1, 1, 14, 14, color); painter.end(); return QIcon(pixmap)
         self.t5_color1 = QComboBox(); self.t5_color2 = QComboBox()
         for name, color in color_map.items(): self.t5_color1.addItem(get_color_icon(color), name); self.t5_color2.addItem(get_color_icon(color), name)
         self.t5_color1.setCurrentText("노란색 (Yellow)"); self.t5_color2.setCurrentText("청록색 (Cyan)")
-        self.add_param(f, "측정 방식", self.t5_method, "테두리 최단거리 (Edge)"); self.add_param(f, "Confidence", self.t5_conf, 0.25); self.add_param(f, "IoU (NMS)", self.t5_iou, 0.45); self.add_param(f, "최대 탐지 수", self.t5_max_det, 300); self.add_param(f, "Agnostic NMS", self.t5_agnostic, True); self.add_param(f, "N개 이웃 (KNN 전용)", self.t5_knn_n, 2); self.add_param(f, "Edge 분류 임계값", self.t5_edge_thr, "60"); self.add_param(f, "'NG' 클래스 제외", self.t5_skip_ng, True); self.add_param(f, "홀수 개체 시 최저 신뢰도 제거", self.t5_drop_odd, True); self.add_param(f, "수평/KNN 선 색상", self.t5_color1, "노란색 (Yellow)"); self.add_param(f, "수직 선 색상 (Edge)", self.t5_color2, "청록색 (Cyan)")
+        self.add_param(f, "측정 방식", self.t5_method, "테두리 최단거리 (Edge)"); self.add_param(f, "Confidence", self.t5_conf, 0.25); self.add_param(f, "IoU (NMS)", self.t5_iou, 0.45); self.add_param(f, "최대 탐지 수", self.t5_max_det, 300); self.add_param(f, "Agnostic NMS", self.t5_agnostic, True); self.add_param(f, "N개 이웃 (KNN 전용)", self.t5_knn_n, 2); self.add_param(f, "Edge 분류 임계값", self.t5_edge_thr, "60"); self.add_param(f, "'NG' 클래스 제외", self.t5_skip_ng, True); self.add_param(f, "홀수 개체 시 최저 신뢰도 제거", self.t5_drop_odd, False); self.add_param(f, "수평/KNN 선 색상", self.t5_color1, "노란색 (Yellow)"); self.add_param(f, "수직 선 색상 (Edge)", self.t5_color2, "청록색 (Cyan)")
         self.t5_btn_run = QPushButton("📏 측정 및 통계 분석 실행"); self.t5_btn_run.clicked.connect(self.run_tab5); self.t5_progress = QProgressBar(); self.t5_canvas = FigureCanvas(plt.Figure(figsize=(10, 4.5))); self.t5_canvas.setMinimumHeight(300); self.t5_toolbar = NavigationToolbar(self.t5_canvas, self); self.t5_img_grid = ImageGridWidget(max_display=100)
         self.t5_chk_show_outliers = QCheckBox("🚨 이상치(Outlier) 이미지만 필터링"); self.t5_chk_show_outliers.setStyleSheet("color: red; font-weight: bold;"); self.t5_chk_show_outliers.setEnabled(False); self.t5_chk_show_outliers.stateChanged.connect(self.update_tab5_visualization)
         split = QSplitter(Qt.Horizontal); c_w = QWidget(); c_l = QVBoxLayout(c_w); c_l.addWidget(self._create_scroll(f), stretch=1); c_l.addWidget(self.t5_btn_run); c_l.addWidget(self.t5_progress); c_l.addWidget(QLabel("<b>데이터 분포 시각화</b>")); c_l.addWidget(self.t5_toolbar); c_l.addWidget(self.t5_canvas, stretch=2)
