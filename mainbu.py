@@ -298,6 +298,7 @@ def _auto_threshold_worker(args, queue):
             x1_min, y1_min = b1[0] - b1[2]/2, b1[1] - b1[3]/2
             x1_max, y1_max = b1[0] + b1[2]/2, b1[1] + b1[3]/2
             x2_min, y2_min = b2[0] - b2[2]/2, b2[1] - b2[3]/2
+            x2_max, y2_max = b2[0] + b2[2]/2, b2[1] + b2[3]/2
 
             inter_xmin = max(x1_min, x2_min)
             inter_ymin = max(y1_min, y2_min)
@@ -1525,6 +1526,22 @@ class MainWindow(QMainWindow):
             self.noti_flags = dialog.get_flags()
             self.statusBar().showMessage("⚙️ 알림 설정이 업데이트되었습니다.", 3000)
 
+    def reset_tab_defaults(self, tab_widget, tab_name):
+        if QMessageBox.question(self, '초기화 확인', f'{tab_name} 탭의 파라미터를 기본값으로 초기화하시겠습니까?', QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+            for widget in tab_widget.findChildren(QWidget):
+                default_val = widget.property("default_val")
+                if default_val is not None:
+                    if isinstance(widget, (QSpinBox, QDoubleSpinBox)): widget.setValue(default_val)
+                    elif isinstance(widget, QComboBox): widget.setCurrentText(default_val)
+                    elif isinstance(widget, QTextEdit): widget.setText(default_val)
+                    elif isinstance(widget, QLineEdit): widget.setText(default_val)
+                    elif isinstance(widget, QCheckBox): widget.setChecked(default_val)
+            
+            if hasattr(self, 't1_class_map') and self.t1_class_map in tab_widget.findChildren(QWidget): self.t1_class_map.setPlainText("OK\nNG")
+            if hasattr(self, 't6_class_map') and self.t6_class_map in tab_widget.findChildren(QWidget): self.t6_class_map.setPlainText("OK\nNG")
+            
+            self.statusBar().showMessage(f"🔄 {tab_name} 탭이 기본값으로 초기화되었습니다.", 3000)
+
     def init_ui(self):
         main_widget = QWidget(); self.setCentralWidget(main_widget); main_layout = QVBoxLayout(main_widget)
         g_group = QGroupBox("📁 전역 설정 및 시스템 상태"); g_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed); g_layout = QHBoxLayout(); g_layout.setContentsMargins(10, 5, 10, 5)
@@ -1553,7 +1570,7 @@ class MainWindow(QMainWindow):
         btn_layout1 = QHBoxLayout()
         self.btn_save_config = QPushButton("💾 설정만 저장"); self.btn_save_config.setStyleSheet("background-color: #f3f4f6; border: 1px solid #d1d5db; padding: 5px; border-radius: 4px;"); self.btn_save_config.clicked.connect(self.save_config_dialog)
         self.btn_load_config = QPushButton("📂 설정만 불러오기"); self.btn_load_config.setStyleSheet("background-color: #f3f4f6; border: 1px solid #d1d5db; padding: 5px; border-radius: 4px;"); self.btn_load_config.clicked.connect(self.load_config_dialog)
-        self.btn_reset_all = QPushButton("🔄 초기화"); self.btn_reset_all.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 5px; border-radius: 4px;"); self.btn_reset_all.clicked.connect(self.reset_all_defaults)
+        self.btn_reset_all = QPushButton("🔄 전체 초기화"); self.btn_reset_all.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 5px; border-radius: 4px;"); self.btn_reset_all.clicked.connect(self.reset_all_defaults)
         self.btn_show_logs = QPushButton("📊 학습 이력(DB)"); self.btn_show_logs.setStyleSheet("background-color: #e0e7ff; border: 1px solid #a5b4fc; padding: 5px; border-radius: 4px; font-weight: bold; color: #3730a3;"); self.btn_show_logs.clicked.connect(self.show_log_viewer)
         btn_layout1.addWidget(self.btn_save_config); btn_layout1.addWidget(self.btn_load_config); btn_layout1.addWidget(self.btn_reset_all); btn_layout1.addWidget(self.btn_show_logs)
         btn_layout2 = QHBoxLayout()
@@ -1567,7 +1584,7 @@ class MainWindow(QMainWindow):
     def show_log_viewer(self): LogViewerDialog(self.log_db, self).exec_()
 
     def reset_all_defaults(self):
-        if QMessageBox.question(self, '초기화 확인', '모든 파라미터를 기본값으로 되돌리시겠습니까?\n(경로 설정은 유지됩니다)', QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+        if QMessageBox.question(self, '전체 초기화 확인', '전체 탭의 모든 파라미터를 기본값으로 되돌리시겠습니까?\n(경로 설정은 유지됩니다)', QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
             for widget in self.findChildren(QWidget):
                 default_val = widget.property("default_val")
                 if default_val is not None:
@@ -1892,8 +1909,12 @@ class MainWindow(QMainWindow):
         self.t6_color_combo.setCurrentText("흰색 (White)"); self.t6_color_combo.currentTextChanged.connect(lambda name: self.t6_view.set_crosshair_color(color_map[name]))
         self.t6_btn_load = QPushButton("📂 이미지 목록 불러오기"); self.t6_btn_load.clicked.connect(self.load_labeling_images); self.btn_go_to_preprocess = QPushButton("➡️ 라벨링 완료 (전처리로 이동)"); self.btn_go_to_preprocess.setStyleSheet("background-color: #dbeafe; font-weight: bold; color: #1e3a8a;"); self.btn_go_to_preprocess.clicked.connect(self.go_to_preprocess_tab)
         f.addRow(self.t6_img_dir); f.addRow(self.t6_lbl_dir); f.addRow(QLabel("클래스 목록 (엔터로 구분)"), self.t6_class_map); f.addRow(QLabel("십자선 색상"), self.t6_color_combo)
-        h_btns = QHBoxLayout(); h_btns.addWidget(self.t6_btn_load); h_btns.addWidget(self.btn_go_to_preprocess); f.addRow(h_btns)
-        split = QSplitter(Qt.Horizontal); left_w = QWidget(); left_l = QVBoxLayout(left_w); left_l.addWidget(self._create_scroll(f)); self.t6_list = QListWidget(); self.t6_list.itemClicked.connect(self.on_label_image_selected); left_l.addWidget(QLabel("<b>이미지 목록</b>")); left_l.addWidget(self.t6_list)
+        split = QSplitter(Qt.Horizontal); left_w = QWidget(); left_l = QVBoxLayout(left_w); left_l.addWidget(self._create_scroll(f))
+        
+        self.t6_btn_reset = QPushButton("🔄 이 탭 초기화"); self.t6_btn_reset.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 5px; border-radius: 4px;"); self.t6_btn_reset.clicked.connect(lambda _, w=left_w: self.reset_tab_defaults(w, "라벨링 툴"))
+        h_btns = QHBoxLayout(); h_btns.addWidget(self.t6_btn_load); h_btns.addWidget(self.btn_go_to_preprocess); h_btns.addWidget(self.t6_btn_reset); left_l.addLayout(h_btns)
+        
+        self.t6_list = QListWidget(); self.t6_list.itemClicked.connect(self.on_label_image_selected); left_l.addWidget(QLabel("<b>이미지 목록</b>")); left_l.addWidget(self.t6_list)
         right_w = QWidget(); right_l = QHBoxLayout(right_w); self.t6_view = LabelingView(); self.t6_view.box_added.connect(self.sync_label_ui); self.t6_view.request_prev.connect(self.select_prev_label_image); self.t6_view.request_next.connect(self.select_next_label_image)
         side_panel = QWidget(); side_layout = QVBoxLayout(side_panel); side_layout.setContentsMargins(10, 0, 0, 0); side_layout.setAlignment(Qt.AlignTop)
         help_text = ("<b>라벨링 영역 단축키</b><br><span style='font-size:11px; color:#555;'><b>Q/E</b>: 실행취소/다시실행<br><b>S/W</b>: OK/NG 클래스 지정<br><b>휠클릭 드래그</b>: 박스 위치이동<br><b>좌클릭 드래그</b>: 크기 조절<br><b>마우스 휠</b>: 화면 확대/축소<br><b>우클릭 드래그</b>: 화면 이동<br><b>Shift/Ctrl+클릭</b>: 다중 선택</span>")
@@ -1969,7 +1990,13 @@ class MainWindow(QMainWindow):
         v_class_layout = QVBoxLayout(); v_class_layout.addWidget(self.t1_class_map); v_class_layout.addWidget(self.btn_scan_classes); form.addRow(QLabel("클래스 목록\n(엔터로 구분)"), v_class_layout)
         self.add_param(form, "기존 출력 폴더 초기화", self.t1_clean, True); self.add_param(form, "EXIF 회전 보정", self.t1_exif, True)
         self.t1_btn_run = QPushButton("🚀 전처리 시작"); self.t1_btn_run.clicked.connect(self.run_tab1); self.t1_progress = QProgressBar(); self.t1_log = QTextEdit(); self.t1_log.setReadOnly(True); self.t1_img_grid = ImageGridWidget(max_display=100)
-        split = QSplitter(Qt.Horizontal); left_w = QWidget(); left_l = QVBoxLayout(left_w); left_l.addWidget(self._create_scroll(form)); left_l.addWidget(self.t1_btn_run); left_l.addWidget(self.t1_progress); left_l.addWidget(self.t1_log)
+        split = QSplitter(Qt.Horizontal); left_w = QWidget(); left_l = QVBoxLayout(left_w); left_l.addWidget(self._create_scroll(form))
+        
+        h_t1_btns = QHBoxLayout(); h_t1_btns.addWidget(self.t1_btn_run)
+        self.t1_btn_reset = QPushButton("🔄 이 탭 초기화"); self.t1_btn_reset.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 5px; border-radius: 4px;")
+        self.t1_btn_reset.clicked.connect(lambda _, w=left_w: self.reset_tab_defaults(w, "데이터 전처리")); h_t1_btns.addWidget(self.t1_btn_reset)
+        left_l.addLayout(h_t1_btns); left_l.addWidget(self.t1_progress); left_l.addWidget(self.t1_log)
+        
         right_w = QWidget(); right_l = QVBoxLayout(right_w); right_l.addWidget(QLabel("<b>전처리 결과 이미지 미리보기</b>")); right_l.addWidget(self.t1_img_grid)
         split.addWidget(left_w); split.addWidget(right_w); split.setSizes([600, 800]); layout = QVBoxLayout(); layout.addWidget(split); tab = QWidget(); tab.setLayout(layout); self.tabs.addTab(tab, "✂️ 데이터 전처리")
 
@@ -1990,6 +2017,7 @@ class MainWindow(QMainWindow):
         
         if target_dir.exists(): 
             self.t1_img_grid.update_images([str(f) for f in target_dir.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}])
+            
     def setup_tab2(self):
         f = QFormLayout(); self.t2_epochs = QSpinBox(); self.t2_epochs.setRange(1, 5000); self.t2_epochs.setValue(400); self.t2_batch = QSpinBox(); self.t2_batch.setRange(1, 256); self.t2_batch.setValue(16); self.t2_workers = QSpinBox(); self.t2_workers.setRange(0, 32); self.t2_workers.setValue(8); self.t2_patience = QSpinBox(); self.t2_patience.setRange(0, 10000); self.t2_patience.setValue(100); self.t2_seed = QSpinBox(); self.t2_seed.setRange(0, 999999); self.t2_seed.setValue(42); self.t2_folds = QSpinBox(); self.t2_folds.setRange(1, 10); self.t2_folds.setValue(5); self.t2_test_split = QDoubleSpinBox(); self.t2_test_split.setRange(0.05, 0.6); self.t2_test_split.setValue(0.2); self.t2_test_split.setSingleStep(0.05); self.t2_lcls = QDoubleSpinBox(); self.t2_lcls.setRange(0.1, 10.0); self.t2_lcls.setValue(0.5); self.t2_lcls.setSingleStep(0.1); self.t2_lbox = QDoubleSpinBox(); self.t2_lbox.setRange(0.1, 20.0); self.t2_lbox.setValue(7.5); self.t2_lbox.setSingleStep(0.5); self.t2_ldfl = QDoubleSpinBox(); self.t2_ldfl.setRange(0.1, 10.0); self.t2_ldfl.setValue(1.5); self.t2_ldfl.setSingleStep(0.1)
         def make_dbl(rng, val, step): b = QDoubleSpinBox(); b.setRange(*rng); b.setDecimals(3 if step < 0.01 else 2); b.setSingleStep(step); b.setValue(val); return b
@@ -2006,9 +2034,14 @@ class MainWindow(QMainWindow):
         self.t2_btn_tune.setStyleSheet("background-color: #dbeafe; border: 1px solid #93c5fd; padding: 8px; font-weight: bold; color: #1e3a8a;")
         self.t2_btn_tune.clicked.connect(self.run_auto_tune)
         self.t2_btn_run = QPushButton("🚀 K-Fold 학습 시작"); self.t2_btn_run.clicked.connect(self.run_tab2); self.t2_btn_stop = QPushButton("🛑 강제 종료"); self.t2_btn_stop.clicked.connect(self.stop_training); self.t2_btn_stop.setEnabled(False)
+        
         l = QVBoxLayout(); self.t2_scroll = self._create_scroll(f); l.addWidget(self.t2_scroll)
+        
+        self.t2_btn_reset = QPushButton("🔄 이 탭 초기화"); self.t2_btn_reset.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 5px; border-radius: 4px;")
+        self.t2_btn_reset.clicked.connect(lambda _, w=self.t2_scroll: self.reset_tab_defaults(w, "K-Fold 학습"))
+        
         h_tune = QHBoxLayout(); h_tune.addWidget(self.t2_btn_tune); l.addLayout(h_tune)
-        h = QHBoxLayout(); h.addWidget(self.t2_btn_run); h.addWidget(self.t2_btn_stop); l.addLayout(h); tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "🏋️ K-Fold 학습")
+        h = QHBoxLayout(); h.addWidget(self.t2_btn_run); h.addWidget(self.t2_btn_stop); h.addWidget(self.t2_btn_reset); l.addLayout(h); tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "🏋️ K-Fold 학습")
 
     def run_auto_tune(self):
         if self.training_process and self.training_process.is_alive(): 
@@ -2089,7 +2122,11 @@ class MainWindow(QMainWindow):
         self.t3_table.setSortingEnabled(True); self.t3_table.itemDoubleClicked.connect(self.on_t3_table_double_clicked)
         self.t3_img_grid = ImageGridWidget(max_display=100); self.t3_chk_show_all = QCheckBox("전체 평가 이미지 보기"); self.t3_chk_show_all.setEnabled(False); self.t3_chk_show_all.stateChanged.connect(self.update_tab3_visualization)
         split = QSplitter(Qt.Horizontal); t_w = QWidget(); t_l = QVBoxLayout(t_w); t_l.addWidget(self._create_scroll(f))
-        h_t3_btns = QHBoxLayout(); h_t3_btns.addWidget(self.t3_btn_run); h_t3_btns.addWidget(self.t3_btn_auto_thr)
+        
+        self.t3_btn_reset = QPushButton("🔄 이 탭 초기화"); self.t3_btn_reset.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 5px; border-radius: 4px;")
+        self.t3_btn_reset.clicked.connect(lambda _, w=t_w: self.reset_tab_defaults(w, "평가 & 선별"))
+        
+        h_t3_btns = QHBoxLayout(); h_t3_btns.addWidget(self.t3_btn_run); h_t3_btns.addWidget(self.t3_btn_auto_thr); h_t3_btns.addWidget(self.t3_btn_reset)
         t_l.addLayout(h_t3_btns); t_l.addWidget(self.btn_send_t3_to_t5); t_l.addWidget(QLabel("<b>평가 결과 목록</b>")); t_l.addWidget(self.t3_table)
         i_w = QWidget(); i_l = QVBoxLayout(i_w); i_header = QHBoxLayout(); i_header.addWidget(QLabel("<b>예측 결과 시각화</b>")); i_header.addStretch(1); i_header.addWidget(self.t3_chk_show_all); i_l.addLayout(i_header); i_l.addWidget(self.t3_img_grid)
         split.addWidget(t_w); split.addWidget(i_w); split.setSizes([700, 700]); l = QVBoxLayout(); l.addWidget(split); tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "🔍 평가 & 선별")
@@ -2099,16 +2136,17 @@ class MainWindow(QMainWindow):
         is_valid, err = self.validate_paths(평가모델_file=Path(self.t3_model.get_path()), 평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
         
-        msg = ('설정된 [정답 매칭 IoU] 기준에 맞춰, F1-Score(정밀도/재현율)를 최대로 만드는\n'
-               '최적의 Confidence 값을 탐색합니다.\n\n'
-               '💡 최적 스레숄드 찾기 가이드:\n'
-               '- Confidence: 0.20~0.80 범위에서 탐색\n'
-               '- NMS IoU: 고정값 0.45 사용\n'
-               '- Match IoU: 0.50 이상 권장 (더 엄격한 검증)\n'
-               '주의: 데이터셋이 작으면 (< 100장) 오버피팅될 수 있으므로 주의하세요.\n\n'
+        msg = ('설정된 [정답 매칭 IoU] 기준에 맞춰, 성능을 최대로 만드는\n'
+               '최적의 Confidence와 NMS IoU 값을 자동 탐색합니다.\n\n'
+               '💡 탐색 로직 안내:\n'
+               '- 탐색 목표: 1순위(완벽 정답 이미지 수 최대화), 2순위(F1-Score 최대화)\n'
+               '- 탐색 범위: Conf(0.01~0.99), NMS IoU(0.15~0.85)\n'
+               '- 방식: 1차 넓은 범위 탐색 후 최적점 근처 2차 정밀 탐색\n\n'
+               '주의: 평가용 데이터셋이 너무 적으면 오버피팅될 수 있으므로 주의하세요.\n\n'
                '계속 진행하시겠습니까?')
         
         if QMessageBox.question(self, '스레숄드 탐색', msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
+        
         args = {"model_path": self.t3_model.get_path(), "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t3_match_iou.value(), "agnostic": self.t3_agnostic.isChecked(), "max_det": self.t3_max_det.value()}
         self.start_training_process(_auto_threshold_worker, args)
 
@@ -2159,8 +2197,12 @@ class MainWindow(QMainWindow):
         
         h_eval_btns = QHBoxLayout()
         self.t4_btn_eval = QPushButton("📊 재학습 모델 최종 평가 실행"); self.t4_btn_eval.setMinimumHeight(40); self.t4_btn_eval.clicked.connect(self.run_tab4_eval); self.t4_btn_eval.setEnabled(False)
-        self.t4_btn_auto_thr = QPushButton("🎯 재학습 모델 최적 스레숄드 자동 찾기 (F1 기반)"); self.t4_btn_auto_thr.setMinimumHeight(40); self.t4_btn_auto_thr.setStyleSheet("background-color: #fef08a; font-weight: bold; color: #854d0e;"); self.t4_btn_auto_thr.clicked.connect(self.run_tab4_auto_threshold)
-        h_eval_btns.addWidget(self.t4_btn_eval); h_eval_btns.addWidget(self.t4_btn_auto_thr)
+        self.t4_btn_auto_thr = QPushButton("🎯 재학습 모델 최적 스레숄드 찾기"); self.t4_btn_auto_thr.setMinimumHeight(40); self.t4_btn_auto_thr.setStyleSheet("background-color: #fef08a; font-weight: bold; color: #854d0e;"); self.t4_btn_auto_thr.clicked.connect(self.run_tab4_auto_threshold)
+        
+        self.t4_btn_reset = QPushButton("🔄 이 탭 초기화"); self.t4_btn_reset.setMinimumHeight(40); self.t4_btn_reset.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; font-weight: bold; color: #b91c1c;")
+        self.t4_btn_reset.clicked.connect(lambda _, w=left_widget: self.reset_tab_defaults(w, "재학습"))
+        
+        h_eval_btns.addWidget(self.t4_btn_eval); h_eval_btns.addWidget(self.t4_btn_auto_thr); h_eval_btns.addWidget(self.t4_btn_reset)
         eval_layout.addLayout(h_eval_btns)
         
         self.btn_send_t4_to_t5 = QPushButton("➡️ 이 재학습 모델과 설정으로 거리 측정하기"); self.btn_send_t4_to_t5.setStyleSheet("background-color: #dbeafe; font-weight: bold; color: #1e3a8a;"); self.btn_send_t4_to_t5.clicked.connect(lambda: self.send_to_measure_tab(self.t4_eval_model_display.text(), self.t3_img.get_path(), self.t4_conf.value(), self.t4_iou.value(), self.t4_max_det.value(), self.t4_agnostic.isChecked())); eval_layout.addWidget(self.btn_send_t4_to_t5); st2_layout.addWidget(eval_group)
@@ -2183,14 +2225,15 @@ class MainWindow(QMainWindow):
         is_valid, err = self.validate_paths(평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
         
-        msg = ('설정된 [정답 매칭 IoU] 기준에 맞춰, 재학습된 모델의 최적 Confidence 값을 탐색합니다.\n\n'
-               '💡 최적 스레숄드 찾기 가이드:\n'
-               '- Confidence: 0.20~0.80 범위에서 탐색\n'
-               '- NMS IoU: 고정값 0.45 사용\n'
-               '- Match IoU: 0.50 이상 권장 (더 엄격한 검증)\n'
-               '주의: 데이터셋이 작으면 (< 100장) 오버피팅될 수 있으므로 주의하세요.\n\n'
+        msg = ('설정된 [정답 매칭 IoU] 기준에 맞춰, 재학습된 모델의 성능을 최대로 만드는\n'
+               '최적의 Confidence와 NMS IoU 값을 자동 탐색합니다.\n\n'
+               '💡 탐색 로직 안내:\n'
+               '- 탐색 목표: 1순위(완벽 정답 이미지 수 최대화), 2순위(F1-Score 최대화)\n'
+               '- 탐색 범위: Conf(0.01~0.99), NMS IoU(0.15~0.85)\n'
+               '- 방식: 1차 넓은 범위 탐색 후 최적점 근처 2차 정밀 탐색\n\n'
+               '주의: 평가용 데이터셋이 너무 적으면 오버피팅될 수 있으므로 주의하세요.\n\n'
                '진행하시겠습니까?')
-               
+                
         if QMessageBox.question(self, '스레숄드 탐색', msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
         
         args = {"model_path": model_path, "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t4_match_iou.value(), "agnostic": self.t4_agnostic.isChecked(), "max_det": self.t4_max_det.value()}
@@ -2252,9 +2295,17 @@ class MainWindow(QMainWindow):
         for name, color in color_map.items(): self.t5_color1.addItem(get_color_icon(color), name); self.t5_color2.addItem(get_color_icon(color), name)
         self.t5_color1.setCurrentText("노란색 (Yellow)"); self.t5_color2.setCurrentText("청록색 (Cyan)")
         self.add_param(f, "측정 방식", self.t5_method, "테두리 최단거리 (Edge)"); self.add_param(f, "Confidence", self.t5_conf, 0.25); self.add_param(f, "IoU (NMS)", self.t5_iou, 0.45); self.add_param(f, "최대 탐지 수", self.t5_max_det, 300); self.add_param(f, "Agnostic NMS", self.t5_agnostic, True); self.add_param(f, "N개 이웃 (KNN 전용)", self.t5_knn_n, 2); self.add_param(f, "Edge 분류 임계값", self.t5_edge_thr, "60"); self.add_param(f, "'NG' 클래스 제외", self.t5_skip_ng, True); self.add_param(f, "홀수 개체 시 최저 신뢰도 제거", self.t5_drop_odd, False); self.add_param(f, "수평/KNN 선 색상", self.t5_color1, "노란색 (Yellow)"); self.add_param(f, "수직 선 색상 (Edge)", self.t5_color2, "청록색 (Cyan)")
-        self.t5_btn_run = QPushButton("📏 측정 및 통계 분석 실행"); self.t5_btn_run.clicked.connect(self.run_tab5); self.t5_progress = QProgressBar(); self.t5_canvas = FigureCanvas(plt.Figure(figsize=(10, 4.5))); self.t5_canvas.setMinimumHeight(300); self.t5_toolbar = NavigationToolbar(self.t5_canvas, self); self.t5_img_grid = ImageGridWidget(max_display=100)
+        self.t5_btn_run = QPushButton("📏 측정 및 통계 분석 실행"); self.t5_btn_run.clicked.connect(self.run_tab5)
+        self.t5_progress = QProgressBar(); self.t5_canvas = FigureCanvas(plt.Figure(figsize=(10, 4.5))); self.t5_canvas.setMinimumHeight(300); self.t5_toolbar = NavigationToolbar(self.t5_canvas, self); self.t5_img_grid = ImageGridWidget(max_display=100)
         self.t5_chk_show_outliers = QCheckBox("🚨 이상치(Outlier) 이미지만 필터링"); self.t5_chk_show_outliers.setStyleSheet("color: red; font-weight: bold;"); self.t5_chk_show_outliers.setEnabled(False); self.t5_chk_show_outliers.stateChanged.connect(self.update_tab5_visualization)
-        split = QSplitter(Qt.Horizontal); c_w = QWidget(); c_l = QVBoxLayout(c_w); c_l.addWidget(self._create_scroll(f), stretch=1); c_l.addWidget(self.t5_btn_run); c_l.addWidget(self.t5_progress); c_l.addWidget(QLabel("<b>데이터 분포 시각화</b>")); c_l.addWidget(self.t5_toolbar); c_l.addWidget(self.t5_canvas, stretch=2)
+        
+        split = QSplitter(Qt.Horizontal); c_w = QWidget(); c_l = QVBoxLayout(c_w); c_l.addWidget(self._create_scroll(f), stretch=1)
+        
+        self.t5_btn_reset = QPushButton("🔄 이 탭 초기화"); self.t5_btn_reset.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 5px; border-radius: 4px;")
+        self.t5_btn_reset.clicked.connect(lambda _, w=c_w: self.reset_tab_defaults(w, "거리 측정"))
+        h_t5_btns = QHBoxLayout(); h_t5_btns.addWidget(self.t5_btn_run); h_t5_btns.addWidget(self.t5_btn_reset)
+        
+        c_l.addLayout(h_t5_btns); c_l.addWidget(self.t5_progress); c_l.addWidget(QLabel("<b>데이터 분포 시각화</b>")); c_l.addWidget(self.t5_toolbar); c_l.addWidget(self.t5_canvas, stretch=2)
         i_w = QWidget(); i_l = QVBoxLayout(i_w); i_header_layout = QHBoxLayout(); i_header_layout.addWidget(QLabel("<b>측정 결과 시각화</b>")); i_header_layout.addStretch(1); i_header_layout.addWidget(self.t5_chk_show_outliers); i_l.addLayout(i_header_layout); i_l.addWidget(self.t5_img_grid)
         split.addWidget(c_w); split.addWidget(i_w); split.setSizes([700, 700]); l = QVBoxLayout(); l.addWidget(split); tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "📏 거리 측정")
 

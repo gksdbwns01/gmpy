@@ -298,6 +298,7 @@ def _auto_threshold_worker(args, queue):
             x1_min, y1_min = b1[0] - b1[2]/2, b1[1] - b1[3]/2
             x1_max, y1_max = b1[0] + b1[2]/2, b1[1] + b1[3]/2
             x2_min, y2_min = b2[0] - b2[2]/2, b2[1] - b2[3]/2
+            x2_max, y2_max = b2[0] + b2[2]/2, b2[1] + b2[3]/2
 
             inter_xmin = max(x1_min, x2_min)
             inter_ymin = max(y1_min, y2_min)
@@ -2135,13 +2136,13 @@ class MainWindow(QMainWindow):
         is_valid, err = self.validate_paths(평가모델_file=Path(self.t3_model.get_path()), 평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
         
-        msg = ('설정된 [정답 매칭 IoU] 기준에 맞춰, F1-Score(정밀도/재현율)를 최대로 만드는\n'
-               '최적의 Confidence 값을 탐색합니다.\n\n'
-               '💡 최적 스레숄드 찾기 가이드:\n'
-               '- Confidence: 0.20~0.80 범위에서 탐색\n'
-               '- NMS IoU: 고정값 0.45 사용\n'
-               '- Match IoU: 0.50 이상 권장 (더 엄격한 검증)\n'
-               '주의: 데이터셋이 작으면 (< 100장) 오버피팅될 수 있으므로 주의하세요.\n\n'
+        msg = ('설정된 [정답 매칭 IoU] 기준에 맞춰, 성능을 최대로 만드는\n'
+               '최적의 Confidence와 NMS IoU 값을 자동 탐색합니다.\n\n'
+               '💡 탐색 로직 안내:\n'
+               '- 탐색 목표: 1순위(완벽 정답 이미지 수 최대화), 2순위(F1-Score 최대화)\n'
+               '- 탐색 범위: Conf(0.01~0.99), NMS IoU(0.15~0.85)\n'
+               '- 방식: 1차 넓은 범위 탐색 후 최적점 근처 2차 정밀 탐색\n\n'
+               '주의: 평가용 데이터셋이 너무 적으면 오버피팅될 수 있으므로 주의하세요.\n\n'
                '계속 진행하시겠습니까?')
         
         if QMessageBox.question(self, '스레숄드 탐색', msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
@@ -2224,12 +2225,13 @@ class MainWindow(QMainWindow):
         is_valid, err = self.validate_paths(평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
         
-        msg = ('설정된 [정답 매칭 IoU] 기준에 맞춰, 재학습된 모델의 최적 Confidence 값을 탐색합니다.\n\n'
-               '💡 최적 스레숄드 찾기 가이드:\n'
-               '- Confidence: 0.20~0.80 범위에서 탐색\n'
-               '- NMS IoU: 고정값 0.45 사용\n'
-               '- Match IoU: 0.50 이상 권장 (더 엄격한 검증)\n'
-               '주의: 데이터셋이 작으면 (< 100장) 오버피팅될 수 있으므로 주의하세요.\n\n'
+        msg = ('설정된 [정답 매칭 IoU] 기준에 맞춰, 재학습된 모델의 성능을 최대로 만드는\n'
+               '최적의 Confidence와 NMS IoU 값을 자동 탐색합니다.\n\n'
+               '💡 탐색 로직 안내:\n'
+               '- 탐색 목표: 1순위(완벽 정답 이미지 수 최대화), 2순위(F1-Score 최대화)\n'
+               '- 탐색 범위: Conf(0.01~0.99), NMS IoU(0.15~0.85)\n'
+               '- 방식: 1차 넓은 범위 탐색 후 최적점 근처 2차 정밀 탐색\n\n'
+               '주의: 평가용 데이터셋이 너무 적으면 오버피팅될 수 있으므로 주의하세요.\n\n'
                '진행하시겠습니까?')
                 
         if QMessageBox.question(self, '스레숄드 탐색', msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
