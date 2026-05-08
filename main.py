@@ -280,45 +280,48 @@ def _auto_threshold_worker(args, queue):
     import time, traceback, numpy as np
     from pathlib import Path
     from ultralytics import YOLO
-    
+
     start_time = time.time()
     result = {"success": False, "task": "threshold", "error": "", "best_conf": 0.25, "best_iou": 0.45, "best_acc": 0.0, "msg": ""}
-    
+
     try:
         model_path = Path(args["model_path"])
         img_dir = Path(args["img_dir"])
         lbl_dir = Path(args["lbl_dir"])
-        match_iou_thr = args.get("match_iou", 0.50)
-        
+        match_iou_thr = max(args.get("match_iou", 0.50), 0.1) 
+        agnostic = args.get("agnostic", True)
+        max_det = args.get("max_det", 300)
+
         model = YOLO(str(model_path))
-        
+
         def calc_iou(b1, b2):
             x1_min, y1_min = b1[0] - b1[2]/2, b1[1] - b1[3]/2
             x1_max, y1_max = b1[0] + b1[2]/2, b1[1] + b1[3]/2
             x2_min, y2_min = b2[0] - b2[2]/2, b2[1] - b2[3]/2
             x2_max, y2_max = b2[0] + b2[2]/2, b2[1] + b2[3]/2
-            
+
             inter_xmin = max(x1_min, x2_min)
             inter_ymin = max(y1_min, y2_min)
             inter_xmax = min(x1_max, x2_max)
             inter_ymax = min(y1_max, y2_max)
-            
+
             if inter_xmax < inter_xmin or inter_ymax < inter_ymin:
                 return 0.0
-                
+
             inter_area = (inter_xmax - inter_xmin) * (inter_ymax - inter_ymin)
             box1_area = (x1_max - x1_min) * (y1_max - y1_min)
             box2_area = (x2_max - x2_min) * (y2_max - y2_min)
             union_area = box1_area + box2_area - inter_area
-            
+
             return inter_area / (union_area + 1e-6)
 
         img_files = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpeg"))
         total_imgs = len(img_files)
         if total_imgs == 0: raise ValueError("평가할 이미지가 없습니다.")
 
-        base_results = model.predict(source=[str(p) for p in img_files], conf=0.25, iou=0.45, verbose=False)
-        
+        # 가장 넓은 범위로 단 1번 예측 (모든 후보 박스 캐싱)
+        base_results = model.predict(source=[str(p) for p in img_files], conf=0.01, iou=0.99, max_det=max_det, agnostic_nms=False, verbose=False)
+
         gt_data = []
         for r in base_results:
             img_name = Path(r.path).name
@@ -330,31 +333,40 @@ def _auto_threshold_worker(args, queue):
                     if len(parts) == 5:
                         boxes.append({"class": int(parts[0]), "box": [float(x) for x in parts[1:]]})
             gt_data.append(boxes)
-            
-        def evaluate(test_conf, fixed_iou=0.45):
+
+        def simulate_prediction(test_conf, test_iou):
             total_tp, total_fp, total_fn = 0, 0, 0
-            per_image_results = []
-            
+            img_correct_count = 0
+
             for idx, r in enumerate(base_results):
                 valid_preds = []
                 for cls_t, box_t, conf_t in zip(r.boxes.cls, r.boxes.xywhn, r.boxes.conf):
                     if conf_t.item() >= test_conf:
-                        valid_preds.append({"class": int(cls_t.item()), "box": box_t.tolist(), "conf": conf_t.item()})
-                
+                        valid_preds.append({
+                            "class": int(cls_t.item()),
+                            "box": box_t.tolist(),
+                            "conf": conf_t.item()
+                        })
+
                 valid_preds.sort(key=lambda x: x["conf"], reverse=True)
-                
+
                 keep_preds = []
                 for vp in valid_preds:
                     keep = True
                     for kp in keep_preds:
-                        if calc_iou(vp["box"], kp["box"]) > fixed_iou:
-                            keep = False; break
-                    if keep: keep_preds.append(vp)
-                
+                        if agnostic or vp["class"] == kp["class"]:
+                            if calc_iou(vp["box"], kp["box"]) > test_iou:
+                                keep = False
+                                break
+                    if keep:
+                        keep_preds.append(vp)
+                        if len(keep_preds) >= max_det:
+                            break
+
                 gt_boxes = gt_data[idx]
                 matched_gt = set()
                 tp = fp = 0
-                
+
                 for pb in keep_preds:
                     best_iou, best_gt = 0.0, -1
                     for j, gb in enumerate(gt_boxes):
@@ -362,54 +374,73 @@ def _auto_threshold_worker(args, queue):
                         if pb["class"] != gb["class"]: continue
                         iou = calc_iou(pb["box"], gb["box"])
                         if iou > best_iou: best_iou, best_gt = iou, j
-                    
-                    match_threshold = max(match_iou_thr, 0.5)
-                    if best_iou >= match_threshold:
+
+                    if best_iou >= match_iou_thr:
                         tp += 1
                         matched_gt.add(best_gt)
                     else:
                         fp += 1
-                
+
                 fn = len(gt_boxes) - len(matched_gt)
                 total_tp += tp
                 total_fp += fp
                 total_fn += fn
-                
-                img_correct = (fp == 0 and fn == 0)
-                per_image_results.append(img_correct)
-                
-            image_accuracy = sum(per_image_results) / len(per_image_results) * 100 if per_image_results else 0.0
+
+                if fp == 0 and fn == 0:
+                    img_correct_count += 1
+
             precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
             recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
             f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-            
-            combined_score = (f1_score * 100 * 0.6 + image_accuracy * 0.4)
-            return combined_score, f1_score * 100, image_accuracy
 
-        best_acc, best_f1, best_img_acc = -1.0, 0.0, 0.0
+            return img_correct_count, f1_score * 100
+
+        best_img_correct = -1
+        best_f1 = -1.0
         best_conf = 0.25
-        
-        for c in np.arange(0.20, 0.81, 0.05):
-            combined, f1, img_acc = evaluate(c, fixed_iou=0.45)
-            if combined > best_acc: best_acc, best_conf, best_f1, best_img_acc = combined, c, f1, img_acc
-            
-        fine_start = max(0.20, best_conf - 0.10)
-        fine_end = min(0.80, best_conf + 0.10)
-        
-        for c in np.arange(fine_start, fine_end + 0.01, 0.01):
-            combined, f1, img_acc = evaluate(c, fixed_iou=0.45)
-            if combined > best_acc: best_acc, best_conf, best_f1, best_img_acc = combined, c, f1, img_acc
+        best_iou = 0.45
+
+        # 1차 Coarse Grid Search
+        for c in np.arange(0.10, 0.90, 0.05):
+            for i in np.arange(0.10, 0.90, 0.05):
+                img_correct, f1 = simulate_prediction(c, i)
+                if img_correct > best_img_correct or (img_correct == best_img_correct and f1 > best_f1):
+                    best_img_correct = img_correct
+                    best_f1 = f1
+                    best_conf = c
+                    best_iou = i
+
+        # 2차 Fine Grid Search
+        fine_c_start = max(0.01, best_conf - 0.05)
+        fine_c_end = min(0.99, best_conf + 0.05)
+        fine_i_start = max(0.01, best_iou - 0.05)
+        fine_i_end = min(0.99, best_iou + 0.05)
+
+        for c in np.arange(fine_c_start, fine_c_end + 0.01, 0.01):
+            for i in np.arange(fine_i_start, fine_i_end + 0.01, 0.01):
+                img_correct, f1 = simulate_prediction(c, i)
+                if img_correct > best_img_correct or (img_correct == best_img_correct and f1 > best_f1):
+                    best_img_correct = img_correct
+                    best_f1 = f1
+                    best_conf = c
+                    best_iou = i
 
         result["success"] = True
         result["best_conf"] = round(float(best_conf), 2)
-        result["best_iou"] = 0.45
+        result["best_iou"] = round(float(best_iou), 2)
         result["best_acc"] = round(float(best_f1), 1)
-        
+
         hours, rem = divmod(time.time() - start_time, 3600)
         mins, secs = divmod(rem, 60)
-        result["msg"] = f"🎯 최적 스레숄드 탐색 완료! (소요시간: {int(mins)}분 {int(secs)}초)\n\n📊 [최적 파라미터]\n- Confidence: {result['best_conf']}\n- NMS IoU: {result['best_iou']} (고정)\n\n✅ [성능 지표]\n- F1-Score: {result['best_acc']}%\n- 이미지 정확도: {round(best_img_acc, 1)}%\n- 종합 점수: {round(best_acc, 1)}%"
-        
-    except Exception as e:
+        result["msg"] = (f"🎯 최적 스레숄드 탐색 완료! (소요시간: {int(mins)}분 {int(secs)}초)\n\n"
+                         f"📊 [최적 파라미터]\n"
+                         f"- Confidence: {result['best_conf']}\n"
+                         f"- NMS IoU: {result['best_iou']}\n\n"
+                         f"✅ [성능 예측]\n"
+                         f"- 완벽하게 맞춘 이미지: {best_img_correct}장 / {total_imgs}장\n"
+                         f"- F1-Score: {result['best_acc']}%")
+
+    except Exception:
         result["error"] = traceback.format_exc()
     finally:
         clear_vram()
@@ -1746,7 +1777,7 @@ class MainWindow(QMainWindow):
         if not src_dir: return
         src_path = Path(src_dir); target_dir = Path(self.t6_img_dir.get_path()); target_dir.mkdir(parents=True, exist_ok=True); valid_exts = {".jpg", ".jpeg", ".png"}
         files_to_copy = [f for f in src_path.iterdir() if f.suffix.lower() in valid_exts]
-        if not files_to_copy: QMessageBox.warning(self, "파일 없음", "선택한 폴더에 이미지 파일이 무없습니다."); return
+        if not files_to_copy: QMessageBox.warning(self, "파일 없음", "선택한 폴더에 이미지 파일이 없습니다."); return
         copy_count = 0; QApplication.setOverrideCursor(Qt.WaitCursor) 
         try:
             for f in files_to_copy:
@@ -2041,7 +2072,7 @@ class MainWindow(QMainWindow):
         is_valid, err = self.validate_paths(평가모델_file=Path(self.t3_model.get_path()), 평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
         
-        msg = ('개발자님이 설정한 [정답 매칭 IoU] 기준에 맞춰, F1-Score(정밀도/재현율)를 최대로 만드는\n'
+        msg = ('설정된 [정답 매칭 IoU] 기준에 맞춰, F1-Score(정밀도/재현율)를 최대로 만드는\n'
                '최적의 Confidence 값을 탐색합니다.\n\n'
                '💡 최적 스레숄드 찾기 가이드:\n'
                '- Confidence: 0.20~0.80 범위에서 탐색\n'
@@ -2051,7 +2082,7 @@ class MainWindow(QMainWindow):
                '계속 진행하시겠습니까?')
         
         if QMessageBox.question(self, '스레숄드 탐색', msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
-        args = {"model_path": self.t3_model.get_path(), "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t3_match_iou.value()}
+        args = {"model_path": self.t3_model.get_path(), "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t3_match_iou.value(), "agnostic": self.t3_agnostic.isChecked(), "max_det": self.t3_max_det.value()}
         self.start_training_process(_auto_threshold_worker, args)
 
     def run_tab3(self):
@@ -2135,7 +2166,7 @@ class MainWindow(QMainWindow):
                
         if QMessageBox.question(self, '스레숄드 탐색', msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
         
-        args = {"model_path": model_path, "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t4_match_iou.value()}
+        args = {"model_path": model_path, "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t4_match_iou.value(), "agnostic": self.t4_agnostic.isChecked(), "max_det": self.t4_max_det.value()}
         self.start_training_process(_auto_threshold_worker, args)
 
     def run_tab4_retrain(self):
