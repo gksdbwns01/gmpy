@@ -2022,30 +2022,87 @@ class MainWindow(QMainWindow):
             self.t1_img_grid.update_images([str(f) for f in target_dir.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}])
             
     def setup_tab2(self):
-        f = QFormLayout(); self.t2_epochs = QSpinBox(); self.t2_epochs.setRange(1, 5000); self.t2_epochs.setValue(400); self.t2_batch = QSpinBox(); self.t2_batch.setRange(1, 256); self.t2_batch.setValue(16); self.t2_workers = QSpinBox(); self.t2_workers.setRange(0, 32); self.t2_workers.setValue(8); self.t2_patience = QSpinBox(); self.t2_patience.setRange(0, 10000); self.t2_patience.setValue(100); self.t2_seed = QSpinBox(); self.t2_seed.setRange(0, 999999); self.t2_seed.setValue(42); self.t2_folds = QSpinBox(); self.t2_folds.setRange(1, 10); self.t2_folds.setValue(5); self.t2_test_split = QDoubleSpinBox(); self.t2_test_split.setRange(0.05, 0.6); self.t2_test_split.setValue(0.2); self.t2_test_split.setSingleStep(0.05); self.t2_lcls = QDoubleSpinBox(); self.t2_lcls.setRange(0.1, 10.0); self.t2_lcls.setValue(0.5); self.t2_lcls.setSingleStep(0.1); self.t2_lbox = QDoubleSpinBox(); self.t2_lbox.setRange(0.1, 20.0); self.t2_lbox.setValue(7.5); self.t2_lbox.setSingleStep(0.5); self.t2_ldfl = QDoubleSpinBox(); self.t2_ldfl.setRange(0.1, 10.0); self.t2_ldfl.setValue(1.5); self.t2_ldfl.setSingleStep(0.1)
+        self.t2_epochs = QSpinBox(); self.t2_epochs.setRange(1, 5000); self.t2_epochs.setValue(400); self.t2_batch = QSpinBox(); self.t2_batch.setRange(1, 256); self.t2_batch.setValue(16); self.t2_workers = QSpinBox(); self.t2_workers.setRange(0, 32); self.t2_workers.setValue(8); self.t2_patience = QSpinBox(); self.t2_patience.setRange(0, 10000); self.t2_patience.setValue(100); self.t2_seed = QSpinBox(); self.t2_seed.setRange(0, 999999); self.t2_seed.setValue(42); self.t2_folds = QSpinBox(); self.t2_folds.setRange(1, 10); self.t2_folds.setValue(5); self.t2_test_split = QDoubleSpinBox(); self.t2_test_split.setRange(0.05, 0.6); self.t2_test_split.setValue(0.2); self.t2_test_split.setSingleStep(0.05); self.t2_lcls = QDoubleSpinBox(); self.t2_lcls.setRange(0.1, 10.0); self.t2_lcls.setValue(0.5); self.t2_lcls.setSingleStep(0.1); self.t2_lbox = QDoubleSpinBox(); self.t2_lbox.setRange(0.1, 20.0); self.t2_lbox.setValue(7.5); self.t2_lbox.setSingleStep(0.5); self.t2_ldfl = QDoubleSpinBox(); self.t2_ldfl.setRange(0.1, 10.0); self.t2_ldfl.setValue(1.5); self.t2_ldfl.setSingleStep(0.1)
         def make_dbl(rng, val, step): b = QDoubleSpinBox(); b.setRange(*rng); b.setDecimals(3 if step < 0.01 else 2); b.setSingleStep(step); b.setValue(val); return b
         self.t2_ah = make_dbl((0, 0.1), 0.015, 0.001); self.t2_as = make_dbl((0, 1.0), 0.7, 0.05); self.t2_av = make_dbl((0, 1.0), 0.4, 0.05); self.t2_adeg = make_dbl((0, 45.0), 0.0, 1.0); self.t2_atrans = make_dbl((0, 0.5), 0.1, 0.01); self.t2_ascale = make_dbl((0, 1.0), 0.5, 0.05); self.t2_ashear = make_dbl((0, 30.0), 0.0, 1.0); self.t2_afud = make_dbl((0, 1.0), 0.0, 0.05); self.t2_aflr = make_dbl((0, 1.0), 0.5, 0.05); self.t2_amos = make_dbl((0, 1.0), 1.0, 0.05); self.t2_amix = make_dbl((0, 1.0), 0.0, 0.05); self.t2_acp = make_dbl((0, 1.0), 0.0, 0.05)
         
         self.t2_tune_iterations = QSpinBox(); self.t2_tune_iterations.setRange(10, 300); self.t2_tune_iterations.setValue(30)
         
-        f.addRow(QLabel("<b>[기본 파라미터]</b>")); self.add_param(f, "Epochs", self.t2_epochs, 400); self.add_param(f, "Batch", self.t2_batch, 16); self.add_param(f, "Workers", self.t2_workers, 8); self.add_param(f, "Patience (조기 종료)", self.t2_patience, 100); self.add_param(f, "Random Seed", self.t2_seed, 42); self.add_param(f, "Fold 수", self.t2_folds, 5); self.add_param(f, "Test 분리 비율", self.t2_test_split, 0.2)
-        f.addRow(QLabel("<br><b>[Loss 가중치]</b>")); self.add_param(f, "cls", self.t2_lcls, 0.5); self.add_param(f, "box", self.t2_lbox, 7.5); self.add_param(f, "dfl", self.t2_ldfl, 1.5)
-        f.addRow(QLabel("<br><b>[데이터 증강]</b>")); self.add_param(f, "HSV(H)", self.t2_ah, 0.015); self.add_param(f, "HSV(S)", self.t2_as, 0.7); self.add_param(f, "HSV(V)", self.t2_av, 0.4); self.add_param(f, "Degrees", self.t2_adeg, 0.0); self.add_param(f, "Translate", self.t2_atrans, 0.1); self.add_param(f, "Scale", self.t2_ascale, 0.5); self.add_param(f, "Shear", self.t2_ashear, 0.0); self.add_param(f, "Flip UD", self.t2_afud, 0.0); self.add_param(f, "Flip LR", self.t2_aflr, 0.5); self.add_param(f, "Mosaic", self.t2_amos, 1.0); self.add_param(f, "Mixup", self.t2_amix, 0.0); self.add_param(f, "Copy-Paste", self.t2_acp, 0.0)
-        f.addRow(QLabel("<br><b>[Auto ML 최적화]</b>")); self.add_param(f, "튜닝 반복 횟수 (Iterations)", self.t2_tune_iterations, 30)
+        # 2열 배치를 위해 메인 수평 레이아웃 생성 및 좌/우 폼 레이아웃 분리
+        h_form = QHBoxLayout()
+        f_left = QFormLayout()
+        f_right = QFormLayout()
+
+        # [좌측 열] 기본 파라미터, Loss 가중치, Auto ML 최적화
+        f_left.addRow(QLabel("<b>[기본 파라미터]</b>"))
+        self.add_param(f_left, "Epochs", self.t2_epochs, 400)
+        self.add_param(f_left, "Batch", self.t2_batch, 16)
+        self.add_param(f_left, "Workers", self.t2_workers, 8)
+        self.add_param(f_left, "Patience (조기 종료)", self.t2_patience, 100)
+        self.add_param(f_left, "Random Seed", self.t2_seed, 42)
+        self.add_param(f_left, "Fold 수", self.t2_folds, 5)
+        self.add_param(f_left, "Test 분리 비율", self.t2_test_split, 0.2)
+        
+        f_left.addRow(QLabel("<br><b>[Loss 가중치]</b>"))
+        self.add_param(f_left, "cls", self.t2_lcls, 0.5)
+        self.add_param(f_left, "box", self.t2_lbox, 7.5)
+        self.add_param(f_left, "dfl", self.t2_ldfl, 1.5)
+        
+        f_left.addRow(QLabel("<br><b>[Auto ML 최적화]</b>"))
+        self.add_param(f_left, "튜닝 반복 횟수 (Iterations)", self.t2_tune_iterations, 30)
+
+        # [우측 열] 데이터 증강
+        f_right.addRow(QLabel("<b>[데이터 증강]</b>"))
+        self.add_param(f_right, "HSV(H)", self.t2_ah, 0.015)
+        self.add_param(f_right, "HSV(S)", self.t2_as, 0.7)
+        self.add_param(f_right, "HSV(V)", self.t2_av, 0.4)
+        self.add_param(f_right, "Degrees", self.t2_adeg, 0.0)
+        self.add_param(f_right, "Translate", self.t2_atrans, 0.1)
+        self.add_param(f_right, "Scale", self.t2_ascale, 0.5)
+        self.add_param(f_right, "Shear", self.t2_ashear, 0.0)
+        self.add_param(f_right, "Flip UD", self.t2_afud, 0.0)
+        self.add_param(f_right, "Flip LR", self.t2_aflr, 0.5)
+        self.add_param(f_right, "Mosaic", self.t2_amos, 1.0)
+        self.add_param(f_right, "Mixup", self.t2_amix, 0.0)
+        self.add_param(f_right, "Copy-Paste", self.t2_acp, 0.0)
+        
+        # 좌우 레이아웃을 메인 수평 레이아웃에 추가
+        h_form.addLayout(f_left)
+        h_form.addLayout(f_right)
         
         self.t2_btn_tune = QPushButton("🤖 최적 파라미터 자동 탐색 (Auto ML)")
         self.t2_btn_tune.setStyleSheet("background-color: #dbeafe; border: 1px solid #93c5fd; padding: 8px; font-weight: bold; color: #1e3a8a;")
         self.t2_btn_tune.clicked.connect(self.run_auto_tune)
-        self.t2_btn_run = QPushButton("🚀 K-Fold 학습 시작"); self.t2_btn_run.clicked.connect(self.run_tab2); self.t2_btn_stop = QPushButton("🛑 강제 종료"); self.t2_btn_stop.clicked.connect(self.stop_training); self.t2_btn_stop.setEnabled(False)
         
-        l = QVBoxLayout(); self.t2_scroll = self._create_scroll(f); l.addWidget(self.t2_scroll)
+        self.t2_btn_run = QPushButton("🚀 K-Fold 학습 시작")
+        self.t2_btn_run.clicked.connect(self.run_tab2)
         
-        self.t2_btn_reset = QPushButton("🔄 이 탭 초기화"); self.t2_btn_reset.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 5px; border-radius: 4px;")
+        self.t2_btn_stop = QPushButton("🛑 강제 종료")
+        self.t2_btn_stop.clicked.connect(self.stop_training)
+        self.t2_btn_stop.setEnabled(False)
+        
+        l = QVBoxLayout()
+        # _create_scroll에 2열로 합친 QHBoxLayout(h_form)을 통째로 넘김
+        self.t2_scroll = self._create_scroll(h_form)
+        l.addWidget(self.t2_scroll)
+        
+        self.t2_btn_reset = QPushButton("🔄 이 탭 초기화")
+        self.t2_btn_reset.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 5px; border-radius: 4px;")
         self.t2_btn_reset.clicked.connect(lambda _, w=self.t2_scroll: self.reset_tab_defaults(w, "K-Fold 학습"))
         
-        h_tune = QHBoxLayout(); h_tune.addWidget(self.t2_btn_tune); l.addLayout(h_tune)
-        h = QHBoxLayout(); h.addWidget(self.t2_btn_run); h.addWidget(self.t2_btn_stop); h.addWidget(self.t2_btn_reset); l.addLayout(h); tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "🏋️ K-Fold 학습")
-
+        h_tune = QHBoxLayout()
+        h_tune.addWidget(self.t2_btn_tune)
+        l.addLayout(h_tune)
+        
+        h = QHBoxLayout()
+        h.addWidget(self.t2_btn_run)
+        h.addWidget(self.t2_btn_stop)
+        h.addWidget(self.t2_btn_reset)
+        l.addLayout(h)
+        
+        tab = QWidget()
+        tab.setLayout(l)
+        self.tabs.addTab(tab, "🏋️ K-Fold 학습")
     def run_auto_tune(self):
         if self.training_process and self.training_process.is_alive(): 
             QMessageBox.warning(self, "경고", "이미 진행 중인 프로세스가 있습니다.")
