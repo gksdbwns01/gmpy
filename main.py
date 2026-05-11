@@ -550,6 +550,7 @@ def _kfold_train_worker(args, queue):
             dst = kfold_base / "best_model.pt"
             if src.exists():
                 shutil.copy(src, dst)
+                (kfold_base / "best_model_source.txt").write_text(str(src), encoding="utf-8") # 원본 경로 기록 추가
                 hours, rem = divmod(time.time() - start_time, 3600); mins, secs = divmod(rem, 60)
                 time_str = f"{int(hours)}시간 {int(mins)}분 {int(secs)}초" if hours else f"{int(mins)}분 {int(secs)}초"
                 result["success"] = True
@@ -1344,7 +1345,7 @@ class ConfigViewerDialog(QDialog):
 
 class LogViewerDialog(QDialog):
     def __init__(self, db_manager, parent=None):
-        super().__init__(parent); self.setWindowTitle("📊 프로젝트 통합 히스토리 (DB)"); self.resize(1000, 500); self.db_manager = db_manager
+        super().__init__(parent); self.setWindowTitle("📊 프로젝트 통합 히스토리 (DB)"); self.resize(1600, 700); self.db_manager = db_manager
         layout = QVBoxLayout(self); self.tabs = QTabWidget(); layout.addWidget(self.tabs)
         self.train_tab = QWidget(); train_layout = QVBoxLayout(self.train_tab)
         self.train_table = QTableWidget(); self.train_table.setColumnCount(8); self.train_table.setHorizontalHeaderLabels(["일시", "유형", "사용 모델", "Epochs", "Batch", "최고 mAP", "저장 경로", "상세 설정"]); self.setup_table(self.train_table); self.train_table.itemDoubleClicked.connect(self.on_train_table_double_clicked)
@@ -1377,6 +1378,7 @@ class LogViewerDialog(QDialog):
                 elif c_idx == 7: item.setForeground(QColor("blue")); font = QFont(); font.setUnderline(True); item.setFont(font)
                 self.eval_table.setItem(r_idx, c_idx, item)
         self.eval_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.eval_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
 
     def on_train_table_double_clicked(self, item):
         if item.column() == 7:
@@ -2361,7 +2363,16 @@ class MainWindow(QMainWindow):
             self.t3_table.setItem(i, 0, QTableWidgetItem(str(row["파일명"]))); self.t3_table.setItem(i, 1, QTableWidgetItem(str(row["상태"]))); self.t3_table.setItem(i, 2, QTableWidgetItem(str(row["예측 수"]))); self.t3_table.setItem(i, 3, QTableWidgetItem(str(row["정답 수"]))); self.t3_table.setItem(i, 4, QTableWidgetItem(str(row["사유"])))
             for col in range(5): self.t3_table.item(i, col).setTextAlignment(Qt.AlignCenter)
         self.t3_table.setSortingEnabled(True); self.t3_chk_show_all.setEnabled(True); self.t3_chk_show_all.blockSignals(True); self.t3_chk_show_all.setChecked(False); self.t3_chk_show_all.blockSignals(False); self.update_tab3_visualization()
-        self.log_db.insert_eval_log(task_type="Tab 3 Eval", model_name=Path(self.t3_model.get_path()).name, total=stats['total'], wrong=stats['wrong'], accuracy=stats['acc'], wrong_imgs_list=wrong_imgs, config_data=self.config_builder.build(self))
+        
+        eval_path = self.t3_model.get_path()
+        display_name = Path(eval_path).name
+        if display_name == "best_model.pt":
+            source_txt = Path(eval_path).parent / "best_model_source.txt"
+            if source_txt.exists():
+                display_name += f" (원본: {source_txt.read_text(encoding='utf-8').strip()})"
+                
+        model_name_with_path = f"{display_name}  |  {eval_path}"
+        self.log_db.insert_eval_log(task_type="Tab 3 Eval", model_name=model_name_with_path, total=stats['total'], wrong=stats['wrong'], accuracy=stats['acc'], wrong_imgs_list=wrong_imgs, config_data=self.config_builder.build(self))
         
         QMessageBox.information(self, "평가 완료", f"총 {stats['total']}장 중 {stats['correct']}장 완벽 일치, {stats['wrong']}장 이상 발생\n\n[객체 단위 검출 성능]\n- 정밀도(Precision): {stats.get('precision', 0):.1f}%\n- 재현율(Recall): {stats.get('recall', 0):.1f}%\n- F1-Score: {stats.get('f1_score', stats['acc']):.1f}%")
         
@@ -2472,7 +2483,16 @@ class MainWindow(QMainWindow):
             self.t4_table.setItem(i, 0, QTableWidgetItem(str(row["파일명"]))); self.t4_table.setItem(i, 1, QTableWidgetItem(str(row["상태"]))); self.t4_table.setItem(i, 2, QTableWidgetItem(str(row["예측 수"]))); self.t4_table.setItem(i, 3, QTableWidgetItem(str(row["정답 수"]))); self.t4_table.setItem(i, 4, QTableWidgetItem(str(row["사유"])))
             for col in range(5): self.t4_table.item(i, col).setTextAlignment(Qt.AlignCenter)
         self.t4_table.setSortingEnabled(True); self.t4_chk_show_all.setEnabled(True); self.t4_chk_show_all.blockSignals(True); self.t4_chk_show_all.setChecked(False); self.t4_chk_show_all.blockSignals(False); self.update_tab4_visualization()
-        self.log_db.insert_eval_log(task_type="Tab 4 Final Eval", model_name=Path(self.t4_eval_model_display.text()).name, total=stats['total'], wrong=stats['wrong'], accuracy=stats['acc'], wrong_imgs_list=wrong_imgs, config_data=self.config_builder.build(self))
+        
+        eval_path = self.t4_eval_model_display.text()
+        display_name = Path(eval_path).name
+        if display_name == "best_model.pt":
+            source_txt = Path(eval_path).parent / "best_model_source.txt"
+            if source_txt.exists():
+                display_name += f" (원본: {source_txt.read_text(encoding='utf-8').strip()})"
+                
+        model_name_with_path = f"{display_name}  |  {eval_path}"
+        self.log_db.insert_eval_log(task_type="Tab 4 Final Eval", model_name=model_name_with_path, total=stats['total'], wrong=stats['wrong'], accuracy=stats['acc'], wrong_imgs_list=wrong_imgs, config_data=self.config_builder.build(self))
         QMessageBox.information(self, "완료", f"총 {stats['total']}장 중 {stats['correct']}장 완벽 일치, {stats['wrong']}장 이상 발생\n\n[객체 단위 검출 성능]\n- 정밀도(Precision): {stats.get('precision', 0):.1f}%\n- 재현율(Recall): {stats.get('recall', 0):.1f}%\n- F1-Score: {stats.get('f1_score', stats['acc']):.1f}%")
 
     def update_tab4_visualization(self):
