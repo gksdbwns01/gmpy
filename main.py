@@ -157,7 +157,8 @@ def send_discord_webhook(webhook_url, content):
     import requests
     try: 
         requests.post(webhook_url, json={"content": content}, timeout=5)
-        logger.debug("디스코드 웹훅 알림 전송 완료")
+        log_content = content.replace('\n', ' ')  # 로그가 여러 줄로 깨지지 않게 줄바꿈을 공백으로 치환
+        logger.debug(f"디스코드 웹훅 알림 전송 완료 (내용: {log_content})")
     except Exception as e: 
         logger.error(f"디스코드 웹훅 전송 실패: {e}")
 
