@@ -51,28 +51,6 @@ def setup_logger():
     return logger
 
 logger = setup_logger()
-
-# 선택된 프로젝트별(Project) 전용 로거 할당 함수
-def change_project_logger(workspace_path):
-    log_dir = Path(workspace_path) / "logs"
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        # 기존 프로젝트 핸들러가 있으면 제거 (중복 기록 방지)
-        for handler in logger.handlers[:]:
-            if getattr(handler, 'is_project_handler', False):
-                logger.removeHandler(handler)
-                
-        # 새 프로젝트 전용 로그 핸들러 추가
-        project_handler = RotatingFileHandler(log_dir / "project_task.log", maxBytes=5*1024*1024, backupCount=3, encoding='utf-8')
-        project_handler.setLevel(logging.DEBUG)
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(funcName)s - %(message)s')
-        project_handler.setFormatter(formatter)
-        project_handler.is_project_handler = True # 식별용 태그
-        
-        logger.addHandler(project_handler)
-        logger.info(f"📁 프로젝트 전용 로그 경로 연동 완료: {log_dir / 'project_task.log'}")
-    except Exception as e:
-        logger.error(f"프로젝트 로거 설정 실패: {e}")
 # ==========================================
 
 def clear_vram():
@@ -1570,7 +1548,6 @@ class MainWindow(QMainWindow):
 
     def sync_work_paths(self, new_path):
         if hasattr(self, 't3_model'): self.t3_model.line_edit.setText(str(Path(new_path) / "kfold" / "best_model.pt"))
-        change_project_logger(new_path) # 워크스페이스 경로가 바뀔 때마다 프로젝트 로그 스위칭
 
     def parse_and_validate_class_map(self, text):
         cmap = {}; lines = [line.strip() for line in text.strip().split('\n') if line.strip()]
@@ -1698,9 +1675,6 @@ class MainWindow(QMainWindow):
         g_layout.addLayout(path_layout, 5); g_layout.addSpacing(20); g_layout.addLayout(right_layout, 5); g_group.setLayout(g_layout); main_layout.addWidget(g_group)
         self.tabs = QTabWidget(); main_layout.addWidget(self.tabs); self.setup_tab6(); self.setup_tab1(); self.setup_tab2(); self.setup_tab3(); self.setup_tab4(); self.setup_tab5()
         self.w_base_ds.line_edit.textChanged.connect(self.sync_base_paths); self.w_proc_ds.line_edit.textChanged.connect(self.sync_proc_paths); self.w_proj_root.line_edit.textChanged.connect(self.sync_project_root); self.w_work_ds.line_edit.textChanged.connect(self.sync_work_paths)
-        
-        # 프로그램 시작 시 최초 프로젝트 로그 파일 연결
-        change_project_logger(self.w_work_ds.get_path())
 
     def show_log_viewer(self): LogViewerDialog(self.log_db, self).exec_()
 
@@ -2090,10 +2064,7 @@ class MainWindow(QMainWindow):
                 zf.writestr("config.json", json.dumps(final_json_data, ensure_ascii=False, indent=4))
                 if has_base: zf.write(t3_model, "base_model.pt")
                 if has_retrained: zf.write(t4_model, "retrained_model.pt")
-                # 로그 파일 추가
-                proj_log = Path(self.w_work_ds.get_path()) / "logs" / "project_task.log"
-                if proj_log.exists(): zf.write(str(proj_log), "project_task.log")
-            logger.info("프로젝트 백업 압축 완료 (로그 파일 포함)")
+            logger.info("프로젝트 백업 압축 완료")
             QMessageBox.information(self, "내보내기 완료", f"저장되었습니다:\n{save_path}"); self.statusBar().showMessage(f"✅ 프로젝트 내보내기 완료: {Path(save_path).name}", 5000)
         except Exception as e: 
             logger.error(f"프로젝트 내보내기 중 오류 발생: {e}", exc_info=True)
@@ -2117,8 +2088,7 @@ class MainWindow(QMainWindow):
             if base_model.exists() or legacy_model.exists():
                 model_path_str = str((base_model if base_model.exists() else legacy_model).resolve()); self.t3_model.line_edit.setText(model_path_str); self.t4_base.line_edit.setText(model_path_str); self.t5_model.line_edit.setText(model_path_str)
             if retrained_model.exists(): retrained_path_str = str(retrained_model.resolve()); self.t4_eval_model_display.setText(retrained_path_str); self.t4_btn_eval.setEnabled(True); self.t4_btn_auto_thr.setEnabled(True); self.t5_model.line_edit.setText(retrained_path_str)
-            self.config_manager.update_workspace_path(str(new_proj_path / "workspace")); 
-            change_project_logger(str(new_proj_path / "workspace"))
+            self.config_manager.update_workspace_path(str(new_proj_path / "workspace"))
             QApplication.restoreOverrideCursor()
             if is_renamed: 
                 logger.warning(f"복구 경로 이름이 중복되어 변경되었습니다. 기존: {original_name}, 새이름: {new_proj_path.name}")
