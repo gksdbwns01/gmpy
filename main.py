@@ -1,5 +1,7 @@
 import sys, os, json, shutil, math, time, platform, multiprocessing, signal, re, gc, traceback, sqlite3
 import queue as qlib
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime, timedelta
 import zipfile, cv2, numpy as np, pandas as pd, psutil, torch, yaml
@@ -19,11 +21,66 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
 
+# ==========================================
+# 로깅(Logging) 설정
+# ==========================================
+def setup_logger():
+    logger = logging.getLogger("YOLO_Pipeline")
+    logger.setLevel(logging.DEBUG)
+    
+    base_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
+    log_dir = base_dir / "logs"
+    log_dir.mkdir(exist_ok=True)
+    
+    # 1. 전역(Global) 앱 로그 (프로그램 구동 전체 이력)
+    file_handler = RotatingFileHandler(log_dir / "app.log", maxBytes=5*1024*1024, backupCount=3, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    
+    # 2. 콘솔 핸들러
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(funcName)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    if not logger.handlers:
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+        
+    return logger
+
+logger = setup_logger()
+
+# 선택된 프로젝트별(Project) 전용 로거 할당 함수
+def change_project_logger(workspace_path):
+    log_dir = Path(workspace_path) / "logs"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        # 기존 프로젝트 핸들러가 있으면 제거 (중복 기록 방지)
+        for handler in logger.handlers[:]:
+            if getattr(handler, 'is_project_handler', False):
+                logger.removeHandler(handler)
+                
+        # 새 프로젝트 전용 로그 핸들러 추가
+        project_handler = RotatingFileHandler(log_dir / "project_task.log", maxBytes=5*1024*1024, backupCount=3, encoding='utf-8')
+        project_handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(funcName)s - %(message)s')
+        project_handler.setFormatter(formatter)
+        project_handler.is_project_handler = True # 식별용 태그
+        
+        logger.addHandler(project_handler)
+        logger.info(f"📁 프로젝트 전용 로그 경로 연동 완료: {log_dir / 'project_task.log'}")
+    except Exception as e:
+        logger.error(f"프로젝트 로거 설정 실패: {e}")
+# ==========================================
+
 def clear_vram():
     gc.collect()
     try:
         if torch.cuda.is_available(): torch.cuda.empty_cache()
-    except Exception: pass
+    except Exception as e: 
+        logger.error(f"VRAM 정리 중 오류 발생: {e}")
 
 class ConfigManager:
     def __init__(self, base_dir):
@@ -47,15 +104,23 @@ class ConfigManager:
             file_path = self.config_dir / f"{config_name}.json"
             final_data = {"metadata": {"saved_at": timestamp, "version": "1.0", "name": config_name}, "config": config_data}
             with open(file_path, 'w', encoding='utf-8') as f: json.dump(final_data, f, indent=4, ensure_ascii=False)
+            logger.info(f"설정 저장 성공: {file_path}")
             return True, str(file_path)
-        except PermissionError: return False, f"쓰기 권한이 없습니다:\n{self.config_dir}"
-        except Exception as e: return False, str(e)
+        except PermissionError: 
+            logger.error(f"설정 저장 실패 (쓰기 권한 없음): {self.config_dir}")
+            return False, f"쓰기 권한이 없습니다:\n{self.config_dir}"
+        except Exception as e: 
+            logger.error(f"설정 저장 중 예외 발생: {e}", exc_info=True)
+            return False, str(e)
 
     def load_config(self, file_path):
         try:
             with open(file_path, 'r', encoding='utf-8') as f: data = json.load(f)
+            logger.info(f"설정 불러오기 성공: {file_path}")
             return True, data.get("config", {})
-        except Exception as e: return False, str(e)
+        except Exception as e: 
+            logger.error(f"설정 불러오기 실패 ({file_path}): {e}", exc_info=True)
+            return False, str(e)
 
     def get_all_configs(self):
         return sorted(list(self.config_dir.glob("*.json")), key=os.path.getmtime, reverse=True)
@@ -86,6 +151,7 @@ class LogDatabase:
             conn.commit()
 
     def insert_log(self, task_type, model_name, epochs, batch, best_map, save_dir, config_data):
+        logger.debug(f"DB에 로그 삽입 중: {task_type}, {model_name}")
         self._ensure_db()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('INSERT INTO training_logs (timestamp, task_type, model_name, epochs, batch_size, best_map, save_dir, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), task_type, model_name, epochs, batch, best_map, save_dir, json.dumps(config_data, ensure_ascii=False)))
@@ -97,6 +163,7 @@ class LogDatabase:
         with sqlite3.connect(self.db_path) as conn: return conn.execute('SELECT timestamp, task_type, model_name, epochs, batch_size, best_map, save_dir, config_json FROM training_logs ORDER BY id DESC').fetchall()
 
     def insert_eval_log(self, task_type, model_name, total, wrong, accuracy, wrong_imgs_list, config_data):
+        logger.debug(f"DB에 평가 로그 삽입 중: {task_type}, {model_name}")
         self._ensure_db()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('INSERT INTO evaluation_logs (timestamp, task_type, model_name, total_imgs, wrong_count, accuracy, wrong_images, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), task_type, model_name, total, wrong, accuracy, json.dumps([Path(p).name for p in wrong_imgs_list], ensure_ascii=False), json.dumps(config_data, ensure_ascii=False)))
@@ -110,8 +177,11 @@ class LogDatabase:
 def send_discord_webhook(webhook_url, content):
     if not webhook_url or not webhook_url.startswith("http"): return
     import requests
-    try: requests.post(webhook_url, json={"content": content}, timeout=5)
-    except Exception: pass
+    try: 
+        requests.post(webhook_url, json={"content": content}, timeout=5)
+        logger.debug("디스코드 웹훅 알림 전송 완료")
+    except Exception as e: 
+        logger.error(f"디스코드 웹훅 전송 실패: {e}")
 
 def create_heartbeat_callback(webhook_url, total_epochs, interval):
     if interval <= 0: return lambda trainer: None
@@ -391,7 +461,6 @@ def _auto_threshold_worker(args, queue):
         best_conf = 0.25
         best_iou = 0.45
 
-        print("🔍 1차 Coarse 스레숄드 탐색 중...")
         for c in [0.1, 0.3, 0.5, 0.7, 0.9]:
             for i in [0.3, 0.5, 0.7]:
                 img_correct, f1 = evaluate_real_yolo(c, i)
@@ -401,7 +470,6 @@ def _auto_threshold_worker(args, queue):
                     best_conf = c
                     best_iou = i
 
-        print(f"🎯 2차 Fine 탐색 중... (기준점: Conf {best_conf:.2f}, IoU {best_iou:.2f})")
         fine_c_start = max(0.01, best_conf - 0.15)
         fine_c_end = min(0.99, best_conf + 0.15)
         fine_i_start = max(0.01, best_iou - 0.15)
@@ -565,26 +633,36 @@ class ProcessMonitorThread(QThread):
     finished_ok = pyqtSignal(dict); error = pyqtSignal(str)
     def __init__(self, queue, process): super().__init__(); self.queue = queue; self.process = process
     def run(self):
+        logger.info("프로세스 모니터링 스레드 시작")
         while self.process.is_alive():
             try: self.finished_ok.emit(self.queue.get(timeout=0.5)); return
             except qlib.Empty: continue
         try: self.finished_ok.emit(self.queue.get(timeout=1.0))
         except qlib.Empty:
-            if self.process.exitcode != 0: self.error.emit(f"프로세스 비정상 종료 (Exit Code: {self.process.exitcode})")
+            if self.process.exitcode != 0: 
+                error_msg = f"프로세스 비정상 종료 (Exit Code: {self.process.exitcode})"
+                logger.error(error_msg)
+                self.error.emit(error_msg)
 
 class PreprocessThread(QThread):
     progress = pyqtSignal(int); log_msg = pyqtSignal(str); finished_ok = pyqtSignal(int); error = pyqtSignal(str)
     def __init__(self, config): super().__init__(); self.config = config
     def run(self):
+        logger.info("데이터 전처리 스레드 실행 시작")
         try:
             from PIL import Image as PILImage, ImageOps, ImageDraw
             c = self.config; label_dir, image_dir = Path(c["base_dir"]) / "data", Path(c["base_dir"]) / "image"
             out_img, out_lbl = Path(c["processed_dir"]) / "images", Path(c["processed_dir"]) / "labels"
             out_preview = Path(c["processed_dir"]) / "preview"
             
-            if not label_dir.is_dir(): return self.error.emit(f"라벨 폴더 누락: {label_dir}")
+            logger.debug(f"전처리 소스: 이미지({image_dir}), 라벨({label_dir})")
+            if not label_dir.is_dir(): 
+                logger.error(f"라벨 폴더 누락: {label_dir}")
+                return self.error.emit(f"라벨 폴더 누락: {label_dir}")
 
             label_files = list(label_dir.glob("*.json")) + list(label_dir.glob("*.txt"))
+            logger.info(f"총 {len(label_files)}개의 라벨 파일 발견")
+            
             if c["use_auto_crop"]:
                 min_x = min_y = float("inf"); max_x = max_y = 0.0
                 for lf in label_files:
@@ -613,8 +691,13 @@ class PreprocessThread(QThread):
                     crop_w, crop_h = int((max_x + c["margin"]) - crop_x), int((max_y + c["margin"]) - crop_y)
             else: crop_x, crop_y, crop_w, crop_h = c["manual_crop"]
 
-            self.log_msg.emit(f"✂️ 크롭 영역 확정 → X={crop_x}, Y={crop_y}, W={crop_w}, H={crop_h}")
-            if c["clean_old"] and Path(c["processed_dir"]).exists(): shutil.rmtree(c["processed_dir"])
+            log_msg = f"✂️ 크롭 영역 확정 → X={crop_x}, Y={crop_y}, W={crop_w}, H={crop_h}"
+            logger.info(log_msg)
+            self.log_msg.emit(log_msg)
+            
+            if c["clean_old"] and Path(c["processed_dir"]).exists(): 
+                logger.debug(f"기존 출력 폴더 초기화: {c['processed_dir']}")
+                shutil.rmtree(c["processed_dir"])
             
             out_img.mkdir(parents=True, exist_ok=True); out_lbl.mkdir(parents=True, exist_ok=True)
             out_preview.mkdir(parents=True, exist_ok=True)
@@ -682,11 +765,15 @@ class PreprocessThread(QThread):
                     preview_img.save(out_preview / img_id)
                     
                     img.close(); ok_count += 1; self.progress.emit(int((i + 1) / len(label_files) * 100))
-                except Exception: continue
+                except Exception as ex: 
+                    logger.debug(f"파일 처리 실패 ({img_id}): {ex}")
+                    continue
 
+            logger.info(f"전처리 성공적으로 완료됨 (총 {ok_count}장)")
             if c.get("webhook_url") and c.get("noti_flags", {}).get("task"): send_discord_webhook(c["webhook_url"], f"✂️ **[데이터 전처리 완료]**\n총 {ok_count}장 처리 완료!")
             self.finished_ok.emit(ok_count)
         except Exception as e:
+            logger.error(f"전처리 중 오류 발생: {e}", exc_info=True)
             if c.get("webhook_url") and c.get("noti_flags", {}).get("error"): send_discord_webhook(c["webhook_url"], f"❌ **[전처리 에러]**\n{str(e)[:500]}")
             self.error.emit(traceback.format_exc())
 
@@ -694,10 +781,13 @@ class EvalThread(QThread):
     finished_ok = pyqtSignal(pd.DataFrame, list, list, dict); error = pyqtSignal(str)
     def __init__(self, config): super().__init__(); self.config = config
     def run(self):
+        logger.info("평가 스레드 실행 시작")
         try:
             from ultralytics import YOLO
             c = self.config; eval_project_dir = Path(c["workspace_dir"]) / "runs" / "eval"
             relabel_dir = eval_project_dir / f"{c['eval_run_name']}_needs_relabel"
+            logger.debug(f"평가 대상 모델: {c['eval_model_path']}, 소스: {c['eval_source']}")
+            
             if c["save_relabel"]:
                 if relabel_dir.exists(): shutil.rmtree(relabel_dir)
                 relabel_dir.mkdir(parents=True, exist_ok=True)
@@ -775,12 +865,14 @@ class EvalThread(QThread):
                 "relabel_dir": str(relabel_dir) if c["save_relabel"] else ""
             }
             
+            logger.info(f"평가 스레드 완료 (F1-Score: {f1_score*100:.1f}%)")
             if c.get("webhook_url") and c.get("noti_flags", {}).get("task"): 
                 send_discord_webhook(c["webhook_url"], f"🔍 **[평가 선별 완료]**\n총 {stats['total']}장 중 {stats['wrong']}장 오답 발견\n성능 지표: 정밀도 {stats['precision']:.1f}%, 재현율 {stats['recall']:.1f}%, F1-Score {stats['f1_score']:.1f}%")
             
             del model; clear_vram()
             self.finished_ok.emit(pd.DataFrame(rows).sort_values("상태"), wrong_imgs, all_imgs, stats)
         except Exception as e:
+            logger.error(f"평가 스레드 중 오류 발생: {e}", exc_info=True)
             if c.get("webhook_url") and c.get("noti_flags", {}).get("error"): send_discord_webhook(c["webhook_url"], f"❌ **[평가 에러]**\n{str(e)[:500]}")
             self.error.emit(traceback.format_exc())
 
@@ -788,6 +880,7 @@ class Tab4FinalEvalThread(QThread):
     finished_ok = pyqtSignal(pd.DataFrame, list, list, dict, str); error = pyqtSignal(str)
     def __init__(self, config): super().__init__(); self.config = config
     def run(self):
+        logger.info("Tab4 최종 평가 스레드 실행 시작")
         try:
             from ultralytics import YOLO
             c = self.config; model = YOLO(str(c["retrained_model"]))
@@ -799,6 +892,7 @@ class Tab4FinalEvalThread(QThread):
             eval_thread.finished_ok.connect(lambda df, imgs, a_imgs, st: self.finished_ok.emit(df, imgs, a_imgs, st, pr_curve))
             eval_thread.error.connect(self.error.emit); eval_thread.run()
         except Exception as e:
+            logger.error(f"최종 평가 중 오류 발생: {e}", exc_info=True)
             if self.config.get("webhook_url") and self.config.get("noti_flags", {}).get("error"): send_discord_webhook(self.config["webhook_url"], f"❌ **[재학습 평가 에러]**\n{str(e)[:500]}")
             self.error.emit(traceback.format_exc())
 
@@ -807,9 +901,11 @@ class MeasureThread(QThread):
     COLOR_MAP = {"노란색 (Yellow)": (0, 255, 255), "초록색 (Green)": (0, 255, 0), "빨간색 (Red)": (0, 0, 255), "파란색 (Blue)": (255, 0, 0), "청록색 (Cyan)": (255, 255, 0), "자주색 (Magenta)": (255, 0, 255), "흰색 (White)": (255, 255, 255)}
     def __init__(self, config): super().__init__(); self.config = config
     def run(self):
+        logger.info("거리 측정 스레드 실행 시작")
         try:
             from ultralytics import YOLO
             c = self.config; dist_source = Path(c["dist_source"])
+            logger.debug(f"측정 모델: {c['dist_model_path']}, 방식: {c['measure_method']}")
             is_edge, is_knn = c["measure_method"] == "테두리 최단거리 (Edge)", c["measure_method"] == "가장 가까운 N개 이웃 (방향 무관)"
             c1 = self.COLOR_MAP.get(c.get("color1", "노란색 (Yellow)"), (0, 255, 255)); c2 = self.COLOR_MAP.get(c.get("color2", "청록색 (Cyan)"), (255, 255, 0))
             dist_run_name = "ok_edge_distance" if is_edge else "ok_knn_distance" if is_knn else "ok_euclidean_distance"
@@ -907,10 +1003,12 @@ class MeasureThread(QThread):
                 if outliers_list: pd.concat(outliers_list, ignore_index=True).to_csv(final_save_dir / f"{dist_run_name}_outliers.csv", index=False, encoding="utf-8-sig")
 
             df_outliers = pd.concat(outliers_list, ignore_index=True) if outliers_list else pd.DataFrame()
+            logger.info(f"거리 측정 완료. 이상치 {len(df_outliers)}건 발견")
             if c.get("webhook_url") and c.get("noti_flags", {}).get("task"): send_discord_webhook(c["webhook_url"], f"📏 **[거리 측정 완료]**\n총 {len(df_export)}건 측정 (이상치 {len(df_outliers)}건 발견)")
             del model; clear_vram()
             self.finished_ok.emit(df_export, df_parsed, df_outliers, image_pairs)
         except Exception as e:
+            logger.error(f"측정 스레드 중 오류 발생: {e}", exc_info=True)
             if self.config.get("webhook_url") and self.config.get("noti_flags", {}).get("error"): send_discord_webhook(self.config["webhook_url"], f"❌ **[측정 에러]**\n{str(e)[:500]}")
             self.error.emit(traceback.format_exc())
 
@@ -1422,24 +1520,39 @@ class ImageGridWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__(); self.setWindowTitle("YOLO Training Pipeline (PyQt5) - AutoML + Auto Early Stop"); self.resize(1400, 900)
+        logger.info("YOLO Training Pipeline 애플리케이션 시작")
         self.base_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
         default_proj_path = self.base_dir / "MyProject"; self.config_manager = ConfigManager(str(default_proj_path)); self.config_builder = ConfigBuilder()
         self.log_db = LogDatabase(self.base_dir / "MyProject" / "workspace" / "training_history.db"); self.training_process = None; self.init_ui()
 
     def validate_paths(self, **paths):
         for name, path_obj in paths.items():
-            if not path_obj.exists(): return False, f"[{name}] 경로를 찾을 수 없습니다: {path_obj}"
-            if name.endswith('_file') and not path_obj.is_file(): return False, f"[{name}]은(는) 파일이어야 합니다: {path_obj}"
-            if name.endswith('_dir') and not path_obj.is_dir(): return False, f"[{name}]은(는) 폴더여야 합니다: {path_obj}"
+            logger.debug(f"경로 검증 중: {name} -> {path_obj}")
+            if not path_obj.exists(): 
+                logger.warning(f"경로 검증 실패 (존재하지 않음): {name} -> {path_obj}")
+                return False, f"[{name}] 경로를 찾을 수 없습니다: {path_obj}"
+            if name.endswith('_file') and not path_obj.is_file(): 
+                logger.warning(f"경로 검증 실패 (파일 아님): {name} -> {path_obj}")
+                return False, f"[{name}]은(는) 파일이어야 합니다: {path_obj}"
+            if name.endswith('_dir') and not path_obj.is_dir(): 
+                logger.warning(f"경로 검증 실패 (폴더 아님): {name} -> {path_obj}")
+                return False, f"[{name}]은(는) 폴더여야 합니다: {path_obj}"
+        logger.info("모든 경로 검증 통과")
         return True, None
 
     def closeEvent(self, event):
-        if self.training_process and self.training_process.is_alive(): self.stop_training(); self.training_process.join(timeout=3)
+        logger.info("애플리케이션 종료 중...")
+        if self.training_process and self.training_process.is_alive(): 
+            logger.warning("종료 시 프로세스가 아직 실행 중이므로 강제 종료합니다.")
+            self.stop_training(); self.training_process.join(timeout=3)
         for t_name in ["t1_thread", "t3_thread", "t4_thread", "t5_thread"]:
             if hasattr(self, t_name):
                 th = getattr(self, t_name)
-                if th and th.isRunning(): th.quit(); th.wait(2000)
+                if th and th.isRunning(): 
+                    logger.debug(f"{t_name} 종료 대기 중...")
+                    th.quit(); th.wait(2000)
         self.settings.setValue("webhook_url", self.webhook_url); event.accept()
+        logger.info("애플리케이션 종료 완료")
 
     def sync_base_paths(self, new_path):
         if hasattr(self, 't6_img_dir'): self.t6_img_dir.line_edit.setText(str(Path(new_path) / "image"))
@@ -1457,6 +1570,7 @@ class MainWindow(QMainWindow):
 
     def sync_work_paths(self, new_path):
         if hasattr(self, 't3_model'): self.t3_model.line_edit.setText(str(Path(new_path) / "kfold" / "best_model.pt"))
+        change_project_logger(new_path) # 워크스페이스 경로가 바뀔 때마다 프로젝트 로그 스위칭
 
     def parse_and_validate_class_map(self, text):
         cmap = {}; lines = [line.strip() for line in text.strip().split('\n') if line.strip()]
@@ -1524,10 +1638,12 @@ class MainWindow(QMainWindow):
         if dialog.exec_() == QDialog.Accepted:
             self.noti_flags = dialog.get_flags()
             self.webhook_url = dialog.get_url()
+            logger.info("디스코드 알림 설정 및 웹훅 URL이 업데이트되었습니다.")
             self.statusBar().showMessage("⚙️ 알림 설정 및 웹훅 URL이 업데이트되었습니다.", 3000)
 
     def reset_tab_defaults(self, tab_widget, tab_name):
         if QMessageBox.question(self, '초기화 확인', f'{tab_name} 탭의 파라미터를 기본값으로 초기화하시겠습니까?', QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+            logger.info(f"{tab_name} 탭 기본값 초기화 진행")
             for widget in tab_widget.findChildren(QWidget):
                 default_val = widget.property("default_val")
                 if default_val is not None:
@@ -1582,11 +1698,15 @@ class MainWindow(QMainWindow):
         g_layout.addLayout(path_layout, 5); g_layout.addSpacing(20); g_layout.addLayout(right_layout, 5); g_group.setLayout(g_layout); main_layout.addWidget(g_group)
         self.tabs = QTabWidget(); main_layout.addWidget(self.tabs); self.setup_tab6(); self.setup_tab1(); self.setup_tab2(); self.setup_tab3(); self.setup_tab4(); self.setup_tab5()
         self.w_base_ds.line_edit.textChanged.connect(self.sync_base_paths); self.w_proc_ds.line_edit.textChanged.connect(self.sync_proc_paths); self.w_proj_root.line_edit.textChanged.connect(self.sync_project_root); self.w_work_ds.line_edit.textChanged.connect(self.sync_work_paths)
+        
+        # 프로그램 시작 시 최초 프로젝트 로그 파일 연결
+        change_project_logger(self.w_work_ds.get_path())
 
     def show_log_viewer(self): LogViewerDialog(self.log_db, self).exec_()
 
     def reset_all_defaults(self):
         if QMessageBox.question(self, '전체 초기화 확인', '전체 탭의 모든 파라미터를 기본값으로 되돌리시겠습니까?\n(경로 설정은 유지됩니다)', QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+            logger.info("사용자 요청에 의한 전체 설정 초기화 진행")
             for widget in self.findChildren(QWidget):
                 default_val = widget.property("default_val")
                 if default_val is not None:
@@ -1622,10 +1742,14 @@ class MainWindow(QMainWindow):
         def delete_selected():
             if list_widget.currentItem():
                 file_name = list_widget.currentItem().text(); file_path = self.config_manager.config_dir / file_name
-                if QMessageBox.question(dialog, '삭제 확인', f"'{file_name}' 설정을 삭제하시겠습니까?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes: file_path.unlink(missing_ok=True); list_widget.takeItem(list_widget.currentRow())
+                if QMessageBox.question(dialog, '삭제 확인', f"'{file_name}' 설정을 삭제하시겠습니까?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes: 
+                    file_path.unlink(missing_ok=True)
+                    logger.info(f"설정 파일 삭제: {file_name}")
+                    list_widget.takeItem(list_widget.currentRow())
         btn_load.clicked.connect(load_selected); btn_delete.clicked.connect(delete_selected); btn_cancel.clicked.connect(dialog.reject); list_widget.itemDoubleClicked.connect(load_selected); dialog.exec_()
 
     def apply_loaded_config(self, c):
+        logger.info("불러온 설정 UI에 적용")
         g = c.get("global", {})
         if "proj_root" in g: self.w_proj_root.line_edit.setText(g["proj_root"])
         if "base_ds" in g: self.w_base_ds.line_edit.setText(g["base_ds"])
@@ -1714,23 +1838,27 @@ class MainWindow(QMainWindow):
         if "auto_nms" in t6: self.t6_auto_nms.setValue(t6["auto_nms"])
 
     def start_training_process(self, worker_func, args):
+        logger.info(f"백그라운드 스레드 프로세스 시작 ({worker_func.__name__})")
         self.train_queue = multiprocessing.Queue(); self.training_process = multiprocessing.Process(target=worker_func, args=(args, self.train_queue)); self.training_process.start()
         self.monitor_thread = ProcessMonitorThread(self.train_queue, self.training_process); self.monitor_thread.finished_ok.connect(self.on_training_finished); self.monitor_thread.error.connect(self.on_training_fatal_error); self.monitor_thread.start()
         
         webhook_url = self.webhook_url
         if webhook_url and self.noti_flags.get("start"):
-            send_discord_webhook(webhook_url, "▶️ **[작업 시작]** 새로운 백그라운 작업이 시작되었습니다.")
+            send_discord_webhook(webhook_url, "▶️ **[작업 시작]** 새로운 백그라운드 작업이 시작되었습니다.")
 
         self.btn_webhook_settings.setEnabled(False)
         self.t2_btn_run.setEnabled(False); self.t2_btn_tune.setEnabled(False); self.t4_btn_retrain.setEnabled(False); self.t4_btn_auto_thr.setEnabled(False); self.t3_btn_auto_thr.setEnabled(False); self.t2_scroll.setEnabled(False); self.t4_scroll.setEnabled(False); self.g_model.setEnabled(False); self.g_imgsz.setEnabled(False); self.t2_btn_stop.setEnabled(True)
         self.statusBar().showMessage(f"🏃 작업 진행 중... PID: {self.training_process.pid}")
 
     def stop_training(self):
+        logger.warning("사용자 요청에 의한 프로세스 강제 종료 시도")
         if self.training_process and self.training_process.is_alive():
             try:
                 if platform.system() == "Windows": import subprocess; subprocess.call(["taskkill", "/F", "/T", "/PID", str(self.training_process.pid)])
                 else: os.kill(self.training_process.pid, signal.SIGKILL)
-            except Exception: pass
+                logger.info(f"프로세스 PID {self.training_process.pid} 강제 종료됨")
+            except Exception as e: 
+                logger.error(f"강제 종료 중 예외 발생: {e}")
             webhook_url = self.webhook_url
             if webhook_url and self.noti_flags.get("error"): send_discord_webhook(webhook_url, "🛑 **[작업 강제 종료]**\n프로세스가 강제 중단되었습니다.")
             self._restore_training_ui(); self.statusBar().showMessage("🛑 작업이 강제 종료되었습니다."); self.training_process = None
@@ -1739,6 +1867,7 @@ class MainWindow(QMainWindow):
         self._restore_training_ui(); self.statusBar().showMessage("✅ 프로세스 완료")
         if res.get("success"):
             task = res.get("task")
+            logger.info(f"백그라운드 프로세스 완료 성공: Task={task}")
             current_config = self.config_builder.build(self)
             
             if task == "tune":
@@ -1780,11 +1909,15 @@ class MainWindow(QMainWindow):
                     self.t4_eval_model_display.setText(res["model_path"]); self.t4_btn_eval.setEnabled(True)
                     self.statusBar().showMessage(f"✅ 재학습 모델 준비 완료: {Path(res['model_path']).name}")
                     
-        else: QMessageBox.critical(self, "실패", res.get("error", "알 수 없는 오류"))
+        else: 
+            logger.error(f"백그라운드 프로세스 실패 반환: {res.get('error', '알 수 없는 오류')}")
+            QMessageBox.critical(self, "실패", res.get("error", "알 수 없는 오류"))
+            
         self.training_process = None
 
     def on_training_fatal_error(self, error_msg):
         if self.training_process is None: return
+        logger.error(f"프로세스 치명적 에러 감지: {error_msg}")
         webhook_url = self.webhook_url
         if webhook_url and self.noti_flags.get("error"): send_discord_webhook(webhook_url, f"❌ **[프로세스 비정상 종료]**\n상세: {error_msg}")
         self._restore_training_ui(); QMessageBox.critical(self, "비정상 종료", error_msg); self.statusBar().showMessage("🛑 프로세스가 비정상 종료되었습니다."); self.training_process = None
@@ -1829,6 +1962,7 @@ class MainWindow(QMainWindow):
             self.t6_list.clear()
             for f in sorted(target_dir.iterdir()):
                 if f.suffix.lower() in valid_exts: self.t6_list.addItem(f.name)
+            logger.info(f"라벨링 작업 폴더로 {copy_count}장 복사 완료. (총 {self.t6_list.count()}장)")
         finally: QApplication.restoreOverrideCursor()
         msg = f"작업 폴더로 {copy_count}장의 사진을 복사했습니다. (현재 목록: 총 {self.t6_list.count()}장)"
         self.statusBar().showMessage(msg, 5000); QMessageBox.information(self, "가져오기 완료", msg)
@@ -1949,14 +2083,21 @@ class MainWindow(QMainWindow):
         config_data = self.config_builder.build(self)
         if "global" in config_data and "webhook_url" in config_data["global"]: config_data["global"]["webhook_url"] = ""
         final_json_data = {"metadata": {"saved_at": datetime.now().strftime("%Y%m%d_%H%M%S"), "type": "project_snapshot", "has_base_model": has_base, "has_retrained_model": has_retrained}, "config": config_data}
+        logger.info(f"프로젝트 전체 백업 진행 중 (Zip 압축): {save_path}")
         self.statusBar().showMessage("📦 프로젝트 내보내기 중...")
         try:
             with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("config.json", json.dumps(final_json_data, ensure_ascii=False, indent=4))
                 if has_base: zf.write(t3_model, "base_model.pt")
                 if has_retrained: zf.write(t4_model, "retrained_model.pt")
+                # 로그 파일 추가
+                proj_log = Path(self.w_work_ds.get_path()) / "logs" / "project_task.log"
+                if proj_log.exists(): zf.write(str(proj_log), "project_task.log")
+            logger.info("프로젝트 백업 압축 완료 (로그 파일 포함)")
             QMessageBox.information(self, "내보내기 완료", f"저장되었습니다:\n{save_path}"); self.statusBar().showMessage(f"✅ 프로젝트 내보내기 완료: {Path(save_path).name}", 5000)
-        except Exception as e: QMessageBox.critical(self, "오류", f"오류 발생:\n{e}"); self.statusBar().clearMessage()
+        except Exception as e: 
+            logger.error(f"프로젝트 내보내기 중 오류 발생: {e}", exc_info=True)
+            QMessageBox.critical(self, "오류", f"오류 발생:\n{e}"); self.statusBar().clearMessage()
 
     def import_project_dialog(self):
         load_path, _ = QFileDialog.getOpenFileName(self, "프로젝트 불러오기 (Zip)", "", "Zip Files (*.zip)")
@@ -1964,6 +2105,7 @@ class MainWindow(QMainWindow):
         import_name = Path(load_path).stem; current_root_parent = Path(self.w_proj_root.get_path()).parent; new_proj_path = current_root_parent / import_name; is_renamed = False; original_name = new_proj_path.name; counter = 1
         while new_proj_path.exists(): is_renamed = True; new_proj_path = current_root_parent / f"{import_name}_{counter}"; counter += 1
         new_proj_path.mkdir(parents=True, exist_ok=True); target_dir = new_proj_path / "workspace" / f"Imported_{import_name}"; target_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"프로젝트 복구 프로세스 시작: 소스({load_path}) -> 타겟({target_dir})")
         self.statusBar().showMessage(f"📥 '{new_proj_path.name}' 프로젝트를 구성하는 중..."); QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             with zipfile.ZipFile(load_path, 'r') as zf: zf.extractall(target_dir)
@@ -1975,10 +2117,19 @@ class MainWindow(QMainWindow):
             if base_model.exists() or legacy_model.exists():
                 model_path_str = str((base_model if base_model.exists() else legacy_model).resolve()); self.t3_model.line_edit.setText(model_path_str); self.t4_base.line_edit.setText(model_path_str); self.t5_model.line_edit.setText(model_path_str)
             if retrained_model.exists(): retrained_path_str = str(retrained_model.resolve()); self.t4_eval_model_display.setText(retrained_path_str); self.t4_btn_eval.setEnabled(True); self.t4_btn_auto_thr.setEnabled(True); self.t5_model.line_edit.setText(retrained_path_str)
-            self.config_manager.update_workspace_path(str(new_proj_path / "workspace")); QApplication.restoreOverrideCursor()
-            if is_renamed: QMessageBox.warning(self, "⚠️ 이름 변경", f"기존에 '{original_name}' 폴더가 존재하여 이름이 변경되었습니다!\n새 폴더명: {new_proj_path.name}"); self.statusBar().showMessage(f"⚠️ 폴더 이름 변경됨: {new_proj_path.name} 로 복구 완료", 7000)
-            else: QMessageBox.information(self, "✅ 불러오기 완료", f"루트: {new_proj_path.name}\n모든 경로가 연동되었습니다."); self.statusBar().showMessage(f"✅ 프로젝트 불러오기 완료: {new_proj_path.name}", 5000)
-        except Exception as e: QApplication.restoreOverrideCursor(); QMessageBox.critical(self, "❌ 오류", f"오류 발생:\n{e}"); self.statusBar().clearMessage()
+            self.config_manager.update_workspace_path(str(new_proj_path / "workspace")); 
+            change_project_logger(str(new_proj_path / "workspace"))
+            QApplication.restoreOverrideCursor()
+            if is_renamed: 
+                logger.warning(f"복구 경로 이름이 중복되어 변경되었습니다. 기존: {original_name}, 새이름: {new_proj_path.name}")
+                QMessageBox.warning(self, "⚠️ 이름 변경", f"기존에 '{original_name}' 폴더가 존재하여 이름이 변경되었습니다!\n새 폴더명: {new_proj_path.name}"); self.statusBar().showMessage(f"⚠️ 폴더 이름 변경됨: {new_proj_path.name} 로 복구 완료", 7000)
+            else: 
+                logger.info("프로젝트 복구가 정상적으로 완료되었습니다.")
+                QMessageBox.information(self, "✅ 불러오기 완료", f"루트: {new_proj_path.name}\n모든 경로가 연동되었습니다."); self.statusBar().showMessage(f"✅ 프로젝트 불러오기 완료: {new_proj_path.name}", 5000)
+        except Exception as e: 
+            QApplication.restoreOverrideCursor()
+            logger.error(f"프로젝트 불러오기 중 예외 발생: {e}", exc_info=True)
+            QMessageBox.critical(self, "❌ 오류", f"오류 발생:\n{e}"); self.statusBar().clearMessage()
 
     def setup_tab1(self):
         form = QFormLayout(); self.t1_auto_crop = QCheckBox(); self.t1_auto_crop.setChecked(True); self.t1_margin = QSpinBox(); self.t1_margin.setRange(0, 500); self.t1_margin.setValue(50)
@@ -2003,10 +2154,20 @@ class MainWindow(QMainWindow):
         split.addWidget(left_w); split.addWidget(right_w); split.setSizes([600, 800]); layout = QVBoxLayout(); layout.addWidget(split); tab = QWidget(); tab.setLayout(layout); self.tabs.addTab(tab, "✂️ 데이터 전처리")
 
     def run_tab1(self):
-        base_dir = Path(self.w_base_ds.get_path()); is_valid, err = self.validate_paths(원본_데이터_dir=base_dir, 이미지_dir=base_dir/"image", 라벨_dir=base_dir/"data")
-        if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
+        logger.info("Tab1 데이터 전처리 실행 버튼 클릭")
+        base_dir = Path(self.w_base_ds.get_path())
+        is_valid, err = self.validate_paths(원본_데이터_dir=base_dir, 이미지_dir=base_dir/"image", 라벨_dir=base_dir/"data")
+        if not is_valid: 
+            QMessageBox.warning(self, "경로 오류", err)
+            return
+            
         success, cmap_or_error = self.parse_and_validate_class_map(self.t1_class_map.toPlainText())
-        if not success: QMessageBox.warning(self, "클래스 매핑 오류", cmap_or_error); return
+        if not success: 
+            logger.warning(f"클래스 매핑 오류: {cmap_or_error}")
+            QMessageBox.warning(self, "클래스 매핑 오류", cmap_or_error)
+            return
+            
+        logger.info("데이터 전처리 준비 완료. 백그라운드 스레드 시작.")
         config = {"base_dir": self.w_base_ds.get_path(), "processed_dir": self.w_proc_ds.get_path(), "use_auto_crop": self.t1_auto_crop.isChecked(), "margin": self.t1_margin.value(), "manual_crop": (self.t1_mx.value(), self.t1_my.value(), self.t1_mw.value(), self.t1_mh.value()), "class_map": cmap_or_error, "clean_old": self.t1_clean.isChecked(), "use_exif": self.t1_exif.isChecked(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags()}
         self.t1_btn_run.setEnabled(False); self.t1_log.clear(); self.statusBar().showMessage("✂️ 데이터 전처리 진행 중... 잠시만 기다려주세요."); QApplication.setOverrideCursor(Qt.WaitCursor)
         self.t1_thread = PreprocessThread(config); self.t1_thread.progress.connect(self.t1_progress.setValue); self.t1_thread.log_msg.connect(self.t1_log.append); self.t1_thread.error.connect(lambda e: QMessageBox.critical(self, "오류", e)); self.t1_thread.finished_ok.connect(self.on_tab1_finished)
@@ -2099,7 +2260,9 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tab, "🏋️ K-Fold 학습")
 
     def run_auto_tune(self):
+        logger.info("Tab2 Auto ML 튜닝 버튼 클릭")
         if self.training_process and self.training_process.is_alive(): 
+            logger.warning("이미 진행 중인 프로세스가 있어 튜닝 시작 거부됨.")
             QMessageBox.warning(self, "경고", "이미 진행 중인 프로세스가 있습니다.")
             return
             
@@ -2154,7 +2317,10 @@ class MainWindow(QMainWindow):
         self.start_training_process(_tune_worker, args)
 
     def run_tab2(self):
-        if self.training_process and self.training_process.is_alive(): QMessageBox.warning(self, "경고", "이미 진행 중인 프로세스가 있습니다."); return
+        logger.info("Tab2 K-Fold 학습 실행 버튼 클릭")
+        if self.training_process and self.training_process.is_alive(): 
+            logger.warning("이미 진행 중인 프로세스 감지. 학습 시작 취소.")
+            QMessageBox.warning(self, "경고", "이미 진행 중인 프로세스가 있습니다."); return
         proc_dir = Path(self.w_proc_ds.get_path()); is_valid, err = self.validate_paths(처리된_데이터_dir=proc_dir, 이미지_dir=proc_dir/"images", 라벨_dir=proc_dir/"labels")
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
         if not self.g_model.currentText(): QMessageBox.warning(self, "입력 오류", "모델을 선택해주세요."); return
@@ -2187,7 +2353,10 @@ class MainWindow(QMainWindow):
         split.addWidget(t_w); split.addWidget(i_w); split.setSizes([700, 700]); l = QVBoxLayout(); l.addWidget(split); tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "🔍 평가 & 선별")
 
     def run_auto_threshold(self):
-        if self.training_process and self.training_process.is_alive(): QMessageBox.warning(self, "경고", "이미 진행 중입니다."); return
+        logger.info("최적 스레숄드 자동 탐색 실행 시작")
+        if self.training_process and self.training_process.is_alive(): 
+            logger.warning("이미 다른 프로세스가 실행 중입니다.")
+            QMessageBox.warning(self, "경고", "이미 진행 중입니다."); return
         is_valid, err = self.validate_paths(평가모델_file=Path(self.t3_model.get_path()), 평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
         
@@ -2206,6 +2375,7 @@ class MainWindow(QMainWindow):
         self.start_training_process(_auto_threshold_worker, args)
 
     def run_tab3(self):
+        logger.info("Tab3 평가 및 오답 선별 실행 버튼 클릭")
         is_valid, err = self.validate_paths(평가모델_file=Path(self.t3_model.get_path()), 평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
         config = {"eval_model_path": self.t3_model.get_path(), "eval_source": self.t3_img.get_path(), "gt_labels_path": self.t3_lbl.get_path(), "workspace_dir": self.w_work_ds.get_path(), "eval_run_name": self.t3_run_name.text(), "eval_conf": self.t3_conf.value(), "eval_iou": self.t3_iou.value(), "match_iou": self.t3_match_iou.value(), "max_det": self.t3_max_det.value(), "agnostic_nms": self.t3_agnostic.isChecked(), "save_relabel": self.t3_save_rel.isChecked(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags()}
@@ -2270,6 +2440,7 @@ class MainWindow(QMainWindow):
         main_split.addWidget(right_widget); main_split.setSizes([600, 800]); tab_layout = QVBoxLayout(); tab_layout.addWidget(main_split); tab = QWidget(); tab.setLayout(tab_layout); self.tabs.addTab(tab, "🔁 재학습")
 
     def run_tab4_auto_threshold(self):
+        logger.info("재학습 모델 최적 스레숄드 자동 탐색 실행 시작")
         if self.training_process and self.training_process.is_alive(): 
             QMessageBox.warning(self, "경고", "이미 진행 중입니다."); return
         
@@ -2295,6 +2466,7 @@ class MainWindow(QMainWindow):
         self.start_training_process(_auto_threshold_worker, args)
 
     def run_tab4_retrain(self):
+        logger.info("Tab4 재학습 실행 버튼 클릭")
         if self.training_process and self.training_process.is_alive(): QMessageBox.warning(self, "경고", "이미 진행 중"); return
         is_valid, err = self.validate_paths(오답_dir=Path(self.t4_hard.get_path()), 원본정답_dir=Path(self.t4_orig.get_path()), 베이스모델_file=Path(self.t4_base.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
@@ -2304,6 +2476,7 @@ class MainWindow(QMainWindow):
         self.t4_btn_eval.setEnabled(False); self.start_training_process(_retrain_worker, args)
 
     def run_tab4_eval(self):
+        logger.info("Tab4 최종 평가 버튼 클릭")
         from ultralytics import YOLO; import yaml
         is_valid, err = self.validate_paths(평가모델_file=Path(self.t4_eval_model_display.text()), 평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
@@ -2365,6 +2538,7 @@ class MainWindow(QMainWindow):
         split.addWidget(c_w); split.addWidget(i_w); split.setSizes([700, 700]); l = QVBoxLayout(); l.addWidget(split); tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "📏 거리 측정")
 
     def run_tab5(self):
+        logger.info("Tab5 거리 측정 실행 버튼 클릭")
         is_valid, err = self.validate_paths(측정모델_file=Path(self.t5_model.get_path()), 분석이미지_dir=Path(self.t5_img.get_path()))
         if not is_valid: QMessageBox.warning(self, "오류", err); return
         config = {"dist_model_path": self.t5_model.get_path(), "dist_source": self.t5_img.get_path(), "workspace_dir": self.w_work_ds.get_path(), "measure_method": self.t5_method.currentText(), "dist_conf": self.t5_conf.value(), "dist_iou": self.t5_iou.value(), "dist_max_det": self.t5_max_det.value(), "dist_agnostic": self.t5_agnostic.isChecked(), "n_neighbors": self.t5_knn_n.value(), "edge_thresholds": self.t5_edge_thr.text(), "skip_ng": self.t5_skip_ng.isChecked(), "drop_odd_lowest": self.t5_drop_odd.isChecked(), "color1": self.t5_color1.currentText(), "color2": self.t5_color2.currentText(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags()}
