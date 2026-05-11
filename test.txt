@@ -39,6 +39,9 @@ https://discord.com/api/webhooks/1499309543136690248/cr2zCJUKE9MM1xgxetzuX-ZTWqa
 파라미터에서 시드를 랜덤으로 하는 조건도 추가해야될듯 - 원래 0이 기본값이긴 함
 로깅파일 만들기 - 로그는 cmd에 안나와도 될듯?, 플젝로그는 삭제
 
+db에서의 경로는 복사본 경로가 아니라 원본 경로
+
+
 db에서 설정 가져오기 - db에 모델이 저장되는지 확인해야됨
 -Closing dataloader mosaic 이후 딜레이 있음
 db를 통해 자동 보고서?
