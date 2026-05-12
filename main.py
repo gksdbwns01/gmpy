@@ -311,7 +311,7 @@ def _tune_worker(args, queue):
             model = YOLO(model_name)
             
             # 개선: 적응형 에포크 적용 (빠른 탐색 위해 짧게 -> 최종 길게)
-            adaptive_epochs = max(10, int(tune_epochs - (tune_epochs // 2) * (gen / iterations)))
+            adaptive_epochs = max(10, int((tune_epochs // 2) + (tune_epochs - tune_epochs // 2) * (gen / max(1, iterations - 1))))
             
             if args.get("webhook_url") and args.get("noti_flags", {}).get("epoch", False):
                 interval = args.get("noti_flags", {}).get("epoch_interval", 100)
