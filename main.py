@@ -39,7 +39,6 @@ def setup_logger():
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     
-    # 프로세스 아이디와 스레드 이름을 포함하여 상세 추적 가능하도록 포맷 변경
     formatter = logging.Formatter('[%(levelname)s] %(asctime)s - [PID:%(process)d|%(threadName)s] - %(funcName)s - %(message)s')
     file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
@@ -113,9 +112,6 @@ class ConfigBuilder:
             "tab6": {"class_map": w.t6_class_map.toPlainText(), "color": w.t6_color_combo.currentText(), "auto_thr": w.t6_auto_thr.value(), "auto_nms": w.t6_auto_nms.value()}
         }
 
-# ==========================================
-# DB & Logging Manager
-# ==========================================
 class LogDatabase:
     def __init__(self, db_path):
         self.db_path = Path(db_path)
@@ -189,9 +185,6 @@ class LogDatabase:
             logger.error(f"DB 로그 조회 중 오류: {e}", exc_info=True)
             return [], 0
 
-# ==========================================
-# Helpers
-# ==========================================
 def open_folder(path):
     p = Path(path)
     if not p.exists(): logger.warning(f"폴더를 열 수 없습니다. 존재하지 않음: {path}"); return
@@ -219,10 +212,6 @@ def create_heartbeat_callback(webhook_url, total_epochs, interval):
             send_discord_webhook(webhook_url, f"💓 **[학습 진행 상황]** {current_epoch} / {total_epochs} Epochs\n📉 현재 Total Loss: `{trainer.tloss.sum().item():.4f}`")
     return on_train_epoch_end
 
-
-# ==========================================
-# Worker Threads & Functions (멀티프로세스 환경 지원)
-# ==========================================
 class WebhookSettingsDialog(QDialog):
     def __init__(self, current_flags, current_url, parent=None):
         super().__init__(parent); self.setWindowTitle("디스코드 웹훅 상세 설정"); self.resize(400, 480)
@@ -258,66 +247,130 @@ class WebhookSettingsDialog(QDialog):
     def get_flags(self): return {"error": self.chk_error.isChecked(), "early_stop": self.chk_early_stop.isChecked(), "start": self.chk_start.isChecked(), "fold": self.chk_fold.isChecked(), "tune": self.chk_tune.isChecked(), "epoch": self.chk_epoch.isChecked(), "epoch_interval": {0: 10, 1: 50, 2: 100, 3: 500}[self.cmb_epoch.currentIndex()], "task": self.chk_task.isChecked()}
 
 def _tune_worker(args, queue):
-    worker_logger = setup_logger() # 프로세스 독립 로거 설정
-    import time, traceback, random; import numpy as np; import pandas as pd
-    from pathlib import Path; from ultralytics import YOLO; from sklearn.model_selection import train_test_split
-    start_time = time.time(); result = {"success": False, "task": "tune", "error": "", "msg": "", "best_params": {}}
-    worker_logger.info(f"[AutoML Worker] 튜닝 시작. 반복 횟수: {args['iterations']}, Epochs: {args['epochs']}")
+    worker_logger = setup_logger()
+    import time, traceback, random, numpy as np, pandas as pd
+    from pathlib import Path
+    from ultralytics import YOLO
+    from sklearn.model_selection import train_test_split
+    
+    start_time = time.time()
+    result = {"success": False, "task": "tune", "error": "", "msg": "", "best_params": {}, "history": []}
+    worker_logger.info(f"[AutoML Worker] 튜닝 시작. 반복 횟수: {args['iterations']}")
+    
     try:
         processed_dir, workspace_dir = Path(args["processed_dir"]), Path(args["workspace_dir"])
-        model_name, epochs, iterations = args["model_name"], args["epochs"], args["iterations"]
+        model_name, iterations = args["model_name"], args["iterations"]
+        tune_epochs = args.get("tune_epochs", 30)
+        tune_patience = args.get("tune_patience", 5)
+        
         tune_base = workspace_dir / "runs" / "tune_custom"
         if tune_base.exists(): shutil.rmtree(tune_base); worker_logger.debug("기존 tune_custom 폴더 삭제 완료")
         tune_base.mkdir(parents=True, exist_ok=True)
+        
         img_map = {f.stem: f for f in sorted((processed_dir / "images").glob("*.jpg"))}
         lbl_map = {f.stem: f for f in sorted((processed_dir / "labels").glob("*.txt"))}
         paired = [(str(img_map[n]), str(lbl_map[n])) for n in img_map if n in lbl_map]
         worker_logger.debug(f"[AutoML Worker] 이미지-라벨 페어 개수: {len(paired)}")
-        if len(paired) < 5: result["error"] = "튜닝용 데이터 부족"; worker_logger.error("데이터 부족으로 튜닝 종료"); queue.put(result); return
+        
+        if len(paired) < 5: 
+            result["error"] = "튜닝용 데이터 부족"
+            worker_logger.error("데이터 부족으로 튜닝 종료"); queue.put(result); return
+            
         tr, vl = train_test_split(paired, test_size=0.2, random_state=42)
         tr_txt, vl_txt = tune_base / "train.txt", tune_base / "val.txt"
         tr_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in tr))
         vl_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in vl))
         data_yaml = tune_base / "tune_data.yaml"
         data_yaml.write_text(f"train: {tr_txt.resolve()}\nval: {vl_txt.resolve()}\nnc: {len(args['class_names'])}\nnames: {args['class_names']}\n")
-        best_params = args["initial_params"].copy(); best_score = -1.0
-        bounds = {'box': (0.1, 20.0), 'cls': (0.1, 10.0), 'dfl': (0.1, 10.0), 'hsv_h': (0.0, 0.1), 'hsv_s': (0.0, 1.0), 'hsv_v': (0.0, 1.0), 'degrees': (0.0, 45.0), 'translate': (0.0, 0.5), 'scale': (0.0, 1.0), 'shear': (0.0, 30.0), 'flipud': (0.0, 1.0), 'fliplr': (0.0, 1.0), 'mosaic': (0.0, 1.0), 'mixup': (0.0, 1.0), 'copy_paste': (0.0, 1.0)}
-        rng = random.Random(); rng.seed(time.time())
-        for i in range(iterations):
+        
+        best_params = args["initial_params"].copy()
+        best_score = -1.0
+        search_history = []
+        
+        bounds = {
+            'box': (0.1, 20.0), 'cls': (0.1, 10.0), 'dfl': (0.1, 10.0), 
+            'hsv_h': (0.0, 0.1), 'hsv_s': (0.0, 1.0), 'hsv_v': (0.0, 1.0), 
+            'degrees': (0.0, 45.0), 'translate': (0.0, 0.5), 'scale': (0.0, 1.0), 
+            'shear': (0.0, 30.0), 'flipud': (0.0, 1.0), 'fliplr': (0.0, 1.0), 
+            'mosaic': (0.0, 1.0), 'mixup': (0.0, 1.0), 'copy_paste': (0.0, 1.0)
+        }
+        
+        rng = random.Random(time.time())
+        
+        for gen in range(iterations):
             current_params = best_params.copy()
-            worker_logger.debug(f"--- 튜닝 세대 {i+1}/{iterations} --- 시작")
-            if i > 0:
-                for k, (min_v, max_v) in bounds.items():
-                    if rng.random() < 0.5: 
-                        mutation = rng.gauss(0, (max_v - min_v) * 0.1)
-                        current_params[k] = round(max(min_v, min(max_v, current_params[k] + mutation)), 4)
+            worker_logger.debug(f"--- 튜닝 세대 {gen+1}/{iterations} --- 시작")
+            
+            # 개선: 세대가 지날수록 변이 강도 감소 (첫 세대부터 바로 탐색 시작)
+            mutation_strength = max(0.05, 1.0 - (gen / iterations))
+            
+            for k, (min_v, max_v) in bounds.items():
+                mutation = rng.gauss(0, (max_v - min_v) * mutation_strength * 0.1)
+                current_params[k] = round(max(min_v, min(max_v, current_params[k] + mutation)), 4)
+                
             model = YOLO(model_name)
+            
+            # 개선: 적응형 에포크 적용 (빠른 탐색 위해 짧게 -> 최종 길게)
+            adaptive_epochs = max(10, int(tune_epochs - (tune_epochs // 2) * (gen / iterations)))
             
             if args.get("webhook_url") and args.get("noti_flags", {}).get("epoch", False):
                 interval = args.get("noti_flags", {}).get("epoch_interval", 100)
-                model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], min(epochs, 30), interval))
+                model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], adaptive_epochs, interval))
 
-            res = model.train(data=str(data_yaml), epochs=min(epochs, 30), patience=5, batch=args["batch"], workers=args["workers"], project=str(tune_base), name=f"gen_{i+1}", seed=42, verbose=False, **current_params)
+            res = model.train(
+                data=str(data_yaml), 
+                epochs=adaptive_epochs, 
+                patience=tune_patience, 
+                batch=args["batch"], 
+                workers=args["workers"], 
+                project=str(tune_base), 
+                name=f"gen_{gen+1}", 
+                seed=42, 
+                verbose=False, 
+                **current_params
+            )
             
-            actual_epochs = len(pd.read_csv(Path(res.save_dir) / "results.csv")) if (Path(res.save_dir) / "results.csv").exists() else min(epochs, 30)
-            if actual_epochs < min(epochs, 30) and args.get("webhook_url") and args.get("noti_flags", {}).get("early_stop", False):
-                worker_logger.info(f"세대 {i+1} 조기 종료 감지됨 (Epoch: {actual_epochs})")
-                send_discord_webhook(args["webhook_url"], f"🛑 **[조기 종료]** Auto ML {i+1}세대 - {actual_epochs} Epoch에서 조기 종료됨.")
+            actual_epochs = len(pd.read_csv(Path(res.save_dir) / "results.csv")) if (Path(res.save_dir) / "results.csv").exists() else adaptive_epochs
+            if actual_epochs < adaptive_epochs and args.get("webhook_url") and args.get("noti_flags", {}).get("early_stop", False):
+                worker_logger.info(f"세대 {gen+1} 조기 종료 감지됨 (Epoch: {actual_epochs})")
+                send_discord_webhook(args["webhook_url"], f"🛑 **[조기 종료]** Auto ML {gen+1}세대 - {actual_epochs} Epoch에서 조기 종료됨.")
 
-            mAP50 = res.results_dict.get('metrics/mAP50(B)', 0); mAP50_95 = res.results_dict.get('metrics/mAP50-95(B)', 0)
+            mAP50 = res.results_dict.get('metrics/mAP50(B)', 0)
+            mAP50_95 = res.results_dict.get('metrics/mAP50-95(B)', 0)
             fitness = ((0.1 * mAP50) + (0.9 * mAP50_95)) * 100
-            worker_logger.info(f"세대 {i+1} 완료. Fitness: {fitness:.2f} (Best: {best_score:.2f})")
             
-            if fitness > best_score: best_score = fitness; best_params = current_params.copy(); worker_logger.debug(f"세대 {i+1}에서 최고 점수 갱신됨")
+            # 개선: 탐색 과정(History) 저장
+            gen_record = {
+                "generation": gen + 1,
+                "fitness": fitness,
+                "mAP50": mAP50,
+                "mAP50_95": mAP50_95,
+                **current_params
+            }
+            search_history.append(gen_record)
+            
+            worker_logger.info(f"세대 {gen+1}: Fitness={fitness:.2f} (Best: {best_score:.2f}) | Epochs실행: {adaptive_epochs}")
+            
+            if fitness > best_score: 
+                best_score = fitness
+                best_params = current_params.copy()
+                worker_logger.info(f"✨ 세대 {gen+1}에서 최고 점수 갱신!")
             
             if args.get("webhook_url") and args.get("noti_flags", {}).get("tune", False):
-                send_discord_webhook(args["webhook_url"], f"🤖 **[Auto ML]** {i+1}세대 탐색 완료\n- 최고 잠재력 점수: {best_score:.1f}점")
+                send_discord_webhook(args["webhook_url"], f"🤖 **[Auto ML]** {gen+1}세대 탐색 완료\n- 최고 잠재력 점수: {best_score:.1f}점")
 
             del model; clear_vram()
-        result["best_params"] = best_params; result["success"] = True; result["msg"] = f"✅ 맞춤형 파라미터 탐색 완료\n최고 잠재력 점수: {best_score:.1f}점"
+            
+        result["best_params"] = best_params
+        result["success"] = True
+        result["history"] = search_history
+        result["msg"] = f"✅ 맞춤형 파라미터 탐색 완료\n최고 잠재력 점수: {best_score:.1f}점\n총 {iterations}세대 탐색 완료"
         worker_logger.info(f"[AutoML Worker] 튜닝 최종 완료. 소요시간: {time.time() - start_time:.1f}s")
-    except Exception: result["error"] = traceback.format_exc(); worker_logger.error(f"[AutoML Worker] Exception: {result['error']}")
-    finally: clear_vram(); queue.put(result)
+        
+    except Exception: 
+        result["error"] = traceback.format_exc(); worker_logger.error(f"[AutoML Worker] Exception: {result['error']}")
+    finally: 
+        clear_vram(); queue.put(result)
 
 def _auto_threshold_worker(args, queue):
     worker_logger = setup_logger()
@@ -758,9 +811,6 @@ class MeasureThread(QThread):
             logger.error("[Measure Thread] 에러 발생", exc_info=True)
             self.error.emit(traceback.format_exc())
 
-# ==========================================
-# UI Components
-# ==========================================
 class LabelDialog(QDialog):
     def __init__(self, class_names, parent=None):
         super().__init__(parent); self.setWindowTitle("클래스 선택"); self.class_id = -1
@@ -1548,7 +1598,6 @@ class LogTabWidget(QWidget):
         valid_paths = []
         target_idx = 0
         
-        # 선택된 행의 설정(Config)을 참조하여 정확한 평가 폴더 찾기 시도
         run_dir = None
         selected = self.table.selectedItems()
         if selected:
@@ -1557,18 +1606,16 @@ class LogTabWidget(QWidget):
             try:
                 cfg = json.loads(row_data[8])
                 base_run_name = cfg.get("tab3", {}).get("run_name", "check01")
-                if "Tab 4" in row_data[3]: # Tab 4 Final Eval인 경우
+                if "Tab 4" in row_data[3]:
                     run_dir = eval_runs_dir / (base_run_name + "_final_eval")
                 else:
                     run_dir = eval_runs_dir / base_run_name
             except: pass
 
-        # 리스트에 있는 모든 오답 이미지의 실제 경로 추적 (방향키로 넘겨보기 위함)
         for i in range(self.list_wrong_imgs.count()):
             name = self.list_wrong_imgs.item(i).text()
             p = run_dir / name if run_dir else None
             
-            # 정확한 폴더에 없으면 eval_runs_dir 내의 모든 폴더 1뎁스 탐색 (속도 저하 방지)
             if not p or not p.exists():
                 found = list(eval_runs_dir.glob(f"*/{name}"))
                 if found: p = found[0]
@@ -1579,7 +1626,6 @@ class LogTabWidget(QWidget):
                     target_idx = len(valid_paths) - 1
                     
         if valid_paths:
-            # 미리 만들어둔 ImagePreviewDialog를 재활용하여 크게 띄움 (좌우 방향키 작동)
             ImagePreviewDialog(valid_paths, target_idx, self).exec_()
         else:
             QMessageBox.warning(self, "이미지 찾기 실패", f"'{clicked_img_name}' 이미지를 찾을 수 없습니다.\n평가 폴더(runs/eval)에서 삭제되거나 다른 곳으로 이동되었을 수 있습니다.")
@@ -1616,6 +1662,70 @@ class LogViewerDialog(QDialog):
         btn_close.clicked.connect(self.accept)
         btn_close.setMinimumHeight(40)
         layout.addWidget(btn_close)
+
+class TuneHistoryDialog(QDialog):
+    def __init__(self, history_csv_path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📈 Auto ML 하이퍼파라미터 튜닝 기록")
+        self.resize(1000, 700)
+        layout = QVBoxLayout(self)
+
+        try:
+            df = pd.read_csv(history_csv_path)
+            
+            # 상단: 튜닝 진행 상황 그래프
+            self.canvas = FigureCanvas(plt.Figure(figsize=(8, 4)))
+            self.toolbar = NavigationToolbar(self.canvas, self)
+            layout.addWidget(self.toolbar)
+            layout.addWidget(self.canvas)
+            
+            ax = self.canvas.figure.add_subplot(111)
+            sns.lineplot(data=df, x='generation', y='fitness', marker='o', ax=ax, label='Fitness (잠재력 점수)', color='#e11d48', linewidth=2)
+            
+            # 최고 점수 표시
+            best_row = df.loc[df['fitness'].idxmax()]
+            ax.annotate(f"Best: {best_row['fitness']:.2f}", 
+                        xy=(best_row['generation'], best_row['fitness']), 
+                        xytext=(best_row['generation'], best_row['fitness'] + 1.5),
+                        arrowprops=dict(facecolor='#111827', shrink=0.05, width=1.5, headwidth=6),
+                        fontsize=10, fontweight='bold')
+            
+            ax.set_title("세대별 하이퍼파라미터 잠재력(Fitness) 진화 추이", fontdict={'weight': 'bold', 'size': 12})
+            ax.set_xlabel("세대 (Generation)")
+            ax.set_ylabel("Fitness Score")
+            ax.grid(True, linestyle='--', alpha=0.7)
+            self.canvas.draw()
+            
+            # 하단: 상위 5개 파라미터 조합 테이블
+            layout.addWidget(QLabel("<b>🏆 상위 5개 세대 파라미터 조합 (Top 5)</b>"))
+            table = QTableWidget()
+            top_df = df.sort_values(by='fitness', ascending=False).head(5)
+            
+            table.setRowCount(len(top_df))
+            table.setColumnCount(len(df.columns))
+            table.setHorizontalHeaderLabels(df.columns)
+            table.setAlternatingRowColors(True)
+            table.setEditTriggers(QTableWidget.NoEditTriggers)
+            table.setSelectionBehavior(QTableWidget.SelectRows)
+            
+            for r_idx, (_, row) in enumerate(top_df.iterrows()):
+                for c_idx, col_name in enumerate(df.columns):
+                    val = row[col_name]
+                    if isinstance(val, float): val = f"{val:.4f}"
+                    item = QTableWidgetItem(str(val))
+                    item.setTextAlignment(Qt.AlignCenter)
+                    table.setItem(r_idx, c_idx, item)
+            
+            table.resizeColumnsToContents()
+            layout.addWidget(table)
+            
+            btn_close = QPushButton("닫기")
+            btn_close.setMinimumHeight(40)
+            btn_close.clicked.connect(self.accept)
+            layout.addWidget(btn_close)
+            
+        except Exception as e:
+            layout.addWidget(QLabel(f"기록을 불러오는 중 오류 발생:\n{traceback.format_exc()}"))
 
 # ==========================================
 # Main App
@@ -1974,6 +2084,17 @@ class MainWindow(QMainWindow):
                 if 'mosaic' in bp: self.t2_amos.setValue(float(bp['mosaic']))
                 if 'mixup' in bp: self.t2_amix.setValue(float(bp['mixup']))
                 if 'copy_paste' in bp: self.t2_acp.setValue(float(bp['copy_paste']))
+                
+                # 추가된 개선: 히스토리 내역 저장
+                if "history" in res:
+                    try:
+                        history_df = pd.DataFrame(res["history"])
+                        history_path = Path(self.w_work_ds.get_path()) / "runs" / "tune_custom" / "tune_history.csv"
+                        history_df.to_csv(history_path, index=False, encoding="utf-8-sig")
+                        logger.info(f"AutoML 탐색 기록 CSV 저장 완료: {history_path}")
+                    except Exception as e:
+                        logger.error(f"AutoML 탐색 기록 CSV 저장 중 오류: {e}")
+
                 QMessageBox.information(self, "Auto ML 완료", res["msg"])
             elif task == "threshold":
                 bc, bi = res["best_conf"], res["best_iou"]
@@ -2278,8 +2399,19 @@ class MainWindow(QMainWindow):
         
         h_form.addLayout(f_left); h_form.addLayout(f_right)
         
+        # AutoML 버튼 그룹
+        h_tune = QHBoxLayout()
         self.t2_btn_tune = QPushButton("🤖 최적 파라미터 자동 탐색 (Auto ML)")
-        self.t2_btn_tune.setStyleSheet("background-color: #dbeafe; border: 1px solid #93c5fd; padding: 8px; font-weight: bold; color: #1e3a8a;"); self.t2_btn_tune.clicked.connect(self.run_auto_tune)
+        self.t2_btn_tune.setStyleSheet("background-color: #dbeafe; border: 1px solid #93c5fd; padding: 8px; font-weight: bold; color: #1e3a8a;")
+        self.t2_btn_tune.clicked.connect(self.run_auto_tune)
+        
+        # 새로 추가된 AutoML 튜닝 기록 시각화 버튼
+        self.btn_show_tune_history = QPushButton("📈 AutoML 튜닝 기록 그래프 보기")
+        self.btn_show_tune_history.setStyleSheet("background-color: #fce7f3; border: 1px solid #fbcfe8; padding: 8px; font-weight: bold; color: #9d174d;")
+        self.btn_show_tune_history.clicked.connect(self.show_tune_history)
+        
+        h_tune.addWidget(self.t2_btn_tune)
+        h_tune.addWidget(self.btn_show_tune_history)
         
         self.t2_btn_run = QPushButton("🚀 K-Fold 학습 시작"); self.t2_btn_run.clicked.connect(self.run_tab2)
         self.t2_btn_stop = QPushButton("🛑 강제 종료"); self.t2_btn_stop.clicked.connect(self.stop_training); self.t2_btn_stop.setEnabled(False)
@@ -2288,10 +2420,19 @@ class MainWindow(QMainWindow):
         
         self.t2_btn_reset = QPushButton("🔄 이 탭 초기화"); self.t2_btn_reset.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 5px; border-radius: 4px;"); self.t2_btn_reset.clicked.connect(lambda _, w=self.t2_scroll: self.reset_tab_defaults(w, "K-Fold 학습"))
         
-        h_tune = QHBoxLayout(); h_tune.addWidget(self.t2_btn_tune); l.addLayout(h_tune)
+        l.addLayout(h_tune)
+        
         h = QHBoxLayout(); h.addWidget(self.t2_btn_run); h.addWidget(self.t2_btn_stop); h.addWidget(self.t2_btn_reset); l.addLayout(h)
         
         tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "🏋️ K-Fold 학습")
+
+    def show_tune_history(self):
+        history_path = Path(self.w_work_ds.get_path()) / "runs" / "tune_custom" / "tune_history.csv"
+        if not history_path.exists():
+            QMessageBox.warning(self, "기록 없음", "저장된 튜닝 기록(tune_history.csv)이 없습니다.\n먼저 Auto ML 탐색을 실행해주세요.")
+            return
+        dialog = TuneHistoryDialog(history_path, self)
+        dialog.exec_()
 
     def run_auto_tune(self):
         logger.info("Tab2 Auto ML 파라미터 튜닝 실행")
@@ -2301,8 +2442,18 @@ class MainWindow(QMainWindow):
         success, cmap_or_error = self.parse_and_validate_class_map(self.t1_class_map.toPlainText())
         if not success: QMessageBox.warning(self, "클래스 매핑 오류", cmap_or_error); return
         if QMessageBox.question(self, 'Auto ML 튜닝', f'총 {self.t2_tune_iterations.value()}번의 조합 탐색을 시작합니다.\n계속 진행하시겠습니까?', QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
+        
         initial_params = {'box': self.t2_lbox.value(), 'cls': self.t2_lcls.value(), 'dfl': self.t2_ldfl.value(), 'hsv_h': self.t2_ah.value(), 'hsv_s': self.t2_as.value(), 'hsv_v': self.t2_av.value(), 'degrees': self.t2_adeg.value(), 'translate': self.t2_atrans.value(), 'scale': self.t2_ascale.value(), 'shear': self.t2_ashear.value(), 'flipud': self.t2_afud.value(), 'fliplr': self.t2_aflr.value(), 'mosaic': self.t2_amos.value(), 'mixup': self.t2_amix.value(), 'copy_paste': self.t2_acp.value()}
-        args = {"processed_dir": self.w_proc_ds.get_path(), "workspace_dir": self.w_work_ds.get_path(), "model_name": self.g_model.currentText(), "epochs": self.t2_epochs.value(), "iterations": self.t2_tune_iterations.value(), "batch": self.t2_batch.value(), "workers": self.t2_workers.value(), "class_names": list(cmap_or_error.keys()), "initial_params": initial_params, "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags()}
+        
+        args = {
+            "processed_dir": self.w_proc_ds.get_path(), "workspace_dir": self.w_work_ds.get_path(), 
+            "model_name": self.g_model.currentText(), "epochs": self.t2_epochs.value(), 
+            "iterations": self.t2_tune_iterations.value(), "batch": self.t2_batch.value(), 
+            "workers": self.t2_workers.value(), "class_names": list(cmap_or_error.keys()), 
+            "initial_params": initial_params, "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value(), 
+            "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags(),
+            "tune_epochs": 30, "tune_patience": 5 # 추가된 설정
+        }
         self.start_training_process(_tune_worker, args)
 
     def run_tab2(self):
@@ -2364,6 +2515,7 @@ class MainWindow(QMainWindow):
             self.t3_table.setItem(i, 0, QTableWidgetItem(str(row["파일명"]))); self.t3_table.setItem(i, 1, QTableWidgetItem(str(row["상태"]))); self.t3_table.setItem(i, 2, QTableWidgetItem(str(row["예측 수"]))); self.t3_table.setItem(i, 3, QTableWidgetItem(str(row["정답 수"]))); self.t3_table.setItem(i, 4, QTableWidgetItem(str(row["사유"])))
             for col in range(5): self.t3_table.item(i, col).setTextAlignment(Qt.AlignCenter)
         self.t3_table.setSortingEnabled(True); self.t3_chk_show_all.setEnabled(True); self.t3_chk_show_all.blockSignals(True); self.t3_chk_show_all.setChecked(False); self.t3_chk_show_all.blockSignals(False); self.update_tab3_visualization()
+        
         eval_path = self.t3_model.get_path(); display_name = Path(eval_path).name
         if display_name == "best_model.pt":
             source_txt = Path(eval_path).parent / "best_model_source.txt"
