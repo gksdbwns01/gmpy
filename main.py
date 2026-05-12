@@ -1220,9 +1220,9 @@ class LogTabWidget(QWidget):
         layout.addLayout(filter_layout)
 
         # --- Main Splitter ---
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = QSplitter(Qt.Vertical) # <-- 핵심: 상하 분할
         
-        # Left: Table
+        # [Top]: Table Area
         self.table = QTableWidget()
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1232,33 +1232,46 @@ class LogTabWidget(QWidget):
         self.table.itemDoubleClicked.connect(self.on_row_double_clicked)
         splitter.addWidget(self.table)
         
-        # Right: Details
+        # [Bottom]: Details Panel
         self.details_panel = QWidget()
         details_layout = QVBoxLayout(self.details_panel)
-        self.lbl_detail_title = QLabel("<b>[상세 정보]</b> 목록에서 항목을 선택하세요.")
-        details_layout.addWidget(self.lbl_detail_title)
+        details_layout.setContentsMargins(0, 10, 0, 0)
         
+        # 상세 정보 헤더 (제목과 버튼을 가로로 깔끔하게 배치)
+        detail_header_layout = QHBoxLayout()
+        self.lbl_detail_title = QLabel("<b>[상세 정보]</b> 목록에서 항목을 선택하세요.")
         self.btn_open_folder = QPushButton("📂 저장 폴더 열기")
         self.btn_open_folder.setEnabled(False)
         self.btn_open_folder.clicked.connect(self.open_current_folder)
-        details_layout.addWidget(self.btn_open_folder)
+        self.btn_open_folder.setFixedWidth(150)
         
-        if self.tab_type == 'eval':
-            self.lbl_wrong_imgs = QLabel("<b>오답 이미지 목록:</b>")
-            details_layout.addWidget(self.lbl_wrong_imgs)
-            self.list_wrong_imgs = QListWidget()
-            self.list_wrong_imgs.itemDoubleClicked.connect(self.on_wrong_image_double_clicked)
-            details_layout.addWidget(self.list_wrong_imgs)
-            
-        details_layout.addWidget(QLabel("<b>[설정(Config) 파라미터]</b>"))
+        detail_header_layout.addWidget(self.lbl_detail_title)
+        detail_header_layout.addStretch() # 중간 여백을 밀어서 버튼을 우측 정렬
+        detail_header_layout.addWidget(self.btn_open_folder)
+        details_layout.addLayout(detail_header_layout)
+        
+        # 상세 정보 탭 생성 (Config와 오답 이미지를 분리)
+        self.detail_tabs = QTabWidget()
+        
+        # 1. Config 탭
         self.txt_config = QTextEdit()
         self.txt_config.setReadOnly(True)
         self.txt_config.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas, monospace; font-size: 12px;")
-        details_layout.addWidget(self.txt_config)
+        self.detail_tabs.addTab(self.txt_config, "⚙️ 설정 (Config) 및 변경점")
+        
+        # 2. 오답 이미지 탭 (평가 탭일 경우에만 추가)
+        if self.tab_type == 'eval':
+            self.list_wrong_imgs = QListWidget()
+            self.list_wrong_imgs.itemDoubleClicked.connect(self.on_wrong_image_double_clicked)
+            self.detail_tabs.addTab(self.list_wrong_imgs, "🖼️ 오답 이미지 목록")
+            
+        details_layout.addWidget(self.detail_tabs)
         
         splitter.addWidget(self.details_panel)
-        splitter.setSizes([900, 400])
-        layout.addWidget(splitter, stretch=1) 
+        
+        # 위젯 초기 비율 설정 (위쪽 테이블 60%, 아래쪽 상세정보 40%)
+        splitter.setSizes([600, 400]) 
+        layout.addWidget(splitter, stretch=1)
         
         # --- Bottom Paging Area ---
         paging_layout = QHBoxLayout()
@@ -1528,8 +1541,48 @@ class LogTabWidget(QWidget):
             open_folder(path)
 
     def on_wrong_image_double_clicked(self, item):
-        img_name = item.text()
-        QMessageBox.information(self, "안내", f"선택한 이미지: {img_name}\n\n* 실제 이미지를 보려면 프로젝트 폴더(runs/eval)를 확인하세요.")
+        clicked_img_name = item.text()
+        workspace_dir = self.db_manager.db_path.parent
+        eval_runs_dir = workspace_dir / "runs" / "eval"
+        
+        valid_paths = []
+        target_idx = 0
+        
+        # 선택된 행의 설정(Config)을 참조하여 정확한 평가 폴더 찾기 시도
+        run_dir = None
+        selected = self.table.selectedItems()
+        if selected:
+            r = selected[0].row()
+            row_data = self.current_rows[r]
+            try:
+                cfg = json.loads(row_data[8])
+                base_run_name = cfg.get("tab3", {}).get("run_name", "check01")
+                if "Tab 4" in row_data[3]: # Tab 4 Final Eval인 경우
+                    run_dir = eval_runs_dir / (base_run_name + "_final_eval")
+                else:
+                    run_dir = eval_runs_dir / base_run_name
+            except: pass
+
+        # 리스트에 있는 모든 오답 이미지의 실제 경로 추적 (방향키로 넘겨보기 위함)
+        for i in range(self.list_wrong_imgs.count()):
+            name = self.list_wrong_imgs.item(i).text()
+            p = run_dir / name if run_dir else None
+            
+            # 정확한 폴더에 없으면 eval_runs_dir 내의 모든 폴더 1뎁스 탐색 (속도 저하 방지)
+            if not p or not p.exists():
+                found = list(eval_runs_dir.glob(f"*/{name}"))
+                if found: p = found[0]
+                
+            if p and p.exists():
+                valid_paths.append(str(p))
+                if name == clicked_img_name:
+                    target_idx = len(valid_paths) - 1
+                    
+        if valid_paths:
+            # 미리 만들어둔 ImagePreviewDialog를 재활용하여 크게 띄움 (좌우 방향키 작동)
+            ImagePreviewDialog(valid_paths, target_idx, self).exec_()
+        else:
+            QMessageBox.warning(self, "이미지 찾기 실패", f"'{clicked_img_name}' 이미지를 찾을 수 없습니다.\n평가 폴더(runs/eval)에서 삭제되거나 다른 곳으로 이동되었을 수 있습니다.")
 
     def open_current_folder(self):
         path = self.btn_open_folder.property("target_path")
@@ -1546,7 +1599,7 @@ class LogViewerDialog(QDialog):
     def __init__(self, db_manager, parent=None):
         super().__init__(parent)
         self.setWindowTitle("📊 프로젝트 통합 히스토리 (고급 검색/필터 적용)")
-        self.resize(1400, 800)
+        self.resize(1600, 800)
         self.db_manager = db_manager
         
         layout = QVBoxLayout(self)
