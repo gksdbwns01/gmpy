@@ -1402,8 +1402,19 @@ class LogTabWidget(QWidget):
             
             model_path_str = row_data[3].split('|')[-1].strip() if '|' in row_data[3] else row_data[3]
             try:
-                # 평가 탭에서 저장 폴더 열기 클릭 시, 해당 모델 파일이 있는 폴더 원본으로 이동하도록 수정 (parent)
-                save_dir = str(Path(model_path_str).parent) 
+                model_path = Path(model_path_str)
+                # best_model.pt인 경우 원본 학습 폴더(fold_N)로 연결
+                if model_path.name == "best_model.pt":
+                    source_txt = model_path.parent / "best_model_source.txt"
+                    if source_txt.exists():
+                        original_path = Path(source_txt.read_text(encoding='utf-8').strip())
+                        # 원본이 weights/best.pt 형태면 parent.parent(학습 결과 최상위 폴더)로, 아니면 parent로
+                        save_dir = str(original_path.parent.parent) if original_path.parent.name == "weights" else str(original_path.parent)
+                    else:
+                        save_dir = str(model_path.parent)
+                else:
+                    # 일반 모델 (예: 재학습 완료 모델)인 경우에도 상위 폴더(학습 결과 폴더)로 이동
+                    save_dir = str(model_path.parent.parent) if model_path.parent.name == "weights" else str(model_path.parent)
             except:
                 save_dir = ""
                 

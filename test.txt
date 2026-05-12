@@ -41,8 +41,9 @@ https://discord.com/api/webhooks/1499309543136690248/cr2zCJUKE9MM1xgxetzuX-ZTWqa
 db에서의 경로는 복사본 경로가 아니라 원본 경로
 kfold는 덮어쓰지 않음. 재학습은 덮어씀
 db 기능 추가. ui변경
+평가및오답기록 db에서 저장폴더 원본으로 변경
 
-평가및오답기록 db에서 저장폴더 열기 개선 전, 로그 개선 전
+로그 개선 전
 
 db에서 설정 가져오기 - db에 모델이 저장되는지 확인해야됨
 -Closing dataloader mosaic 이후 딜레이 있음
