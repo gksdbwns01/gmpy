@@ -113,21 +113,21 @@ class ConfigBuilder:
             "tab6": {"class_map": w.t6_class_map.toPlainText(), "color": w.t6_color_combo.currentText(), "auto_thr": w.t6_auto_thr.value(), "auto_nms": w.t6_auto_nms.value()}
         }
 
+# 👉 [개선] SQLite 연결 최적화 및 WAL 모드 지원
 class LogDatabase:
     def __init__(self, db_path):
         self.db_path = Path(db_path)
         logger.debug(f"LogDatabase 초기화. 경로: {self.db_path}")
-    # 👉 추가된 헬퍼 메서드: 연결할 때마다 timeout과 WAL 모드를 자동으로 적용
+
     def _get_connection(self):
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
+
     def _ensure_db(self):
         if not self.db_path.parent.exists(): 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             logger.info(f"DB 상위 폴더 생성됨: {self.db_path.parent}")
-            
-        # 👉 기존 sqlite3.connect 대신 헬퍼 메서드 사용
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('CREATE TABLE IF NOT EXISTS training_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, task_type TEXT, model_name TEXT, epochs INTEGER, batch_size INTEGER, best_map REAL, save_dir TEXT, config_json TEXT)')
@@ -137,7 +137,7 @@ class LogDatabase:
     def insert_log(self, task_type, model_name, epochs, batch, best_map, save_dir, config_data):
         self._ensure_db()
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 conn.execute('INSERT INTO training_logs (timestamp, task_type, model_name, epochs, batch_size, best_map, save_dir, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), task_type, model_name, epochs, batch, best_map, save_dir, json.dumps(config_data, ensure_ascii=False)))
                 conn.commit()
             logger.info(f"학습 로그 DB 삽입 완료. Task: {task_type}, Best mAP: {best_map:.4f}")
@@ -146,7 +146,7 @@ class LogDatabase:
     def insert_eval_log(self, task_type, model_name, total, wrong, accuracy, wrong_imgs_list, config_data):
         self._ensure_db()
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 conn.execute('INSERT INTO evaluation_logs (timestamp, task_type, model_name, total_imgs, wrong_count, accuracy, wrong_images, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), task_type, model_name, total, wrong, accuracy, json.dumps([Path(p).name for p in wrong_imgs_list], ensure_ascii=False), json.dumps(config_data, ensure_ascii=False)))
                 conn.commit()
             logger.info(f"평가 로그 DB 삽입 완료. Task: {task_type}, Acc: {accuracy:.2f}%")
@@ -158,7 +158,7 @@ class LogDatabase:
         table_name = 'training_logs' if table_type == 'train' else 'evaluation_logs'
         placeholders = ','.join('?' for _ in ids)
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 conn.execute(f'DELETE FROM {table_name} WHERE id IN ({placeholders})', ids)
                 conn.commit()
             logger.info(f"DB 레코드 삭제 완료. Table: {table_name}, IDs: {ids}")
@@ -180,7 +180,7 @@ class LogDatabase:
             
         count_query = query.replace("SELECT *", "SELECT COUNT(*)")
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 total = conn.execute(count_query, params).fetchone()[0]
                 if limit > 0:
                     query += f" ORDER BY {sort_col} {sort_order} LIMIT ? OFFSET ?"
@@ -219,6 +219,14 @@ def create_heartbeat_callback(webhook_url, total_epochs, interval):
         if current_epoch % interval == 0:
             logger.debug(f"웹훅 Heartbeat 발생: Epoch {current_epoch}/{total_epochs}")
             send_discord_webhook(webhook_url, f"💓 **[학습 진행 상황]** {current_epoch} / {total_epochs} Epochs\n📉 현재 Total Loss: `{trainer.tloss.sum().item():.4f}`")
+    return on_train_epoch_end
+
+# 👉 [개선] Graceful Stop을 위한 YOLO 커스텀 콜백 추가
+def create_stop_callback(stop_event):
+    def on_train_epoch_end(trainer):
+        if stop_event is not None and stop_event.is_set():
+            logger.info("🛑 사용자의 중지 요청 감지. 이번 Epoch를 끝으로 학습을 안전하게 조기 종료합니다.")
+            trainer.stop = True
     return on_train_epoch_end
 
 class WebhookSettingsDialog(QDialog):
@@ -266,6 +274,10 @@ def _single_tune_run(args, queue):
         if args.get("webhook_url") and args.get("noti_flags", {}).get("epoch", False):
             interval = args.get("noti_flags", {}).get("epoch_interval", 100)
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], args["adaptive_epochs"], interval))
+            
+        # 👉 [개선] Graceful Stop 콜백 연결
+        if args.get("stop_event"):
+            model.add_callback("on_train_epoch_end", create_stop_callback(args["stop_event"]))
 
         res = model.train(
             data=str(args["data_yaml"]), epochs=args["adaptive_epochs"], patience=args["tune_patience"], 
@@ -301,6 +313,7 @@ def _tune_worker(args, queue):
         model_name, iterations = args["model_name"], args["iterations"]
         tune_epochs = args.get("tune_epochs", 30)
         tune_patience = args.get("tune_patience", 5)
+        stop_event = args.get("stop_event")
         
         tune_base = workspace_dir / "runs" / "tune_custom"
         if tune_base.exists(): shutil.rmtree(tune_base); worker_logger.debug("기존 tune_custom 폴더 삭제 완료")
@@ -337,6 +350,17 @@ def _tune_worker(args, queue):
         rng = random.Random(time.time())
         
         for gen in range(iterations):
+            # 👉 [개선] Graceful Stop 지원 - 루프 시작 전 체크
+            if stop_event and stop_event.is_set():
+                worker_logger.info("🛑 사용자에 의한 탐색 취소")
+                if not search_history:
+                    result["error"] = "사용자에 의해 탐색이 취소되었습니다."
+                    queue.put(result)
+                    return
+                else:
+                    worker_logger.info("지금까지의 탐색 결과를 저장하고 종료합니다.")
+                    break
+
             current_params = best_params.copy()
             worker_logger.debug(f"--- 튜닝 세대 {gen+1}/{iterations} --- 시작")
             
@@ -348,17 +372,17 @@ def _tune_worker(args, queue):
                 
             adaptive_epochs = max(10, int((tune_epochs // 2) + (tune_epochs - tune_epochs // 2) * (gen / max(1, iterations - 1))))
             
-            # 👉 하위 프로세스 생성 및 대기 (메모리 100% 반환 보장)
             run_args = {
                 "model_name": model_name, "data_yaml": data_yaml, "adaptive_epochs": adaptive_epochs,
                 "tune_patience": tune_patience, "batch": args["batch"], "workers": args["workers"],
                 "tune_base": tune_base, "gen": gen, "current_params": current_params,
-                "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {})
+                "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}),
+                "stop_event": stop_event
             }
             run_queue = multiprocessing.Queue()
             p = multiprocessing.Process(target=_single_tune_run, args=(run_args, run_queue))
             p.start()
-            p.join() # 학습 끝날때까지 블로킹
+            p.join() 
             
             if not run_queue.empty():
                 run_res = run_queue.get()
@@ -393,7 +417,7 @@ def _tune_worker(args, queue):
         result["best_params"] = best_params
         result["success"] = True
         result["history"] = search_history
-        result["msg"] = f"✅ 맞춤형 파라미터 탐색 완료\n최고 잠재력 점수: {best_score:.1f}점\n총 {iterations}세대 탐색 완료"
+        result["msg"] = f"✅ 맞춤형 파라미터 탐색 완료\n최고 잠재력 점수: {best_score:.1f}점\n총 {len(search_history)}세대 탐색 완료"
         worker_logger.info(f"[AutoML Worker] 튜닝 최종 완료. 소요시간: {time.time() - start_time:.1f}s")
         
     except Exception: 
@@ -420,6 +444,7 @@ def _auto_threshold_worker(args, queue):
         model_path, img_dir, lbl_dir = Path(args["model_path"]), Path(args["img_dir"]), Path(args["lbl_dir"])
         match_iou_thr = max(args.get("match_iou", 0.50), 0.1)
         agnostic, max_det = args.get("agnostic", True), args.get("max_det", 300)
+        stop_event = args.get("stop_event")
         
         worker_logger.debug("모델 로딩 중...")
         model = YOLO(str(model_path))
@@ -438,7 +463,6 @@ def _auto_threshold_worker(args, queue):
         if total_imgs == 0:
             raise ValueError("평가할 이미지가 없습니다.")
         
-        # Ground Truth 데이터 로드
         gt_data = []
         for img_path in img_files:
             txt = lbl_dir / Path(img_path).with_suffix(".txt").name
@@ -499,7 +523,6 @@ def _auto_threshold_worker(args, queue):
             clear_vram()
             return img_correct, f1 * 100, precision, recall
         
-        # 1차: 더 촘촘한 그리드
         conf_1st = [0.05, 0.15, 0.25, 0.45, 0.65, 0.85, 0.95]
         iou_1st = [0.25, 0.40, 0.55, 0.70, 0.85]
         
@@ -508,6 +531,12 @@ def _auto_threshold_worker(args, queue):
         
         for c in conf_1st:
             for i in iou_1st:
+                # 👉 [개선] Graceful Stop 지원
+                if stop_event and stop_event.is_set():
+                    result["error"] = "사용자에 의해 스레숄드 탐색이 취소되었습니다."
+                    queue.put(result)
+                    return
+
                 img_correct, f1, precision, recall = eval_yolo(c, i)
                 candidates.append({
                     "img_correct": img_correct,
@@ -517,7 +546,6 @@ def _auto_threshold_worker(args, queue):
                     "conf": c,
                     "iou": i
                 })
-                # 👉 수정: debug를 info로 변경하여 CMD에 실시간 진행 상황 표시
                 worker_logger.info(f"⏳ [1차 탐색 중] Conf: {c:.2f}, IoU: {i:.2f} → 완벽 일치: {img_correct}장, F1: {f1:.2f}%")
         
         candidates_sorted = sorted(
@@ -545,11 +573,16 @@ def _auto_threshold_worker(args, queue):
             fine_i_start = max(0.01, ti - iou_range)
             fine_i_end = min(0.99, ti + iou_range)
             
-            # 👉 수정: debug를 info로 변경
             worker_logger.info(f"🔍 [2차 정밀 탐색 중] Top-{rank} 후보 주변 탐색: Conf({fine_c_start:.2f}~{fine_c_end:.2f}), IoU({fine_i_start:.2f}~{fine_i_end:.2f})")
             
             for c in np.arange(fine_c_start, fine_c_end + 0.02, 0.03):
                 for i in np.arange(fine_i_start, fine_i_end + 0.02, 0.03):
+                    # 👉 [개선] Graceful Stop 지원
+                    if stop_event and stop_event.is_set():
+                        result["error"] = "사용자에 의해 스레숄드 탐색이 취소되었습니다."
+                        queue.put(result)
+                        return
+
                     img_correct, f1, precision, recall = eval_yolo(c, i)
                     
                     is_new_best = (
@@ -562,7 +595,6 @@ def _auto_threshold_worker(args, queue):
                         best_f1 = f1
                         best_conf = round(float(c), 2)
                         best_iou = round(float(i), 2)
-                        # 👉 수정: 최고점 갱신 시 info로 강조하여 출력
                         worker_logger.info(f"✨ [최고점 갱신!] Conf={c:.3f}, IoU={i:.3f} → 완벽 일치={img_correct}장, F1={f1:.2f}%")
         
         result["success"] = True
@@ -611,6 +643,10 @@ def _single_fold_run(args, queue):
             interval = args.get("noti_flags", {}).get("epoch_interval", 100)
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], args["epochs"], interval))
 
+        # 👉 [개선] Graceful Stop 콜백 연결
+        if args.get("stop_event"):
+            model.add_callback("on_train_epoch_end", create_stop_callback(args["stop_event"]))
+
         res = model.train(
             data=str(args["data_yaml"]), epochs=args["epochs"], patience=args["patience"], imgsz=args["imgsz"], 
             batch=args["batch"], workers=args["workers"], project=str(args["runs_dir"]), name=args["run_name"], 
@@ -636,6 +672,7 @@ def _kfold_train_worker(args, queue):
     worker_logger.info(f"[K-Fold Worker] 학습 시작. Folds: {args['num_folds']}, Model: {args['model_name']}, Epochs: {args['epochs']}")
     try:
         processed_dir, workspace_dir = Path(args["processed_dir"]), Path(args["workspace_dir"])
+        stop_event = args.get("stop_event")
         kfold_base = workspace_dir / "kfold"; runs_dir = workspace_dir / "runs" / "kfold_train"
         img_map = {f.stem: f for f in sorted((processed_dir / "images").glob("*.jpg"))}
         lbl_map = {f.stem: f for f in sorted((processed_dir / "labels").glob("*.txt"))}
@@ -649,20 +686,31 @@ def _kfold_train_worker(args, queue):
         for img, lbl in test_files: shutil.copy(img, test_img_dir); shutil.copy(lbl, test_lbl_dir)
         fold_metrics, fold_save_dirs = [], {}
         splits = [(train_test_split(train_val, test_size=args["test_split"], random_state=args["random_seed"]))] if args["num_folds"] == 1 else list(KFold(n_splits=args["num_folds"], shuffle=True, random_state=args["random_seed"]).split(train_val))
+        
         for fold, split_data in enumerate(splits):
+            # 👉 [개선] Graceful Stop 지원
+            if stop_event and stop_event.is_set():
+                worker_logger.info("🛑 사용자에 의한 K-Fold 진행 취소")
+                if not fold_metrics:
+                    result["error"] = "사용자에 의해 학습이 취소되었습니다."
+                    queue.put(result)
+                    return
+                else:
+                    worker_logger.info("지금까지 완료된 Fold 중에서 최적의 모델을 선택합니다.")
+                    break
+
             fold_num = fold + 1; fd = kfold_base / f"fold_{fold_num}"; fd.mkdir(exist_ok=True)
             worker_logger.info(f"--- Fold {fold_num}/{args['num_folds']} 학습 시작 ---")
             tr, vl = split_data if args["num_folds"] == 1 else (np.array(train_val)[split_data[0]], np.array(train_val)[split_data[1]])
             tr_txt, vl_txt = fd / "train.txt", fd / "val.txt"; tr_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in tr)); vl_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in vl))
             data_yaml = fd / "data.yaml"; data_yaml.write_text(f"train: {tr_txt.resolve()}\nval: {vl_txt.resolve()}\ntest: {test_img_dir.resolve()}\nnc: {len(args['class_names'])}\nnames: {args['class_names']}\n")
             
-            # 👉 하위 프로세스 생성 및 대기 (메모리 100% 반환 보장)
             run_name = f"fold_{fold_num}" if args["num_folds"] > 1 else "single_train"
             run_args = {
                 "model_name": args["model_name"], "data_yaml": data_yaml, "epochs": args["epochs"], "patience": args.get("patience",100),
                 "imgsz": args["imgsz"], "batch": args["batch"], "workers": args["workers"], "runs_dir": runs_dir, "run_name": run_name,
                 "seed": args["random_seed"], "deterministic": args["deterministic"], "aug": args["aug"], "loss": args["loss"],
-                "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {})
+                "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}), "stop_event": stop_event
             }
             
             run_queue = multiprocessing.Queue()
@@ -727,6 +775,10 @@ def _retrain_worker(args, queue):
         if p.get("webhook_url") and p.get("noti_flags", {}).get("epoch", False):
             interval = p.get("noti_flags", {}).get("epoch_interval", 10) 
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(p["webhook_url"], p["rt_epochs"], interval))
+
+        # 👉 [개선] Graceful Stop 콜백 연결
+        if p.get("stop_event"):
+            model.add_callback("on_train_epoch_end", create_stop_callback(p["stop_event"]))
 
         res = model.train(data=str(yaml_rt), epochs=p["rt_epochs"], imgsz=p["imgsz"], batch=p["rt_batch"], project=str(runs_dir), name=p["rt_run_name"], exist_ok=True, hsv_h=p["rt_h"], hsv_s=p["rt_s"], hsv_v=p["rt_v"], flipud=p["rt_flipud"], fliplr=p["rt_fliplr"], mosaic=p["rt_mosaic"], mixup=p["rt_mix"], copy_paste=p["rt_cp"], cls=p["rt_cls"], box=p["rt_box"], verbose=True)
         
@@ -1292,7 +1344,7 @@ class LabelingView(QGraphicsView):
         if img is None: return False, "이미지를 읽을 수 없습니다."
         self.save_state(); total_added = 0
         for tmpl_data in self.saved_templates:
-            template, class_id, w, h = tmpl_data['template'], tmpl_data['class_id'], tmpl_data['w'], tmpl_data['h']
+            template, class_id, w, h = tmpl_data['template'], class_id, tmpl_data['w'], tmpl_data['h']
             res = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
             loc = np.where(res >= threshold)
             cand_boxes, scores = [], []
@@ -2247,30 +2299,40 @@ class MainWindow(QMainWindow):
 
     def start_training_process(self, worker_func, args):
         logger.info(f"멀티프로세싱 워커 시작. 대상 함수: {worker_func.__name__}")
-        self.train_queue = multiprocessing.Queue(); self.training_process = multiprocessing.Process(target=worker_func, args=(args, self.train_queue)); self.training_process.start()
-        self.monitor_thread = ProcessMonitorThread(self.train_queue, self.training_process); self.monitor_thread.finished_ok.connect(self.on_training_finished); self.monitor_thread.error.connect(self.on_training_fatal_error); self.monitor_thread.start()
+        
+        # 👉 [개선] Graceful Stop Event 생성 및 args에 추가
+        self.stop_event = multiprocessing.Event()
+        args["stop_event"] = self.stop_event
+        
+        self.train_queue = multiprocessing.Queue()
+        self.training_process = multiprocessing.Process(target=worker_func, args=(args, self.train_queue))
+        self.training_process.start()
+        
+        self.monitor_thread = ProcessMonitorThread(self.train_queue, self.training_process)
+        self.monitor_thread.finished_ok.connect(self.on_training_finished)
+        self.monitor_thread.error.connect(self.on_training_fatal_error)
+        self.monitor_thread.start()
+        
         webhook_url = self.webhook_url
         if webhook_url and self.noti_flags.get("start"): send_discord_webhook(webhook_url, "▶️ **[작업 시작]** 새로운 백그라운드 작업이 시작되었습니다.")
+        
         self.btn_webhook_settings.setEnabled(False)
-        self.t2_btn_run.setEnabled(False); self.t2_btn_tune.setEnabled(False); self.t4_btn_retrain.setEnabled(False); self.t4_btn_auto_thr.setEnabled(False); self.t3_btn_auto_thr.setEnabled(False); self.t2_scroll.setEnabled(False); self.t4_scroll.setEnabled(False); self.g_model.setEnabled(False); self.g_imgsz.setEnabled(False); self.t2_btn_stop.setEnabled(True)
+        self.t2_btn_run.setEnabled(False); self.t2_btn_tune.setEnabled(False); self.t4_btn_retrain.setEnabled(False); self.t4_btn_auto_thr.setEnabled(False); self.t3_btn_auto_thr.setEnabled(False); self.t2_scroll.setEnabled(False); self.t4_scroll.setEnabled(False); self.g_model.setEnabled(False); self.g_imgsz.setEnabled(False)
+        
+        self.t2_btn_stop.setText("🛑 안전 종료(Graceful Stop)")
+        self.t2_btn_stop.setEnabled(True)
         
         self.start_dynamic_status("백그라운드 작업 진행 중")
 
+    # 👉 [개선] Taskkill 방식 대신 이벤트 트리거를 통한 우아한 종료 적용
     def stop_training(self):
-        logger.warning("사용자에 의한 프로세스 강제 종료 요청")
+        logger.warning("사용자에 의한 안전한 프로세스 종료(Graceful Stop) 요청")
         if self.training_process and self.training_process.is_alive():
-            try:
-                if platform.system() == "Windows": import subprocess; subprocess.call(["taskkill", "/F", "/T", "/PID", str(self.training_process.pid)])
-                else: os.kill(self.training_process.pid, signal.SIGKILL)
-                logger.info(f"프로세스({self.training_process.pid}) 종료 완료")
-            except Exception as e: 
-                logger.error(f"프로세스 종료 중 에러: {e}", exc_info=True)
-            webhook_url = self.webhook_url
-            if webhook_url and self.noti_flags.get("error"): send_discord_webhook(webhook_url, "🛑 **[작업 강제 종료]**\n프로세스가 강제 중단되었습니다.")
-            self._restore_training_ui()
-            
-            self.stop_dynamic_status("🛑 작업이 강제 종료되었습니다.")
-            self.training_process = None
+            if hasattr(self, 'stop_event'):
+                self.stop_event.set()
+                self.statusBar().showMessage("🛑 진행 중인 작업을 안전하게 마무리하고 종료합니다. 잠시만 기다려주십시오...")
+                self.t2_btn_stop.setEnabled(False)
+                self.t2_btn_stop.setText("종료 처리 중...")
 
     def on_training_finished(self, res):
         logger.info(f"워커 프로세스 완료. 결과: Success={res.get('success')}, Task={res.get('task')}")
@@ -2282,7 +2344,7 @@ class MainWindow(QMainWindow):
             if res.get("success"):
                 send_discord_webhook(self.webhook_url, f"✅ **[작업 완료]** {res.get('task').upper()} 작업이 성공적으로 완료되었습니다.")
             else:
-                send_discord_webhook(self.webhook_url, f"⚠️ **[작업 실패]** {res.get('task').upper()} 작업이 실패했습니다.")
+                send_discord_webhook(self.webhook_url, f"⚠️ **[작업 실패/취소]** {res.get('task').upper()} 작업이 종료되었습니다.\n상세: {res.get('error', '알 수 없음')}")
 
         if res.get("success"):
             task = res.get("task"); current_config = self.config_builder.build(self)
@@ -2329,7 +2391,9 @@ class MainWindow(QMainWindow):
                 self.log_db.insert_log(task_type="Hard Retrain", model_name=Path(self.t4_base.get_path()).name, epochs=self.t4_epochs.value(), batch=self.t4_batch.value(), best_map=-1.0, save_dir=res.get("model_path", "경로 없음"), config_data=current_config)
                 if res.get("model_path"): 
                     self.t4_eval_model_display.setText(res["model_path"]); self.t4_btn_eval.setEnabled(True); self.statusBar().showMessage(f"✅ 재학습 모델 준비 완료: {Path(res['model_path']).name}")
-        else: QMessageBox.critical(self, "실패", res.get("error", "알 수 없는 오류"))
+        else: 
+            QMessageBox.critical(self, "결과 알림", res.get("error", "알 수 없는 오류"))
+        
         self.training_process = None
 
     def on_training_fatal_error(self, error_msg):
@@ -2351,7 +2415,9 @@ class MainWindow(QMainWindow):
 
     def _restore_training_ui(self):
         self.btn_webhook_settings.setEnabled(True)
-        self.t2_btn_run.setEnabled(True); self.t2_btn_tune.setEnabled(True); self.t4_btn_retrain.setEnabled(True); self.t4_btn_auto_thr.setEnabled(True); self.t3_btn_auto_thr.setEnabled(True); self.t2_scroll.setEnabled(True); self.t4_scroll.setEnabled(True); self.g_model.setEnabled(True); self.g_imgsz.setEnabled(True); self.t2_btn_stop.setEnabled(False)
+        self.t2_btn_run.setEnabled(True); self.t2_btn_tune.setEnabled(True); self.t4_btn_retrain.setEnabled(True); self.t4_btn_auto_thr.setEnabled(True); self.t3_btn_auto_thr.setEnabled(True); self.t2_scroll.setEnabled(True); self.t4_scroll.setEnabled(True); self.g_model.setEnabled(True); self.g_imgsz.setEnabled(True)
+        self.t2_btn_stop.setEnabled(False)
+        self.t2_btn_stop.setText("🛑 안전 종료(Graceful Stop)")
 
     def show_kfold_metrics_dialog(self, metrics_data, title_msg, best_fold):
         logger.debug(f"K-Fold 검증 다이얼로그 오픈 (Best Fold: {best_fold})")
@@ -2635,7 +2701,9 @@ class MainWindow(QMainWindow):
         h_tune.addWidget(self.btn_show_tune_history)
         
         self.t2_btn_run = QPushButton("🚀 K-Fold 학습 시작"); self.t2_btn_run.clicked.connect(self.run_tab2)
-        self.t2_btn_stop = QPushButton("🛑 강제 종료"); self.t2_btn_stop.clicked.connect(self.stop_training); self.t2_btn_stop.setEnabled(False)
+        
+        # 👉 [개선] 강제 종료 대신 "안전 종료(Graceful Stop)" 버튼으로 변경
+        self.t2_btn_stop = QPushButton("🛑 안전 종료(Graceful Stop)"); self.t2_btn_stop.clicked.connect(self.stop_training); self.t2_btn_stop.setEnabled(False)
         
         l = QVBoxLayout(); self.t2_scroll = self._create_scroll(h_form); l.addWidget(self.t2_scroll)
         
@@ -2673,7 +2741,7 @@ class MainWindow(QMainWindow):
             "workers": self.t2_workers.value(), "class_names": list(cmap_or_error.keys()), 
             "initial_params": initial_params, "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value(), 
             "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags(),
-            "tune_epochs": 30, "tune_patience": 5 # 추가된 설정
+            "tune_epochs": 30, "tune_patience": 5
         }
         self.start_training_process(_tune_worker, args)
 

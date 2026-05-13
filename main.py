@@ -431,6 +431,10 @@ def _auto_threshold_worker(args, queue):
     from pathlib import Path
     from ultralytics import YOLO
     
+    # 👉 [추가] PyTorch 및 NMS 연산을 위한 라이브러리 임포트
+    import torch
+    import torchvision.ops as ops 
+    
     start_time = time.time()
     result = {
         "success": False, "task": "threshold", "error": "",
@@ -438,7 +442,7 @@ def _auto_threshold_worker(args, queue):
         "msg": "", "top5_params": [] 
     }
     
-    worker_logger.info(f"[AutoThreshold Worker] 임계값 자동 탐색 시작. Model: {args['model_path']}")
+    worker_logger.info(f"[AutoThreshold Worker] 임계값 자동 탐색 시작 (캐싱 모드). Model: {args['model_path']}")
     
     try:
         model_path, img_dir, lbl_dir = Path(args["model_path"]), Path(args["img_dir"]), Path(args["lbl_dir"])
@@ -477,19 +481,77 @@ def _auto_threshold_worker(args, queue):
                         })
             gt_data.append(boxes)
         
+        # ---------------------------------------------------------
+        # 👉 [핵심 개선] 1회 전체 예측 및 캐싱 (Batch Predict Cache)
+        # ---------------------------------------------------------
+        worker_logger.info("⚡ 속도 최적화를 위한 이미지 1회 일괄 추론 및 캐싱 진행 중...")
+        
+        res_cached = model.predict(
+            source=[str(p) for p in img_files],
+            conf=0.001,  # 가장 낮은 Conf로 모든 박스 추출
+            iou=0.999,   # NMS를 거의 수행하지 않음
+            max_det=30000, # 최대한 많은 박스 유지
+            agnostic_nms=agnostic, verbose=False, stream=True
+        )
+        
+        cached_predictions = []
+        for r in res_cached:
+            # GPU VRAM을 비우기 위해 .cpu()로 RAM에 적재
+            cached_predictions.append({
+                "xyxy": r.boxes.xyxy.cpu() if len(r.boxes) > 0 else torch.empty((0, 4)),
+                "xywhn": r.boxes.xywhn.cpu() if len(r.boxes) > 0 else torch.empty((0, 4)),
+                "scores": r.boxes.conf.cpu() if len(r.boxes) > 0 else torch.empty(0),
+                "classes": r.boxes.cls.cpu() if len(r.boxes) > 0 else torch.empty(0)
+            })
+            
+        worker_logger.info(f"✅ 총 {len(cached_predictions)}장 캐싱 완료. 모델 메모리 해제.")
+        
+        # 신경망 추론이 끝났으므로 VRAM 해제
+        del model
+        clear_vram()
+        
+        # ---------------------------------------------------------
+        # 👉 [핵심 개선] 캐시된 데이터를 이용한 초고속 필터링 평가 함수
+        # ---------------------------------------------------------
         def eval_yolo(test_conf, test_iou):
-            res = model.predict(
-                source=[str(p) for p in img_files],
-                conf=test_conf, iou=test_iou, max_det=max_det,
-                agnostic_nms=agnostic, verbose=False, stream=True
-            )
             total_tp = total_fp = total_fn = img_correct = 0
             
-            for idx, r in enumerate(res):
-                pred_boxes = [
-                    {"class": int(cls.item()), "box": b.tolist()}
-                    for cls, b in zip(r.boxes.cls, r.boxes.xywhn)
-                ]
+            for idx, cache in enumerate(cached_predictions):
+                xyxy = cache["xyxy"]
+                xywhn = cache["xywhn"]
+                scores = cache["scores"]
+                classes = cache["classes"]
+                
+                # 1. Confidence Threshold 필터링
+                mask = scores >= test_conf
+                f_xyxy = xyxy[mask]
+                f_xywhn = xywhn[mask]
+                f_scores = scores[mask]
+                f_classes = classes[mask]
+                
+                # 2. PyTorch NMS (Non-Maximum Suppression) 적용
+                if len(f_xyxy) > 0:
+                    if agnostic:
+                        keep = ops.nms(f_xyxy, f_scores, test_iou)
+                    else:
+                        keep = ops.batched_nms(f_xyxy, f_scores, f_classes, test_iou)
+                    
+                    # max_det 컷오프 (NMS는 점수 역순으로 인덱스를 반환함)
+                    if len(keep) > max_det:
+                        keep = keep[:max_det]
+                        
+                    final_xywhn = f_xywhn[keep]
+                    final_classes = f_classes[keep]
+                    
+                    # 기존 정답 비교 로직과 포맷 맞추기
+                    pred_boxes = [
+                        {"class": int(cls.item()), "box": b.tolist()}
+                        for cls, b in zip(final_classes, final_xywhn)
+                    ]
+                else:
+                    pred_boxes = []
+                
+                # --- 기존과 동일한 정답 매칭 로직 ---
                 gt_boxes = gt_data[idx]
                 matched_gt = set()
                 tp = fp = 0
@@ -520,9 +582,11 @@ def _auto_threshold_worker(args, queue):
             recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
             f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
             
-            clear_vram()
             return img_correct, f1 * 100, precision, recall
         
+        # ---------------------------------------------------------
+        # 1차 / 2차 탐색 로직 (기존과 동일하지만 수십 배 빠르게 동작함)
+        # ---------------------------------------------------------
         conf_1st = [0.05, 0.15, 0.25, 0.45, 0.65, 0.85, 0.95]
         iou_1st = [0.25, 0.40, 0.55, 0.70, 0.85]
         
@@ -531,7 +595,6 @@ def _auto_threshold_worker(args, queue):
         
         for c in conf_1st:
             for i in iou_1st:
-                # 👉 [개선] Graceful Stop 지원
                 if stop_event and stop_event.is_set():
                     result["error"] = "사용자에 의해 스레숄드 탐색이 취소되었습니다."
                     queue.put(result)
@@ -577,7 +640,6 @@ def _auto_threshold_worker(args, queue):
             
             for c in np.arange(fine_c_start, fine_c_end + 0.02, 0.03):
                 for i in np.arange(fine_i_start, fine_i_end + 0.02, 0.03):
-                    # 👉 [개선] Graceful Stop 지원
                     if stop_event and stop_event.is_set():
                         result["error"] = "사용자에 의해 스레숄드 탐색이 취소되었습니다."
                         queue.put(result)
