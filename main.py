@@ -5,6 +5,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime, timedelta
 import zipfile, cv2, numpy as np, pandas as pd, psutil, torch, yaml
+
 from PyQt5.QtWidgets import QSizePolicy
 from PyQt5.QtCore import QSize, Qt, QThread, pyqtSignal, QTimer, QRectF, QSettings, QDate
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
@@ -301,7 +302,6 @@ def _tune_worker(args, queue):
             current_params = best_params.copy()
             worker_logger.debug(f"--- 튜닝 세대 {gen+1}/{iterations} --- 시작")
             
-            # 개선: 세대가 지날수록 변이 강도 감소 (첫 세대부터 바로 탐색 시작)
             mutation_strength = max(0.05, 1.0 - (gen / iterations))
             
             for k, (min_v, max_v) in bounds.items():
@@ -310,7 +310,6 @@ def _tune_worker(args, queue):
                 
             model = YOLO(model_name)
             
-            # 개선: 적응형 에포크 적용 (빠른 탐색 위해 짧게 -> 최종 길게)
             adaptive_epochs = max(10, int((tune_epochs // 2) + (tune_epochs - tune_epochs // 2) * (gen / max(1, iterations - 1))))
             
             if args.get("webhook_url") and args.get("noti_flags", {}).get("epoch", False):
@@ -339,7 +338,6 @@ def _tune_worker(args, queue):
             mAP50_95 = res.results_dict.get('metrics/mAP50-95(B)', 0)
             fitness = ((0.1 * mAP50) + (0.9 * mAP50_95)) * 100
             
-            # 개선: 탐색 과정(History) 저장
             gen_record = {
                 "generation": gen + 1,
                 "fitness": fitness,
@@ -374,72 +372,220 @@ def _tune_worker(args, queue):
 
 def _auto_threshold_worker(args, queue):
     worker_logger = setup_logger()
-    import time, traceback, numpy as np; from pathlib import Path; from ultralytics import YOLO
-    start_time = time.time(); result = {"success": False, "task": "threshold", "error": "", "best_conf": 0.25, "best_iou": 0.45, "best_acc": 0.0, "msg": ""}
+    import time, traceback, numpy as np
+    from pathlib import Path
+    from ultralytics import YOLO
+    
+    start_time = time.time()
+    result = {
+        "success": False, "task": "threshold", "error": "",
+        "best_conf": 0.25, "best_iou": 0.45, "best_acc": 0.0,
+        "msg": "", "top5_params": []  # 추가: 상위 5개 후보 저장
+    }
+    
     worker_logger.info(f"[AutoThreshold Worker] 임계값 자동 탐색 시작. Model: {args['model_path']}")
+    
     try:
         model_path, img_dir, lbl_dir = Path(args["model_path"]), Path(args["img_dir"]), Path(args["lbl_dir"])
-        match_iou_thr = max(args.get("match_iou", 0.50), 0.1); agnostic, max_det = args.get("agnostic", True), args.get("max_det", 300)
+        match_iou_thr = max(args.get("match_iou", 0.50), 0.1)
+        agnostic, max_det = args.get("agnostic", True), args.get("max_det", 300)
+        
         worker_logger.debug("모델 로딩 중...")
         model = YOLO(str(model_path))
+        
         def calc_iou(b1, b2):
-            ax1,ay1,ax2,ay2 = b1[0]-b1[2]/2, b1[1]-b1[3]/2, b1[0]+b1[2]/2, b1[1]+b1[3]/2
-            bx1,by1,bx2,by2 = b2[0]-b2[2]/2, b2[1]-b2[3]/2, b2[0]+b2[2]/2, b2[1]+b2[3]/2
+            ax1, ay1, ax2, ay2 = b1[0]-b1[2]/2, b1[1]-b1[3]/2, b1[0]+b1[2]/2, b1[1]+b1[3]/2
+            bx1, by1, bx2, by2 = b2[0]-b2[2]/2, b2[1]-b2[3]/2, b2[0]+b2[2]/2, b2[1]+b2[3]/2
             ix, iy = max(0, min(ax2,bx2)-max(ax1,bx1)), max(0, min(ay2,by2)-max(ay1,by1))
-            ia = ix*iy; return ia/((ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-ia+1e-6)
-        img_files = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png")); total_imgs = len(img_files)
+            ia = ix*iy
+            return ia/((ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-ia+1e-6)
+        
+        img_files = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))
+        total_imgs = len(img_files)
         worker_logger.debug(f"평가 대상 이미지 수: {total_imgs}장")
-        if total_imgs == 0: raise ValueError("평가할 이미지가 없습니다.")
+        
+        if total_imgs == 0:
+            raise ValueError("평가할 이미지가 없습니다.")
+        
+        # Ground Truth 데이터 로드
         gt_data = []
         for img_path in img_files:
-            txt = lbl_dir / Path(img_path).with_suffix(".txt").name; boxes = []
+            txt = lbl_dir / Path(img_path).with_suffix(".txt").name
+            boxes = []
             if txt.exists():
                 for line in txt.read_text().splitlines():
                     parts = line.strip().split()
-                    if len(parts) == 5: boxes.append({"class": int(parts[0]), "box": [float(x) for x in parts[1:]]})
+                    if len(parts) == 5:
+                        boxes.append({
+                            "class": int(parts[0]),
+                            "box": [float(x) for x in parts[1:]]
+                        })
             gt_data.append(boxes)
-
+        
         def eval_yolo(test_conf, test_iou):
-            res = model.predict(source=[str(p) for p in img_files], conf=test_conf, iou=test_iou, max_det=max_det, agnostic_nms=agnostic, verbose=False, stream=True)
+            """평가 함수"""
+            res = model.predict(
+                source=[str(p) for p in img_files],
+                conf=test_conf, iou=test_iou, max_det=max_det,
+                agnostic_nms=agnostic, verbose=False, stream=True
+            )
             total_tp = total_fp = total_fn = img_correct = 0
+            
             for idx, r in enumerate(res):
-                pred_boxes = [{"class": int(cls.item()), "box": b.tolist()} for cls, b in zip(r.boxes.cls, r.boxes.xywhn)]; gt_boxes = gt_data[idx]
-                matched_gt = set(); tp = fp = 0
+                pred_boxes = [
+                    {"class": int(cls.item()), "box": b.tolist()}
+                    for cls, b in zip(r.boxes.cls, r.boxes.xywhn)
+                ]
+                gt_boxes = gt_data[idx]
+                matched_gt = set()
+                tp = fp = 0
+                
                 for pb in pred_boxes:
                     best_iou, best_gt = 0.0, -1
                     for j, gb in enumerate(gt_boxes):
                         if j not in matched_gt and pb["class"] == gb["class"]:
                             iou = calc_iou(pb["box"], gb["box"])
-                            if iou > best_iou: best_iou, best_gt = iou, j
-                    if best_iou >= match_iou_thr: tp += 1; matched_gt.add(best_gt)
-                    else: fp += 1
-                fn = len(gt_boxes) - len(matched_gt); total_tp += tp; total_fp += fp; total_fn += fn
-                if fp == 0 and fn == 0: img_correct += 1
+                            if iou > best_iou:
+                                best_iou, best_gt = iou, j
+                    
+                    if best_iou >= match_iou_thr:
+                        tp += 1
+                        matched_gt.add(best_gt)
+                    else:
+                        fp += 1
+                
+                fn = len(gt_boxes) - len(matched_gt)
+                total_tp += tp
+                total_fp += fp
+                total_fn += fn
+                
+                if fp == 0 and fn == 0:
+                    img_correct += 1
+            
             precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
             recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
             f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-            clear_vram(); return img_correct, f1 * 100
-
-        best_img, best_f1, best_conf, best_iou = -1, -1.0, 0.25, 0.45
-        worker_logger.debug("1차 성긴 스레숄드 탐색 시작")
-        for c in [0.1, 0.3, 0.5, 0.7, 0.9]:
-            for i in [0.3, 0.5, 0.7]:
-                img_correct, f1 = eval_yolo(c, i)
-                worker_logger.debug(f"[1차] Conf: {c}, IoU: {i} -> Correct: {img_correct}, F1: {f1:.2f}")
-                if img_correct > best_img or (img_correct == best_img and f1 > best_f1): best_img, best_f1, best_conf, best_iou = img_correct, f1, c, i
-        fine_c_start = max(0.01, best_conf - 0.15); fine_c_end = min(0.99, best_conf + 0.15)
-        fine_i_start = max(0.01, best_iou - 0.15); fine_i_end = min(0.99, best_iou + 0.15)
-        worker_logger.debug(f"2차 정밀 탐색 시작 (C:{fine_c_start:.2f}~{fine_c_end:.2f}, I:{fine_i_start:.2f}~{fine_i_end:.2f})")
-        for c in np.arange(fine_c_start, fine_c_end + 0.01, 0.05):
-            for i in np.arange(fine_i_start, fine_i_end + 0.01, 0.05):
-                img_correct, f1 = eval_yolo(c, i)
-                if img_correct > best_img or (img_correct == best_img and f1 > best_f1): best_img, best_f1, best_conf, best_iou = img_correct, f1, c, i
-
-        result["success"], result["best_conf"], result["best_iou"], result["best_acc"] = True, round(float(best_conf), 2), round(float(best_iou), 2), round(float(best_f1), 1)
-        result["msg"] = f"🎯 최적 스레숄드: Conf={result['best_conf']}, IoU={result['best_iou']}\n예상 정확도: {result['best_acc']}%"
-        worker_logger.info(f"[AutoThreshold Worker] 탐색 완료. 최종 Conf: {result['best_conf']}, IoU: {result['best_iou']}, 예상 정확도: {result['best_acc']}%")
-    except Exception: result["error"] = traceback.format_exc(); worker_logger.error(f"[AutoThreshold Worker] Exception: {result['error']}")
-    finally: clear_vram(); queue.put(result)
+            
+            clear_vram()
+            return img_correct, f1 * 100, precision, recall
+        
+        # ============================================
+        # 개선된 탐색 알고리즘
+        # ============================================
+        
+        # 1차: 더 촘촘한 그리드 (7×5 = 35가지)
+        conf_1st = [0.05, 0.15, 0.25, 0.45, 0.65, 0.85, 0.95]  # 7개
+        iou_1st = [0.25, 0.40, 0.55, 0.70, 0.85]                # 5개
+        
+        worker_logger.debug(f"1차 성근 탐색: {len(conf_1st)}×{len(iou_1st)}={len(conf_1st)*len(iou_1st)}가지")
+        
+        candidates = []  # (img_correct, f1, precision, recall, conf, iou) 저장
+        
+        for c in conf_1st:
+            for i in iou_1st:
+                img_correct, f1, precision, recall = eval_yolo(c, i)
+                candidates.append({
+                    "img_correct": img_correct,
+                    "f1": f1,
+                    "precision": precision,
+                    "recall": recall,
+                    "conf": c,
+                    "iou": i
+                })
+                worker_logger.debug(f"[1차] Conf: {c:.2f}, IoU: {i:.2f} → "
+                                   f"Correct: {img_correct}, F1: {f1:.2f}")
+        
+        # Top-5 후보 선정 (1순위: img_correct, 2순위: f1)
+        candidates_sorted = sorted(
+            candidates,
+            key=lambda x: (x["img_correct"], x["f1"]),
+            reverse=True
+        )
+        top5 = candidates_sorted[:5]
+        
+        worker_logger.debug(f"Top-5 후보:")
+        for idx, cand in enumerate(top5, 1):
+            worker_logger.debug(f"  {idx}. Correct={cand['img_correct']}, "
+                               f"F1={cand['f1']:.2f}, "
+                               f"Conf={cand['conf']:.2f}, IoU={cand['iou']:.2f}")
+        
+        # 2차: Top-5 근처에서 정밀 탐색 (각 후보별)
+        best_img_correct = top5[0]["img_correct"]
+        best_f1 = top5[0]["f1"]
+        best_conf = top5[0]["conf"]
+        best_iou = top5[0]["iou"]
+        
+        worker_logger.debug("2차 정밀 탐색 시작 (Top-5 근처)")
+        
+        for rank, top_cand in enumerate(top5, 1):
+            tc, ti = top_cand["conf"], top_cand["iou"]
+            
+            # 동적 범위 설정 (경계값 고려)
+            conf_range = 0.12 if 0.01 < tc < 0.99 else 0.08
+            iou_range = 0.12 if 0.01 < ti < 0.99 else 0.08
+            
+            fine_c_start = max(0.01, tc - conf_range)
+            fine_c_end = min(0.99, tc + conf_range)
+            fine_i_start = max(0.01, ti - iou_range)
+            fine_i_end = min(0.99, ti + iou_range)
+            
+            worker_logger.debug(f"  Top-{rank} 탐색: "
+                               f"Conf({fine_c_start:.2f}~{fine_c_end:.2f}), "
+                               f"IoU({fine_i_start:.2f}~{fine_i_end:.2f})")
+            
+            for c in np.arange(fine_c_start, fine_c_end + 0.02, 0.03):
+                for i in np.arange(fine_i_start, fine_i_end + 0.02, 0.03):
+                    img_correct, f1, precision, recall = eval_yolo(c, i)
+                    
+                    # 새로운 최고점을 찾거나, 동점일 때 f1이 더 높으면 갱신
+                    is_new_best = (
+                        (img_correct > best_img_correct) or
+                        (img_correct == best_img_correct and f1 > best_f1)
+                    )
+                    
+                    if is_new_best:
+                        best_img_correct = img_correct
+                        best_f1 = f1
+                        best_conf = round(float(c), 2)
+                        best_iou = round(float(i), 2)
+                        worker_logger.debug(f"    ✨ 새로운 최고점! "
+                                           f"Conf={c:.3f}, IoU={i:.3f}, "
+                                           f"Correct={img_correct}, F1={f1:.2f}")
+        
+        result["success"] = True
+        result["best_conf"] = best_conf
+        result["best_iou"] = best_iou
+        result["best_acc"] = round(float(best_f1), 1)
+        result["best_img_correct"] = best_img_correct  # 추가 정보
+        
+        # Top-5 저장 (히스토리 용도)
+        result["top5_params"] = [
+            {
+                "rank": idx + 1,
+                "conf": top["conf"],
+                "iou": top["iou"],
+                "img_correct": top["img_correct"],
+                "f1": round(top["f1"], 2)
+            }
+            for idx, top in enumerate(top5)
+        ]
+        
+        result["msg"] = (f"🎯 최적 스레숄드 탐색 완료\n"
+                        f"• Conf={result['best_conf']}, IoU={result['best_iou']}\n"
+                        f"• 완벽 매칭 이미지: {best_img_correct}장\n"
+                        f"• 예상 F1-Score: {result['best_acc']}%")
+        
+        worker_logger.info(f"[AutoThreshold Worker] 탐색 완료. "
+                          f"Conf: {result['best_conf']}, IoU: {result['best_iou']}, "
+                          f"완벽매칭: {best_img_correct}장, F1: {result['best_acc']}%")
+        
+    except Exception:
+        result["error"] = traceback.format_exc()
+        worker_logger.error(f"[AutoThreshold Worker] Exception: {result['error']}")
+    
+    finally:
+        clear_vram()
+        queue.put(result)
 
 def _kfold_train_worker(args, queue):
     worker_logger = setup_logger()
@@ -1113,7 +1259,6 @@ class LabelingView(QGraphicsView):
         if total_added > 0: self.box_added.emit(self.get_yolo_format()) 
         return True, total_added
 
-
 class PathInputWidget(QWidget):
     def __init__(self, label, is_folder=True, default_path=""):
         super().__init__(); self.is_folder = is_folder; layout = QHBoxLayout(); layout.setContentsMargins(0, 0, 0, 0)
@@ -1673,7 +1818,6 @@ class TuneHistoryDialog(QDialog):
         try:
             df = pd.read_csv(history_csv_path)
             
-            # 상단: 튜닝 진행 상황 그래프
             self.canvas = FigureCanvas(plt.Figure(figsize=(8, 4)))
             self.toolbar = NavigationToolbar(self.canvas, self)
             layout.addWidget(self.toolbar)
@@ -1682,7 +1826,6 @@ class TuneHistoryDialog(QDialog):
             ax = self.canvas.figure.add_subplot(111)
             sns.lineplot(data=df, x='generation', y='fitness', marker='o', ax=ax, label='Fitness (잠재력 점수)', color='#e11d48', linewidth=2)
             
-            # 최고 점수 표시
             best_row = df.loc[df['fitness'].idxmax()]
             ax.annotate(f"Best: {best_row['fitness']:.2f}", 
                         xy=(best_row['generation'], best_row['fitness']), 
@@ -1696,7 +1839,6 @@ class TuneHistoryDialog(QDialog):
             ax.grid(True, linestyle='--', alpha=0.7)
             self.canvas.draw()
             
-            # 하단: 상위 5개 파라미터 조합 테이블
             layout.addWidget(QLabel("<b>🏆 상위 5개 세대 파라미터 조합 (Top 5)</b>"))
             table = QTableWidget()
             top_df = df.sort_values(by='fitness', ascending=False).head(5)
@@ -2085,7 +2227,6 @@ class MainWindow(QMainWindow):
                 if 'mixup' in bp: self.t2_amix.setValue(float(bp['mixup']))
                 if 'copy_paste' in bp: self.t2_acp.setValue(float(bp['copy_paste']))
                 
-                # 추가된 개선: 히스토리 내역 저장
                 if "history" in res:
                     try:
                         history_df = pd.DataFrame(res["history"])
@@ -2494,7 +2635,16 @@ class MainWindow(QMainWindow):
         if self.training_process and self.training_process.is_alive(): QMessageBox.warning(self, "경고", "이미 진행 중입니다."); return
         is_valid, err = self.validate_paths(평가모델_file=Path(self.t3_model.get_path()), 평가이미지_dir=Path(self.t3_img.get_path()), 정답라벨_dir=Path(self.t3_lbl.get_path()))
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
-        if QMessageBox.question(self, '스레숄드 탐색', '설정된 매칭 IoU 기준에 맞춰 최적의 Confidence와 NMS IoU 값을 탐색합니다.\n진행하시겠습니까?', QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
+        
+        msg = ('설정된 [정답 매칭 IoU] 기준에 맞춰, 모델의 성능을 최대로 만드는\n'
+               '최적의 Confidence와 NMS IoU 값을 자동 탐색합니다.\n\n'
+               '💡 탐색 로직 안내:\n'
+               '- 1순위: 완벽 정답 이미지 수 최대화\n'
+               '- 2순위: F1-Score 최대화\n'
+               '- 1차 성근 탐색 후 최적점 근처 2차 정밀 탐색을 진행합니다.\n\n'
+               '진행하시겠습니까?')
+        if QMessageBox.question(self, '스레숄드 자동 탐색', msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
+        
         args = {"model_path": self.t3_model.get_path(), "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t3_match_iou.value(), "agnostic": self.t3_agnostic.isChecked(), "max_det": self.t3_max_det.value()}
         self.start_training_process(_auto_threshold_worker, args)
 
@@ -2549,6 +2699,7 @@ class MainWindow(QMainWindow):
         f1.addRow(QLabel("<b>[기본 설정]</b>")); self.add_param(f1, "Epochs", self.t4_epochs, 10); self.add_param(f1, "Batch", self.t4_batch, 16); self.add_param(f1, "Run Name", self.t4_run, "retrain_hard_01"); self.add_param(f1, "cls Loss", self.t4_lcls, 0.5); self.add_param(f1, "box Loss", self.t4_lbox, 7.5)
         f1.addRow(QLabel("<br><b>[재학습 증강 설정]</b>")); self.add_param(f1, "HSV(H)", self.t4_ah, 0.015); self.add_param(f1, "HSV(S)", self.t4_as, 0.7); self.add_param(f1, "HSV(V)", self.t4_av, 0.4); self.add_param(f1, "Flip UD", self.t4_afud, 0.0); self.add_param(f1, "Flip LR", self.t4_aflr, 0.5); self.add_param(f1, "Mosaic", self.t4_amos, 1.0); self.add_param(f1, "Mixup", self.t4_amix, 0.0); self.add_param(f1, "Copy-Paste", self.t4_acp, 0.0)
         self.t4_scroll = self._create_scroll(f1); st1_layout.addWidget(self.t4_scroll); self.t4_btn_retrain = QPushButton("🔁 Hard Example 재학습 시작"); self.t4_btn_retrain.setMinimumHeight(40); self.t4_btn_retrain.clicked.connect(self.run_tab4_retrain); st1_layout.addWidget(self.t4_btn_retrain)
+        
         sub_tab2 = QWidget(); st2_layout = QVBoxLayout(sub_tab2); eval_group = QGroupBox("최종 평가 설정"); eval_layout = QVBoxLayout(eval_group); f2 = QFormLayout()
         self.t4_conf = QDoubleSpinBox(); self.t4_conf.setRange(0.01, 0.99); self.t4_conf.setValue(0.25); self.t4_conf.setSingleStep(0.01); self.t4_iou = QDoubleSpinBox(); self.t4_iou.setRange(0.01, 0.99); self.t4_iou.setValue(0.45); self.t4_iou.setSingleStep(0.01); self.t4_match_iou = QDoubleSpinBox(); self.t4_match_iou.setRange(0.01, 0.99); self.t4_match_iou.setValue(0.50); self.t4_match_iou.setSingleStep(0.01); self.t4_max_det = QSpinBox(); self.t4_max_det.setRange(1, 999); self.t4_max_det.setValue(99); self.t4_agnostic = QCheckBox(); self.t4_agnostic.setChecked(True)
         h_eval_model = QHBoxLayout(); self.t4_eval_model_display = QLineEdit(); self.t4_eval_model_display.setReadOnly(True); self.t4_eval_model_display.setPlaceholderText("모델을 선택하거나 첫 번째 탭에서 재학습을 완료하세요."); self.t4_eval_model_display.setStyleSheet("background-color: #f3f4f6; color: #374151; font-weight: bold;"); self.btn_t4_eval_browse = QPushButton("📂"); self.btn_t4_eval_browse.clicked.connect(self.browse_tab4_eval_model); h_eval_model.addWidget(self.t4_eval_model_display); h_eval_model.addWidget(self.btn_t4_eval_browse)
@@ -2734,7 +2885,6 @@ class MainWindow(QMainWindow):
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()
-    # CUDA와 multiprocessing 충돌 방지를 위해 시작 방식을 spawn으로 설정
     try:
         multiprocessing.set_start_method('spawn', force=True)
     except RuntimeError:
