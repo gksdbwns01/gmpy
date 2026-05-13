@@ -46,8 +46,10 @@ db 기능 추가. ui변경
 적응형 파라미터 변이, 적응형 에폭, 학습 기록 저장
 가능하다면 스레숄드도 개선하기
 AutoML과 K-Fold 교차 검증에 하위 프로세스(Subprocess) 분리 - Worker 재생성 구조로 변경
+안전 종료 (Graceful Stop)로직, SQLite WAL 모드 최적화, 메모리 100% 반환 보장
 
 
+Optuna 연동?
 만약 DB에서 삭제하면 그 모델과 관련된 모든 것이 삭제됨?
 db에서 설정 가져오기 - db에 모델이 저장되는지 확인해야됨
 -Closing dataloader mosaic 이후 딜레이 있음
