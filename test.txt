@@ -48,6 +48,7 @@ db 기능 추가. ui변경
 AutoML과 K-Fold 교차 검증에 하위 프로세스(Subprocess) 분리 - Worker 재생성 구조로 변경
 안전 종료 (Graceful Stop)로직, SQLite WAL 모드 최적화, 메모리 100% 반환 보장
 Threshold 자동탐색에서 예측 캐싱 적용
+이미지 Dimension 캐싱
 
 Optuna 연동?
 Resume 기능 - 학습 중간부터 이어서 다시 시작

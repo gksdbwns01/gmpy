@@ -882,6 +882,9 @@ class PreprocessThread(QThread):
             label_files = list(label_dir.glob("*.json")) + list(label_dir.glob("*.txt"))
             logger.debug(f"전처리 대상 라벨 파일 수: {len(label_files)}")
             crop_x, crop_y, crop_w, crop_h = c["manual_crop"]
+            
+            dim_cache = {}
+
             if c["use_auto_crop"]:
                 logger.debug("오토 크롭 설정 적용됨, 좌표 계산 중...")
                 min_x = min_y = float("inf"); max_x = max_y = 0.0
@@ -894,9 +897,13 @@ class PreprocessThread(QThread):
                         img_path = next((image_dir / lf.with_suffix(ext).name for ext in [".jpg", ".jpeg", ".png"] if (image_dir / lf.with_suffix(ext).name).exists()), None)
                         if img_path:
                             try:
-                                with PILImage.open(img_path) as img:
-                                    if c["use_exif"]: img = ImageOps.exif_transpose(img)
-                                    iw, ih = img.size
+                                if img_path.name not in dim_cache:
+                                    with PILImage.open(img_path) as img:
+                                        if c["use_exif"]: img = ImageOps.exif_transpose(img)
+                                        dim_cache[img_path.name] = img.size
+                                
+                                iw, ih = dim_cache[img_path.name]
+
                                 for line in lf.read_text(encoding="utf-8").strip().splitlines():
                                     parts = line.strip().split()
                                     if len(parts) == 5:
@@ -928,7 +935,10 @@ class PreprocessThread(QThread):
                 try:
                     img = PILImage.open(image_dir / img_id)
                     if c["use_exif"]: img = ImageOps.exif_transpose(img)
-                    iw, ih = img.size; acw, ach = min(crop_w, iw - crop_x), min(crop_h, ih - crop_y)
+                    
+                    iw, ih = dim_cache.get(img_id, img.size)
+
+                    acw, ach = min(crop_w, iw - crop_x), min(crop_h, ih - crop_y)
                     if acw <= 0 or ach <= 0: continue
                     if lf.suffix == ".txt":
                         for line in lf.read_text(encoding="utf-8").strip().splitlines():
