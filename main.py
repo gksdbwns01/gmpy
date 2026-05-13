@@ -247,11 +247,41 @@ class WebhookSettingsDialog(QDialog):
     def get_url(self): return self.txt_url.text().strip()
     def get_flags(self): return {"error": self.chk_error.isChecked(), "early_stop": self.chk_early_stop.isChecked(), "start": self.chk_start.isChecked(), "fold": self.chk_fold.isChecked(), "tune": self.chk_tune.isChecked(), "epoch": self.chk_epoch.isChecked(), "epoch_interval": {0: 10, 1: 50, 2: 100, 3: 500}[self.cmb_epoch.currentIndex()], "task": self.chk_task.isChecked()}
 
-def _tune_worker(args, queue):
+def _single_tune_run(args, queue):
     worker_logger = setup_logger()
-    import time, traceback, random, numpy as np, pandas as pd
+    import traceback, pandas as pd
     from pathlib import Path
     from ultralytics import YOLO
+    
+    try:
+        model = YOLO(args["model_name"])
+        if args.get("webhook_url") and args.get("noti_flags", {}).get("epoch", False):
+            interval = args.get("noti_flags", {}).get("epoch_interval", 100)
+            model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], args["adaptive_epochs"], interval))
+
+        res = model.train(
+            data=str(args["data_yaml"]), epochs=args["adaptive_epochs"], patience=args["tune_patience"], 
+            batch=args["batch"], workers=args["workers"], project=str(args["tune_base"]), 
+            name=f"gen_{args['gen']+1}", seed=42, verbose=False, **args["current_params"]
+        )
+        
+        actual_epochs = len(pd.read_csv(Path(res.save_dir) / "results.csv")) if (Path(res.save_dir) / "results.csv").exists() else args["adaptive_epochs"]
+        mAP50 = res.results_dict.get('metrics/mAP50(B)', 0)
+        mAP50_95 = res.results_dict.get('metrics/mAP50-95(B)', 0)
+        fitness = ((0.1 * mAP50) + (0.9 * mAP50_95)) * 100
+        
+        queue.put({"success": True, "actual_epochs": actual_epochs, "mAP50": mAP50, "mAP50_95": mAP50_95, "fitness": fitness})
+    except Exception:
+        worker_logger.error(f"[Single Tune Run] 오류 발생: {traceback.format_exc()}")
+        queue.put({"success": False, "error": traceback.format_exc()})
+    finally:
+        del model
+        clear_vram()
+
+def _tune_worker(args, queue):
+    worker_logger = setup_logger()
+    import time, traceback, random, multiprocessing
+    from pathlib import Path
     from sklearn.model_selection import train_test_split
     
     start_time = time.time()
@@ -308,36 +338,31 @@ def _tune_worker(args, queue):
                 mutation = rng.gauss(0, (max_v - min_v) * mutation_strength * 0.1)
                 current_params[k] = round(max(min_v, min(max_v, current_params[k] + mutation)), 4)
                 
-            model = YOLO(model_name)
-            
             adaptive_epochs = max(10, int((tune_epochs // 2) + (tune_epochs - tune_epochs // 2) * (gen / max(1, iterations - 1))))
             
-            if args.get("webhook_url") and args.get("noti_flags", {}).get("epoch", False):
-                interval = args.get("noti_flags", {}).get("epoch_interval", 100)
-                model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], adaptive_epochs, interval))
-
-            res = model.train(
-                data=str(data_yaml), 
-                epochs=adaptive_epochs, 
-                patience=tune_patience, 
-                batch=args["batch"], 
-                workers=args["workers"], 
-                project=str(tune_base), 
-                name=f"gen_{gen+1}", 
-                seed=42, 
-                verbose=False, 
-                **current_params
-            )
+            # 👉 하위 프로세스 생성 및 대기 (메모리 100% 반환 보장)
+            run_args = {
+                "model_name": model_name, "data_yaml": data_yaml, "adaptive_epochs": adaptive_epochs,
+                "tune_patience": tune_patience, "batch": args["batch"], "workers": args["workers"],
+                "tune_base": tune_base, "gen": gen, "current_params": current_params,
+                "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {})
+            }
+            run_queue = multiprocessing.Queue()
+            p = multiprocessing.Process(target=_single_tune_run, args=(run_args, run_queue))
+            p.start()
+            p.join() # 학습 끝날때까지 블로킹
             
-            actual_epochs = len(pd.read_csv(Path(res.save_dir) / "results.csv")) if (Path(res.save_dir) / "results.csv").exists() else adaptive_epochs
+            if not run_queue.empty():
+                run_res = run_queue.get()
+                if not run_res["success"]: raise Exception(f"세대 {gen+1} 학습 중 오류: {run_res.get('error')}")
+                actual_epochs, mAP50, mAP50_95, fitness = run_res["actual_epochs"], run_res["mAP50"], run_res["mAP50_95"], run_res["fitness"]
+            else:
+                raise Exception(f"세대 {gen+1} 워커 프로세스가 비정상 종료되었습니다.")
+            
             if actual_epochs < adaptive_epochs and args.get("webhook_url") and args.get("noti_flags", {}).get("early_stop", False):
                 worker_logger.info(f"세대 {gen+1} 조기 종료 감지됨 (Epoch: {actual_epochs})")
                 send_discord_webhook(args["webhook_url"], f"🛑 **[조기 종료]** Auto ML {gen+1}세대 - {actual_epochs} Epoch에서 조기 종료됨.")
 
-            mAP50 = res.results_dict.get('metrics/mAP50(B)', 0)
-            mAP50_95 = res.results_dict.get('metrics/mAP50-95(B)', 0)
-            fitness = ((0.1 * mAP50) + (0.9 * mAP50_95)) * 100
-            
             gen_record = {
                 "generation": gen + 1,
                 "fitness": fitness,
@@ -356,8 +381,6 @@ def _tune_worker(args, queue):
             
             if args.get("webhook_url") and args.get("noti_flags", {}).get("tune", False):
                 send_discord_webhook(args["webhook_url"], f"🤖 **[Auto ML]** {gen+1}세대 탐색 완료\n- 최고 잠재력 점수: {best_score:.1f}점")
-
-            del model; clear_vram()
             
         result["best_params"] = best_params
         result["success"] = True
@@ -380,7 +403,7 @@ def _auto_threshold_worker(args, queue):
     result = {
         "success": False, "task": "threshold", "error": "",
         "best_conf": 0.25, "best_iou": 0.45, "best_acc": 0.0,
-        "msg": "", "top5_params": []  # 추가: 상위 5개 후보 저장
+        "msg": "", "top5_params": [] 
     }
     
     worker_logger.info(f"[AutoThreshold Worker] 임계값 자동 탐색 시작. Model: {args['model_path']}")
@@ -423,7 +446,6 @@ def _auto_threshold_worker(args, queue):
             gt_data.append(boxes)
         
         def eval_yolo(test_conf, test_iou):
-            """평가 함수"""
             res = model.predict(
                 source=[str(p) for p in img_files],
                 conf=test_conf, iou=test_iou, max_det=max_det,
@@ -469,17 +491,12 @@ def _auto_threshold_worker(args, queue):
             clear_vram()
             return img_correct, f1 * 100, precision, recall
         
-        # ============================================
-        # 개선된 탐색 알고리즘
-        # ============================================
-        
-        # 1차: 더 촘촘한 그리드 (7×5 = 35가지)
-        conf_1st = [0.05, 0.15, 0.25, 0.45, 0.65, 0.85, 0.95]  # 7개
-        iou_1st = [0.25, 0.40, 0.55, 0.70, 0.85]                # 5개
+        # 1차: 더 촘촘한 그리드
+        conf_1st = [0.05, 0.15, 0.25, 0.45, 0.65, 0.85, 0.95]
+        iou_1st = [0.25, 0.40, 0.55, 0.70, 0.85]
         
         worker_logger.debug(f"1차 성근 탐색: {len(conf_1st)}×{len(iou_1st)}={len(conf_1st)*len(iou_1st)}가지")
-        
-        candidates = []  # (img_correct, f1, precision, recall, conf, iou) 저장
+        candidates = [] 
         
         for c in conf_1st:
             for i in iou_1st:
@@ -492,10 +509,9 @@ def _auto_threshold_worker(args, queue):
                     "conf": c,
                     "iou": i
                 })
-                worker_logger.debug(f"[1차] Conf: {c:.2f}, IoU: {i:.2f} → "
-                                   f"Correct: {img_correct}, F1: {f1:.2f}")
+                # 👉 수정: debug를 info로 변경하여 CMD에 실시간 진행 상황 표시
+                worker_logger.info(f"⏳ [1차 탐색 중] Conf: {c:.2f}, IoU: {i:.2f} → 완벽 일치: {img_correct}장, F1: {f1:.2f}%")
         
-        # Top-5 후보 선정 (1순위: img_correct, 2순위: f1)
         candidates_sorted = sorted(
             candidates,
             key=lambda x: (x["img_correct"], x["f1"]),
@@ -503,13 +519,6 @@ def _auto_threshold_worker(args, queue):
         )
         top5 = candidates_sorted[:5]
         
-        worker_logger.debug(f"Top-5 후보:")
-        for idx, cand in enumerate(top5, 1):
-            worker_logger.debug(f"  {idx}. Correct={cand['img_correct']}, "
-                               f"F1={cand['f1']:.2f}, "
-                               f"Conf={cand['conf']:.2f}, IoU={cand['iou']:.2f}")
-        
-        # 2차: Top-5 근처에서 정밀 탐색 (각 후보별)
         best_img_correct = top5[0]["img_correct"]
         best_f1 = top5[0]["f1"]
         best_conf = top5[0]["conf"]
@@ -520,7 +529,6 @@ def _auto_threshold_worker(args, queue):
         for rank, top_cand in enumerate(top5, 1):
             tc, ti = top_cand["conf"], top_cand["iou"]
             
-            # 동적 범위 설정 (경계값 고려)
             conf_range = 0.12 if 0.01 < tc < 0.99 else 0.08
             iou_range = 0.12 if 0.01 < ti < 0.99 else 0.08
             
@@ -529,15 +537,13 @@ def _auto_threshold_worker(args, queue):
             fine_i_start = max(0.01, ti - iou_range)
             fine_i_end = min(0.99, ti + iou_range)
             
-            worker_logger.debug(f"  Top-{rank} 탐색: "
-                               f"Conf({fine_c_start:.2f}~{fine_c_end:.2f}), "
-                               f"IoU({fine_i_start:.2f}~{fine_i_end:.2f})")
+            # 👉 수정: debug를 info로 변경
+            worker_logger.info(f"🔍 [2차 정밀 탐색 중] Top-{rank} 후보 주변 탐색: Conf({fine_c_start:.2f}~{fine_c_end:.2f}), IoU({fine_i_start:.2f}~{fine_i_end:.2f})")
             
             for c in np.arange(fine_c_start, fine_c_end + 0.02, 0.03):
                 for i in np.arange(fine_i_start, fine_i_end + 0.02, 0.03):
                     img_correct, f1, precision, recall = eval_yolo(c, i)
                     
-                    # 새로운 최고점을 찾거나, 동점일 때 f1이 더 높으면 갱신
                     is_new_best = (
                         (img_correct > best_img_correct) or
                         (img_correct == best_img_correct and f1 > best_f1)
@@ -548,17 +554,15 @@ def _auto_threshold_worker(args, queue):
                         best_f1 = f1
                         best_conf = round(float(c), 2)
                         best_iou = round(float(i), 2)
-                        worker_logger.debug(f"    ✨ 새로운 최고점! "
-                                           f"Conf={c:.3f}, IoU={i:.3f}, "
-                                           f"Correct={img_correct}, F1={f1:.2f}")
+                        # 👉 수정: 최고점 갱신 시 info로 강조하여 출력
+                        worker_logger.info(f"✨ [최고점 갱신!] Conf={c:.3f}, IoU={i:.3f} → 완벽 일치={img_correct}장, F1={f1:.2f}%")
         
         result["success"] = True
         result["best_conf"] = best_conf
         result["best_iou"] = best_iou
         result["best_acc"] = round(float(best_f1), 1)
-        result["best_img_correct"] = best_img_correct  # 추가 정보
+        result["best_img_correct"] = best_img_correct 
         
-        # Top-5 저장 (히스토리 용도)
         result["top5_params"] = [
             {
                 "rank": idx + 1,
@@ -587,9 +591,39 @@ def _auto_threshold_worker(args, queue):
         clear_vram()
         queue.put(result)
 
+def _single_fold_run(args, queue):
+    worker_logger = setup_logger()
+    import traceback, pandas as pd
+    from pathlib import Path
+    from ultralytics import YOLO
+    
+    try:
+        model = YOLO(args["model_name"])
+        if args.get("webhook_url") and args.get("noti_flags", {}).get("epoch", False):
+            interval = args.get("noti_flags", {}).get("epoch_interval", 100)
+            model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], args["epochs"], interval))
+
+        res = model.train(
+            data=str(args["data_yaml"]), epochs=args["epochs"], patience=args["patience"], imgsz=args["imgsz"], 
+            batch=args["batch"], workers=args["workers"], project=str(args["runs_dir"]), name=args["run_name"], 
+            seed=args["seed"], deterministic=args["deterministic"], verbose=True, **args["aug"], 
+            cls=args["loss"]["cls"], box=args["loss"]["box"], dfl=args["loss"]["dfl"]
+        )
+        
+        actual_epochs = len(pd.read_csv(Path(res.save_dir) / "results.csv")) if (Path(res.save_dir) / "results.csv").exists() else args["epochs"]
+        queue.put({"success": True, "actual_epochs": actual_epochs, "results_dict": res.results_dict, "save_dir": str(res.save_dir)})
+    except Exception:
+        worker_logger.error(f"[Single Fold Run] 오류 발생: {traceback.format_exc()}")
+        queue.put({"success": False, "error": traceback.format_exc()})
+    finally:
+        del model
+        clear_vram()
+
 def _kfold_train_worker(args, queue):
     worker_logger = setup_logger()
-    import json, shutil, numpy as np, time; import pandas as pd; from ultralytics import YOLO; from sklearn.model_selection import KFold, train_test_split
+    import json, shutil, numpy as np, time, multiprocessing; import pandas as pd; from sklearn.model_selection import KFold, train_test_split
+    from pathlib import Path
+    
     start_time = time.time(); result = {"success": False, "task": "train", "error": "", "msg": "", "best_model": ""}
     worker_logger.info(f"[K-Fold Worker] 학습 시작. Folds: {args['num_folds']}, Model: {args['model_name']}, Epochs: {args['epochs']}")
     try:
@@ -613,27 +647,39 @@ def _kfold_train_worker(args, queue):
             tr, vl = split_data if args["num_folds"] == 1 else (np.array(train_val)[split_data[0]], np.array(train_val)[split_data[1]])
             tr_txt, vl_txt = fd / "train.txt", fd / "val.txt"; tr_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in tr)); vl_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in vl))
             data_yaml = fd / "data.yaml"; data_yaml.write_text(f"train: {tr_txt.resolve()}\nval: {vl_txt.resolve()}\ntest: {test_img_dir.resolve()}\nnc: {len(args['class_names'])}\nnames: {args['class_names']}\n")
-            model = YOLO(args["model_name"])
             
-            if args.get("webhook_url") and args.get("noti_flags", {}).get("epoch", False):
-                interval = args.get("noti_flags", {}).get("epoch_interval", 100)
-                model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], args["epochs"], interval))
-
-            res = model.train(data=str(data_yaml), epochs=args["epochs"], patience=args.get("patience",100), imgsz=args["imgsz"], batch=args["batch"], workers=args["workers"], project=str(runs_dir), name=f"fold_{fold_num}" if args["num_folds"] > 1 else "single_train", seed=args["random_seed"], deterministic=args["deterministic"], verbose=True, **args["aug"], cls=args["loss"]["cls"], box=args["loss"]["box"], dfl=args["loss"]["dfl"])
+            # 👉 하위 프로세스 생성 및 대기 (메모리 100% 반환 보장)
+            run_name = f"fold_{fold_num}" if args["num_folds"] > 1 else "single_train"
+            run_args = {
+                "model_name": args["model_name"], "data_yaml": data_yaml, "epochs": args["epochs"], "patience": args.get("patience",100),
+                "imgsz": args["imgsz"], "batch": args["batch"], "workers": args["workers"], "runs_dir": runs_dir, "run_name": run_name,
+                "seed": args["random_seed"], "deterministic": args["deterministic"], "aug": args["aug"], "loss": args["loss"],
+                "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {})
+            }
             
-            actual_epochs = len(pd.read_csv(Path(res.save_dir) / "results.csv")) if (Path(res.save_dir) / "results.csv").exists() else args["epochs"]
+            run_queue = multiprocessing.Queue()
+            p = multiprocessing.Process(target=_single_fold_run, args=(run_args, run_queue))
+            p.start()
+            p.join()
+            
+            if not run_queue.empty():
+                run_res = run_queue.get()
+                if not run_res["success"]: raise Exception(f"Fold {fold_num} 학습 중 오류: {run_res.get('error')}")
+                actual_epochs, res_dict, save_dir = run_res["actual_epochs"], run_res["results_dict"], run_res["save_dir"]
+            else:
+                raise Exception(f"Fold {fold_num} 워커 프로세스가 비정상 종료되었습니다.")
+            
             if actual_epochs < args["epochs"]:
                 worker_logger.info(f"Fold {fold_num} 조기 종료 감지. (Epoch: {actual_epochs})")
                 if args.get("webhook_url") and args.get("noti_flags", {}).get("early_stop", False):
                     send_discord_webhook(args["webhook_url"], f"🛑 **[조기 종료 발동]** Fold {fold_num} - {actual_epochs} Epoch에서 학습이 조기 종료되었습니다.")
 
-            fold_metrics.append(res.results_dict); fold_save_dirs[fold_num] = str(res.save_dir)
+            fold_metrics.append(res_dict); fold_save_dirs[fold_num] = save_dir
             
             if args.get("webhook_url") and args.get("noti_flags", {}).get("fold", False):
-                mAP = res.results_dict.get('metrics/mAP50-95(B)', 0)
+                mAP = res_dict.get('metrics/mAP50-95(B)', 0)
                 send_discord_webhook(args["webhook_url"], f"📍 **[K-Fold]** Fold {fold_num} 완료\n- mAP50-95: {mAP:.4f}")
 
-            del model
         if fold_metrics:
             best_n = max(range(len(fold_metrics)), key=lambda i: (fold_metrics[i].get(args["best_metric"], 0), fold_metrics[i].get(args["second_metric"], 0))) + 1
             worker_logger.info(f"[K-Fold Worker] 모든 Fold 종료. 최우수 Fold: {best_n}")
@@ -1190,7 +1236,7 @@ class LabelingView(QGraphicsView):
         if idx < 0 or idx >= len(self.boxes): return False, "유효하지 않은 선택입니다."
         if not self.image_item or not hasattr(self, 'current_image_path'): return False, "이미지가 없습니다."
         img = cv2.imread(str(self.current_image_path))
-        if img is None: return False, "이미지를 읽을 수 없습니다."
+        if img is None: return False, "이미지를 읽을 수문을 읽을 수 없습니다."
         rect_item, _, class_id = self.boxes[idx]
         r = rect_item.rect(); x, y, w, h = int(r.x()), int(r.y()), int(r.width()), int(r.height())
         if w < 5 or h < 5 or x < 0 or y < 0 or x+w > img.shape[1] or y+h > img.shape[0]: return False, "크기/위치가 유효하지 않습니다."
@@ -1357,9 +1403,6 @@ class ImageGridWidget(QWidget):
     def show_full_image(self, path):
         if path in self.current_images: ImagePreviewDialog(self.current_images, self.current_images.index(path), self).exec_()
 
-# ==========================================
-# 고급 Log Viewer (DB)
-# ==========================================
 class LogTabWidget(QWidget):
     def __init__(self, tab_type, db_manager, parent=None):
         super().__init__(parent)
@@ -1415,7 +1458,7 @@ class LogTabWidget(QWidget):
         layout.addLayout(filter_layout)
 
         # --- Main Splitter ---
-        splitter = QSplitter(Qt.Vertical) # <-- 핵심: 상하 분할
+        splitter = QSplitter(Qt.Vertical) 
         
         # [Top]: Table Area
         self.table = QTableWidget()
@@ -1432,7 +1475,7 @@ class LogTabWidget(QWidget):
         details_layout = QVBoxLayout(self.details_panel)
         details_layout.setContentsMargins(0, 10, 0, 0)
         
-        # 상세 정보 헤더 (제목과 버튼을 가로로 깔끔하게 배치)
+        # 상세 정보 헤더
         detail_header_layout = QHBoxLayout()
         self.lbl_detail_title = QLabel("<b>[상세 정보]</b> 목록에서 항목을 선택하세요.")
         self.btn_open_folder = QPushButton("📂 저장 폴더 열기")
@@ -1441,11 +1484,11 @@ class LogTabWidget(QWidget):
         self.btn_open_folder.setFixedWidth(150)
         
         detail_header_layout.addWidget(self.lbl_detail_title)
-        detail_header_layout.addStretch() # 중간 여백을 밀어서 버튼을 우측 정렬
+        detail_header_layout.addStretch()
         detail_header_layout.addWidget(self.btn_open_folder)
         details_layout.addLayout(detail_header_layout)
         
-        # 상세 정보 탭 생성 (Config와 오답 이미지를 분리)
+        # 상세 정보 탭 생성
         self.detail_tabs = QTabWidget()
         
         # 1. Config 탭
@@ -1454,17 +1497,14 @@ class LogTabWidget(QWidget):
         self.txt_config.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas, monospace; font-size: 12px;")
         self.detail_tabs.addTab(self.txt_config, "⚙️ 설정 (Config) 및 변경점")
         
-        # 2. 오답 이미지 탭 (평가 탭일 경우에만 추가)
+        # 2. 오답 이미지 탭
         if self.tab_type == 'eval':
             self.list_wrong_imgs = QListWidget()
             self.list_wrong_imgs.itemDoubleClicked.connect(self.on_wrong_image_double_clicked)
             self.detail_tabs.addTab(self.list_wrong_imgs, "🖼️ 오답 이미지 목록")
             
         details_layout.addWidget(self.detail_tabs)
-        
         splitter.addWidget(self.details_panel)
-        
-        # 위젯 초기 비율 설정 (위쪽 테이블 60%, 아래쪽 상세정보 40%)
         splitter.setSizes([600, 400]) 
         layout.addWidget(splitter, stretch=1)
         
@@ -1496,7 +1536,6 @@ class LogTabWidget(QWidget):
         
         layout.addLayout(paging_layout)
         
-        # Setup headers
         if self.tab_type == 'train':
             self.headers = ["선택", "ID", "일시", "유형", "모델명", "Epochs", "Batch", "최고mAP"]
             self.db_cols = ["id", "id", "timestamp", "task_type", "model_name", "epochs", "batch_size", "best_map"]
@@ -1699,7 +1738,6 @@ class LogTabWidget(QWidget):
         self.btn_open_folder.setProperty("target_path", save_dir)
         self.btn_open_folder.setEnabled(bool(save_dir and Path(save_dir).exists()))
         
-        # JSON 포맷팅 및 이전 설정과 비교(Diff) 표시
         try:
             current_config = json.loads(config_str)
             prev_config = {}

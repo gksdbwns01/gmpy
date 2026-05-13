@@ -1880,6 +1880,31 @@ class MainWindow(QMainWindow):
         default_proj_path = self.base_dir / "MyProject"; self.config_manager = ConfigManager(str(default_proj_path)); self.config_builder = ConfigBuilder()
         self.log_db = LogDatabase(self.base_dir / "MyProject" / "workspace" / "training_history.db"); self.training_process = None; self.init_ui()
 
+        # 👉 상태바 애니메이션을 위한 타이머 설정
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self.update_status_animation)
+        self.status_animation_frame = 0
+        self.base_status_msg = ""
+
+    # 👉 상태바 애니메이션 갱신 메서드
+    def update_status_animation(self):
+        frames = ["⏳", "⌛"]
+        frame = frames[self.status_animation_frame % len(frames)]
+        dots = "." * ((self.status_animation_frame % 3) + 1)
+        self.status_animation_frame += 1
+        
+        pid_info = f" (PID: {self.training_process.pid})" if self.training_process else ""
+        self.statusBar().showMessage(f"{frame} {self.base_status_msg}{dots}{pid_info}")
+
+    def start_dynamic_status(self, msg):
+        self.base_status_msg = msg
+        self.status_animation_frame = 0
+        self.status_timer.start(500)
+
+    def stop_dynamic_status(self, msg=""):
+        self.status_timer.stop()
+        self.statusBar().showMessage(msg)
+
     def validate_paths(self, **paths):
         for name, path_obj in paths.items():
             if not path_obj.exists(): return False, f"[{name}] 경로를 찾을 수 없습니다: {path_obj}"
@@ -2182,7 +2207,8 @@ class MainWindow(QMainWindow):
         if webhook_url and self.noti_flags.get("start"): send_discord_webhook(webhook_url, "▶️ **[작업 시작]** 새로운 백그라운드 작업이 시작되었습니다.")
         self.btn_webhook_settings.setEnabled(False)
         self.t2_btn_run.setEnabled(False); self.t2_btn_tune.setEnabled(False); self.t4_btn_retrain.setEnabled(False); self.t4_btn_auto_thr.setEnabled(False); self.t3_btn_auto_thr.setEnabled(False); self.t2_scroll.setEnabled(False); self.t4_scroll.setEnabled(False); self.g_model.setEnabled(False); self.g_imgsz.setEnabled(False); self.t2_btn_stop.setEnabled(True)
-        self.statusBar().showMessage(f"🏃 작업 진행 중... PID: {self.training_process.pid}")
+        
+        self.start_dynamic_status("백그라운드 작업 진행 중")
 
     def stop_training(self):
         logger.warning("사용자에 의한 프로세스 강제 종료 요청")
@@ -2195,11 +2221,16 @@ class MainWindow(QMainWindow):
                 logger.error(f"프로세스 종료 중 에러: {e}", exc_info=True)
             webhook_url = self.webhook_url
             if webhook_url and self.noti_flags.get("error"): send_discord_webhook(webhook_url, "🛑 **[작업 강제 종료]**\n프로세스가 강제 중단되었습니다.")
-            self._restore_training_ui(); self.statusBar().showMessage("🛑 작업이 강제 종료되었습니다."); self.training_process = None
+            self._restore_training_ui()
+            
+            self.stop_dynamic_status("🛑 작업이 강제 종료되었습니다.")
+            self.training_process = None
 
     def on_training_finished(self, res):
         logger.info(f"워커 프로세스 완료. 결과: Success={res.get('success')}, Task={res.get('task')}")
-        self._restore_training_ui(); self.statusBar().showMessage("✅ 프로세스 완료")
+        self._restore_training_ui()
+        
+        self.stop_dynamic_status("✅ 프로세스 완료")
         
         if self.webhook_url and self.noti_flags.get("task"):
             if res.get("success"):
@@ -2260,7 +2291,10 @@ class MainWindow(QMainWindow):
         if self.training_process is None: return
         webhook_url = self.webhook_url
         if webhook_url and self.noti_flags.get("error"): send_discord_webhook(webhook_url, f"❌ **[프로세스 비정상 종료]**\n상세: {error_msg}")
-        self._restore_training_ui(); QMessageBox.critical(self, "비정상 종료", error_msg); self.statusBar().showMessage("🛑 프로세스가 비정상 종료되었습니다."); self.training_process = None
+        self._restore_training_ui(); QMessageBox.critical(self, "비정상 종료", error_msg)
+        
+        self.stop_dynamic_status("🛑 프로세스가 비정상 종료되었습니다.")
+        self.training_process = None
 
     def on_thread_error(self, task_name, error_msg):
         logger.error(f"[{task_name}] QThread 스레드 내부 예외 발생. 원인: {error_msg}")
