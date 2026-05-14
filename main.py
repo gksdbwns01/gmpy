@@ -106,10 +106,19 @@ class ConfigManager:
         try:
             self.config_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            if not config_name: config_name = f"config_{timestamp}"
+            
+            if not config_name: 
+                config_name = f"config_{timestamp}"
+            else:
+                # 🔒 Path Traversal 방지: 입력된 문자열에서 디렉토리 경로를 강제 거세하고 순수 파일명만 추출
+                config_name = Path(config_name).name
+                
             file_path = self.config_dir / f"{config_name}.json"
             final_data = {"metadata": {"saved_at": timestamp, "version": "1.0", "name": config_name}, "config": config_data}
-            with open(file_path, 'w', encoding='utf-8') as f: json.dump(final_data, f, indent=4, ensure_ascii=False)
+            
+            with open(file_path, 'w', encoding='utf-8') as f: 
+                json.dump(final_data, f, indent=4, ensure_ascii=False)
+                
             logger.info(f"설정 저장 성공: {file_path}")
             return True, str(file_path)
         except Exception as e: 
@@ -2105,10 +2114,30 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg)
 
     def validate_paths(self, **paths):
+        """보안 및 시스템 안정성이 강화된 경로 검증 함수"""
         for name, path_obj in paths.items():
-            if not path_obj.exists(): return False, f"[{name}] 경로를 찾을 수 없습니다: {path_obj}"
-            if name.endswith('_file') and not path_obj.is_file(): return False, f"[{name}]은(는) 파일이어야 합니다: {path_obj}"
-            if name.endswith('_dir') and not path_obj.is_dir(): return False, f"[{name}]은(는) 폴더여야 합니다: {path_obj}"
+            if not path_obj or str(path_obj).strip() in ("", "."):
+                return False, f"[{name}] 경로가 입력되지 않았습니다."
+                
+            path = Path(path_obj).resolve()  # 심볼릭 링크 해제 및 절대경로 표준화
+            if not path.exists():
+                return False, f"[{name}] 경로를 찾을 수 없습니다:\n{path}"
+            if not os.access(path, os.R_OK):
+                return False, f"[{name}] 읽기 권한이 없습니다:\n{path}"
+            if "work" in name.lower() or "proc" in name.lower() or "output" in name.lower():
+                if not os.access(path, os.W_OK):
+                    return False, f"[{name}] 쓰기 권한이 없습니다:\n{path}"
+                    
+            if name.endswith('_file') or name.endswith('.pt'):
+                if not path.is_file():
+                    return False, f"[{name}] 파일이어야 합니다:\n{path}"
+                if path.stat().st_size > 5 * 1024**3:
+                    return False, f"[{name}] 파일 용량이 너무 큽니다 (5GB 제한):\n{path}"
+                    
+            elif name.endswith('_dir') or "ds" in name.lower() or "root" in name.lower():
+                if not path.is_dir():
+                    return False, f"[{name}] 폴더(디렉토리)여야 합니다:\n{path}"
+                    
         return True, None
 
     def closeEvent(self, event):
@@ -2700,7 +2729,18 @@ class MainWindow(QMainWindow):
         new_proj_path.mkdir(parents=True, exist_ok=True); target_dir = new_proj_path / "workspace" / f"Imported_{import_name}"; target_dir.mkdir(parents=True, exist_ok=True)
         self.statusBar().showMessage(f"📥 '{new_proj_path.name}' 프로젝트를 구성하는 중..."); QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            with zipfile.ZipFile(load_path, 'r') as zf: zf.extractall(target_dir)
+            with zipfile.ZipFile(load_path, 'r') as zf:
+                # 🔒 Zip Slip 방지를 위한 경로 검증 로직
+                resolved_target = Path(target_dir).resolve()
+                for member in zf.infolist():
+                    member_path = Path(target_dir / member.filename).resolve()
+                    if not member_path.is_relative_to(resolved_target):
+                        raise PermissionError(f"보안 경고: 압축 파일이 지정된 경로를 벗어나려고 합니다! ({member.filename})")
+                
+                # 안전함이 확인된 경우에만 추출 실행
+                zf.extractall(target_dir)
+
+            # ⚠️ [복구 완료] 압축 해제 이후 UI 컴포넌트 연동 및 데이터 복구 로직
             config_file = target_dir / "config.json"; config_data = {}
             if config_file.exists():
                 with open(config_file, 'r', encoding='utf-8') as f: config_data = json.load(f).get("config", {})
