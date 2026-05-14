@@ -5,7 +5,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime, timedelta
 import zipfile, cv2, numpy as np, pandas as pd, psutil, torch, yaml
-
+import threading
 from PyQt5.QtWidgets import QSizePolicy
 from PyQt5.QtCore import QSize, Qt, QThread, pyqtSignal, QTimer, QRectF, QSettings, QDate
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
@@ -203,14 +203,42 @@ def open_folder(path):
     elif platform.system() == "Darwin": subprocess.Popen(["open", target_dir])
     else: subprocess.Popen(["xdg-open", target_dir])
 
-def send_discord_webhook(webhook_url, content):
-    if not webhook_url or not webhook_url.startswith("http"): return
-    import requests
-    try: 
-        logger.debug(f"Discord 웹훅 전송 시도. Content 길이: {len(content)}")
-        requests.post(webhook_url, json={"content": content}, timeout=5)
-    except Exception as e: 
-        logger.error(f"디스코드 웹훅 전송 실패: {e}", exc_info=True)
+def send_discord_webhook(webhook_url, content, retry_count=2):
+    if not webhook_url or not webhook_url.startswith("http"): 
+        return False
+
+    def _send_task():
+        import requests
+        import time
+        from requests.exceptions import Timeout, ConnectionError, RequestException
+
+        for attempt in range(retry_count):
+            try:
+                logger.debug(f"Discord 웹훅 전송 시도. (시도 {attempt+1}/{retry_count}, Content 길이: {len(content)})")
+                response = requests.post(
+                    webhook_url, 
+                    json={"content": content}, 
+                    timeout=5
+                )
+                response.raise_for_status()
+                logger.debug("웹훅 전송 성공")
+                return
+                
+            except Timeout:
+                logger.warning(f"웹훅 타임아웃 (시도 {attempt+1}/{retry_count})")
+            except ConnectionError as e:
+                logger.error(f"네트워크 연결 실패: {e}")
+            except RequestException as e:
+                logger.error(f"웹훅 HTTP 에러 (Rate Limit 등): {e}")
+            except Exception as e:
+                logger.error(f"웹훅 전송 중 알 수 없는 오류: {e}")
+            if attempt < retry_count - 1:
+                time.sleep(2)
+
+        logger.error("디스코드 웹훅 최종 전송 실패")
+    import threading
+    threading.Thread(target=_send_task, daemon=True).start()
+    return True
 
 def create_heartbeat_callback(webhook_url, total_epochs, interval):
     if interval <= 0: return lambda trainer: None
