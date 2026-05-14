@@ -24,7 +24,7 @@ import seaborn as sns
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
 
 # ==========================================
-# 로깅(Logging) 설정 (개선됨)
+# 로깅(Logging) 설정
 # ==========================================
 def setup_logger():
     logger = logging.getLogger("YOLO_Pipeline")
@@ -58,6 +58,35 @@ def clear_vram():
         if torch.cuda.is_available(): torch.cuda.empty_cache(); logger.debug("CUDA empty_cache 완료")
     except Exception as e: 
         logger.error(f"VRAM 정리 중 오류 발생: {e}", exc_info=True)
+
+
+# ==========================================
+# [개선] Graceful Stop Handler 도입
+# ==========================================
+class GracefulStopHandler:
+    """우아한 종료 처리를 위한 일관된 래퍼(Wrapper) 클래스"""
+    def __init__(self, stop_event, logger, queue=None, default_result=None):
+        self.stop_event = stop_event
+        self.logger = logger
+        self.queue = queue
+        self.default_result = default_result or {"success": False, "error": "사용자에 의해 취소되었습니다."}
+
+    def should_stop(self, context="", put_queue=True):
+        """현재 작업 중단 여부 확인"""
+        if self.stop_event and self.stop_event.is_set():
+            self.logger.info(f"🛑 사용자 중단 신호 감지 [{context}]")
+            if put_queue and self.queue:
+                self.default_result["error"] = f"작업이 취소되었습니다. ({context})"
+                self.queue.put(self.default_result)
+            return True
+        return False
+
+    def check_every_n_iterations(self, iteration, interval=10, context="", put_queue=True):
+        """N번 반복마다 한 번씩 확인 (빠른 루프에서의 성능 최적화)"""
+        if iteration % interval == 0:
+            return self.should_stop(context, put_queue)
+        return False
+
 
 class ConfigManager:
     def __init__(self, base_dir):
@@ -113,7 +142,6 @@ class ConfigBuilder:
             "tab6": {"class_map": w.t6_class_map.toPlainText(), "color": w.t6_color_combo.currentText(), "auto_thr": w.t6_auto_thr.value(), "auto_nms": w.t6_auto_nms.value()}
         }
 
-# 👉 [개선] SQLite 연결 최적화 및 WAL 모드 지원
 class LogDatabase:
     def __init__(self, db_path):
         self.db_path = Path(db_path)
@@ -249,7 +277,6 @@ def create_heartbeat_callback(webhook_url, total_epochs, interval):
             send_discord_webhook(webhook_url, f"💓 **[학습 진행 상황]** {current_epoch} / {total_epochs} Epochs\n📉 현재 Total Loss: `{trainer.tloss.sum().item():.4f}`")
     return on_train_epoch_end
 
-# 👉 [개선] Graceful Stop을 위한 YOLO 커스텀 콜백 추가
 def create_stop_callback(stop_event):
     def on_train_epoch_end(trainer):
         if stop_event is not None and stop_event.is_set():
@@ -303,7 +330,6 @@ def _single_tune_run(args, queue):
             interval = args.get("noti_flags", {}).get("epoch_interval", 100)
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], args["adaptive_epochs"], interval))
             
-        # 👉 [개선] Graceful Stop 콜백 연결
         if args.get("stop_event"):
             model.add_callback("on_train_epoch_end", create_stop_callback(args["stop_event"]))
 
@@ -331,10 +357,12 @@ def _tune_worker(args, queue):
     import time, traceback, multiprocessing
     from pathlib import Path
     from sklearn.model_selection import train_test_split
-    import optuna  # 👉 [추가] Optuna 라이브러리
+    import optuna 
     
     start_time = time.time()
     result = {"success": False, "task": "tune", "error": "", "msg": "", "best_params": {}, "history": []}
+    
+    stop_handler = GracefulStopHandler(args.get("stop_event"), worker_logger, queue, result)
     worker_logger.info(f"[AutoML Worker] Optuna 튜닝 시작. 반복 횟수: {args['iterations']}")
     
     try:
@@ -342,7 +370,6 @@ def _tune_worker(args, queue):
         model_name, iterations = args["model_name"], args["iterations"]
         tune_epochs = args.get("tune_epochs", 30)
         tune_patience = args.get("tune_patience", 5)
-        stop_event = args.get("stop_event")
         
         tune_base = workspace_dir / "runs" / "tune_custom"
         if tune_base.exists(): shutil.rmtree(tune_base); worker_logger.debug("기존 tune_custom 폴더 삭제 완료")
@@ -366,15 +393,14 @@ def _tune_worker(args, queue):
         
         search_history = []
         
-        # 👉 [핵심 변경 1] Optuna 목적 함수(Objective) 정의
         def objective(trial):
             # Graceful Stop 지원 - 탐색 중단
-            if stop_event and stop_event.is_set():
+            if stop_handler.should_stop("Optuna 탐색 단계(Objective)", put_queue=False):
                 worker_logger.info("🛑 사용자에 의한 탐색 취소. Optuna Study를 중단합니다.")
                 trial.study.stop()
                 raise optuna.exceptions.TrialPruned()
 
-            # Optuna TPE 알고리즘이 추천하는 파라미터 셋
+            # Optuna TPE 알고리즘 추천 파라미터
             current_params = {
                 'box': round(trial.suggest_float('box', 0.1, 20.0), 4),
                 'cls': round(trial.suggest_float('cls', 0.1, 10.0), 4),
@@ -396,16 +422,15 @@ def _tune_worker(args, queue):
             gen = trial.number
             worker_logger.debug(f"--- 튜닝 세대 {gen+1}/{iterations} --- 시작")
             
-            # Epoch 동적 할당 (초반엔 짧게, 후반엔 길게)
+            # Epoch 동적 할당
             adaptive_epochs = max(10, int((tune_epochs // 2) + (tune_epochs - tune_epochs // 2) * (gen / max(1, iterations - 1))))
             
-            # VRAM 관리를 위해 별도 프로세스로 학습 실행 (기존 로직 유지)
             run_args = {
                 "model_name": model_name, "data_yaml": data_yaml, "adaptive_epochs": adaptive_epochs,
                 "tune_patience": tune_patience, "batch": args["batch"], "workers": args["workers"],
                 "tune_base": tune_base, "gen": gen, "current_params": current_params,
                 "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}),
-                "stop_event": stop_event
+                "stop_event": args.get("stop_event")
             }
             
             run_queue = multiprocessing.Queue()
@@ -434,22 +459,17 @@ def _tune_worker(args, queue):
             })
             
             worker_logger.info(f"세대 {gen+1}: Fitness={fitness:.2f} | Epochs실행: {adaptive_epochs}")
-            
-            return fitness # Optuna에게 평가 점수를 반환
+            return fitness
 
-        # 👉 [핵심 변경 2] Optuna Study 생성 및 실행
-        optuna.logging.set_verbosity(optuna.logging.WARNING) # Optuna 자체 로그는 최소화
-        study = optuna.create_study(direction="maximize")    # 점수가 높을수록 좋음
-        
-        # 0세대는 사용자가 UI에서 세팅한 기본 파라미터로 먼저 평가하도록 힌트 제공
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        study = optuna.create_study(direction="maximize")
         study.enqueue_trial(args["initial_params"])
         
-        # 최적화 실행 (사용자가 도중에 중지하면 부분 탐색 결과 반환)
         try:
             study.optimize(objective, n_trials=iterations)
         except Exception as e:
-            if stop_event and stop_event.is_set():
-                worker_logger.info("탐색이 안전하게 조기 종료되었습니다.")
+            if stop_handler.should_stop("최적화 진행 중 예외 발생", put_queue=False):
+                worker_logger.info("탐색이 안전하게 조기 종료되었습니다. 지금까지의 결과를 반환합니다.")
             else:
                 raise e
 
@@ -458,7 +478,6 @@ def _tune_worker(args, queue):
             queue.put(result)
             return
 
-        # 결과 수합
         best_trial = study.best_trial
         best_params = best_trial.params
         best_score = best_trial.value
@@ -482,8 +501,6 @@ def _auto_threshold_worker(args, queue):
     import time, traceback, numpy as np, gc
     from pathlib import Path
     from ultralytics import YOLO
-    
-    # PyTorch 및 NMS 연산을 위한 라이브러리 임포트
     import torch
     import torchvision.ops as ops 
     
@@ -494,13 +511,13 @@ def _auto_threshold_worker(args, queue):
         "msg": "", "top5_params": [] 
     }
     
+    stop_handler = GracefulStopHandler(args.get("stop_event"), worker_logger, queue, result)
     worker_logger.info(f"[AutoThreshold Worker] 임계값 자동 탐색 시작 (캐싱 모드). Model: {args['model_path']}")
     
     try:
         model_path, img_dir, lbl_dir = Path(args["model_path"]), Path(args["img_dir"]), Path(args["lbl_dir"])
         match_iou_thr = max(args.get("match_iou", 0.50), 0.1)
         agnostic, max_det = args.get("agnostic", True), args.get("max_det", 300)
-        stop_event = args.get("stop_event")
         
         worker_logger.debug("모델 로딩 중...")
         model = YOLO(str(model_path))
@@ -533,34 +550,27 @@ def _auto_threshold_worker(args, queue):
                         })
             gt_data.append(boxes)
         
-        # ---------------------------------------------------------
-        # 👉 [핵심 개선] VRAM 보호를 위한 범용 배치 처리 및 캐싱
-        # ---------------------------------------------------------
         worker_logger.info("⚡ 속도 최적화 및 VRAM 보호를 위한 일괄 추론 및 캐싱 진행 중...")
         
         cached_predictions = []
-        BATCH_SIZE = 64  # 범용적으로 가장 안정적인 추론 배치 사이즈
+        BATCH_SIZE = 64 
         
         for batch_start in range(0, total_imgs, BATCH_SIZE):
-            if stop_event and stop_event.is_set():
-                result["error"] = "사용자에 의해 캐싱 단계에서 취소되었습니다."
-                queue.put(result)
+            if stop_handler.should_stop("이미지 배치 캐싱 단계"):
                 return
                 
             batch_files = img_files[batch_start:batch_start + BATCH_SIZE]
-            
             res_cached = model.predict(
                 source=[str(p) for p in batch_files],
-                conf=0.01,           # RAM 절약을 위해 최저 Conf 상향 조정 (탐색 하한선 아래의 노이즈 제거)
-                iou=0.99,            # NMS 거의 생략
-                max_det=500,         # 유효 객체 수만 확보하여 리소스 절약
+                conf=0.01,
+                iou=0.99,
+                max_det=500,
                 agnostic_nms=agnostic, 
                 verbose=False, 
                 stream=True
             )
             
             for r in res_cached:
-                # RAM 용량 50% 절감을 위한 다운캐스팅 (float16, int16)
                 cached_predictions.append({
                     "xyxy": r.boxes.xyxy.cpu().half() if len(r.boxes) > 0 else torch.empty((0, 4), dtype=torch.float16),
                     "xywhn": r.boxes.xywhn.cpu().half() if len(r.boxes) > 0 else torch.empty((0, 4), dtype=torch.float16),
@@ -568,59 +578,43 @@ def _auto_threshold_worker(args, queue):
                     "classes": r.boxes.cls.cpu().short() if len(r.boxes) > 0 else torch.empty(0, dtype=torch.int16)
                 })
                 
-            # 명시적 메모리 해제
             del res_cached
             gc.collect()
             
         worker_logger.info(f"✅ 총 {len(cached_predictions)}장 캐싱 완료. 모델 메모리 해제.")
-        
-        # 신경망 추론이 끝났으므로 VRAM 해제
         del model
         clear_vram()
         
-        # ---------------------------------------------------------
-        # 👉 [핵심 개선] 캐시된 데이터를 이용한 초고속 필터링 평가 함수
-        # ---------------------------------------------------------
         def eval_yolo(test_conf, test_iou):
             total_tp = total_fp = total_fn = img_correct = 0
-            
             for idx, cache in enumerate(cached_predictions):
-                # PyTorch CPU NMS 연산 호환성을 위해 압축된 데이터를 잠시 32비트로 복원
                 xyxy = cache["xyxy"].float()
                 xywhn = cache["xywhn"].float()
                 scores = cache["scores"].float()
                 classes = cache["classes"].long()
                 
-                # 1. Confidence Threshold 필터링
                 mask = scores >= test_conf
                 f_xyxy = xyxy[mask]
                 f_xywhn = xywhn[mask]
                 f_scores = scores[mask]
                 f_classes = classes[mask]
                 
-                # 2. PyTorch NMS (Non-Maximum Suppression) 적용
                 if len(f_xyxy) > 0:
                     if agnostic:
                         keep = ops.nms(f_xyxy, f_scores, test_iou)
                     else:
                         keep = ops.batched_nms(f_xyxy, f_scores, f_classes, test_iou)
                     
-                    # max_det 컷오프
                     if len(keep) > max_det:
                         keep = keep[:max_det]
                         
                     final_xywhn = f_xywhn[keep]
                     final_classes = f_classes[keep]
                     
-                    # 기존 정답 비교 로직과 포맷 맞추기
-                    pred_boxes = [
-                        {"class": int(cls.item()), "box": b.tolist()}
-                        for cls, b in zip(final_classes, final_xywhn)
-                    ]
+                    pred_boxes = [{"class": int(cls.item()), "box": b.tolist()} for cls, b in zip(final_classes, final_xywhn)]
                 else:
                     pred_boxes = []
                 
-                # --- 기존과 동일한 정답 매칭 로직 ---
                 gt_boxes = gt_data[idx]
                 matched_gt = set()
                 tp = fp = 0
@@ -650,12 +644,8 @@ def _auto_threshold_worker(args, queue):
             precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
             recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
             f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-            
             return img_correct, f1 * 100, precision, recall
         
-        # ---------------------------------------------------------
-        # 1차 / 2차 탐색 로직 (기존 유지)
-        # ---------------------------------------------------------
         conf_1st = [0.05, 0.15, 0.25, 0.45, 0.65, 0.85, 0.95]
         iou_1st = [0.25, 0.40, 0.55, 0.70, 0.85]
         
@@ -664,27 +654,14 @@ def _auto_threshold_worker(args, queue):
         
         for c in conf_1st:
             for i in iou_1st:
-                if stop_event and stop_event.is_set():
-                    result["error"] = "사용자에 의해 스레숄드 탐색이 취소되었습니다."
-                    queue.put(result)
+                if stop_handler.should_stop("1차 성근 탐색"):
                     return
 
                 img_correct, f1, precision, recall = eval_yolo(c, i)
-                candidates.append({
-                    "img_correct": img_correct,
-                    "f1": f1,
-                    "precision": precision,
-                    "recall": recall,
-                    "conf": c,
-                    "iou": i
-                })
+                candidates.append({"img_correct": img_correct, "f1": f1, "precision": precision, "recall": recall, "conf": c, "iou": i})
                 worker_logger.info(f"⏳ [1차 탐색 중] Conf: {c:.2f}, IoU: {i:.2f} → 완벽 일치: {img_correct}장, F1: {f1:.2f}%")
         
-        candidates_sorted = sorted(
-            candidates,
-            key=lambda x: (x["img_correct"], x["f1"]),
-            reverse=True
-        )
+        candidates_sorted = sorted(candidates, key=lambda x: (x["img_correct"], x["f1"]), reverse=True)
         top5 = candidates_sorted[:5]
         
         best_img_correct = top5[0]["img_correct"]
@@ -694,6 +671,7 @@ def _auto_threshold_worker(args, queue):
         
         worker_logger.debug("2차 정밀 탐색 시작 (Top-5 근처)")
         
+        iteration = 0
         for rank, top_cand in enumerate(top5, 1):
             tc, ti = top_cand["conf"], top_cand["iou"]
             
@@ -709,17 +687,12 @@ def _auto_threshold_worker(args, queue):
             
             for c in np.arange(fine_c_start, fine_c_end + 0.02, 0.03):
                 for i in np.arange(fine_i_start, fine_i_end + 0.02, 0.03):
-                    if stop_event and stop_event.is_set():
-                        result["error"] = "사용자에 의해 스레숄드 탐색이 취소되었습니다."
-                        queue.put(result)
+                    iteration += 1
+                    if stop_handler.check_every_n_iterations(iteration, interval=5, context="2차 정밀 탐색"):
                         return
 
                     img_correct, f1, precision, recall = eval_yolo(c, i)
-                    
-                    is_new_best = (
-                        (img_correct > best_img_correct) or
-                        (img_correct == best_img_correct and f1 > best_f1)
-                    )
+                    is_new_best = ((img_correct > best_img_correct) or (img_correct == best_img_correct and f1 > best_f1))
                     
                     if is_new_best:
                         best_img_correct = img_correct
@@ -735,13 +708,7 @@ def _auto_threshold_worker(args, queue):
         result["best_img_correct"] = best_img_correct 
         
         result["top5_params"] = [
-            {
-                "rank": idx + 1,
-                "conf": top["conf"],
-                "iou": top["iou"],
-                "img_correct": top["img_correct"],
-                "f1": round(top["f1"], 2)
-            }
+            {"rank": idx + 1, "conf": top["conf"], "iou": top["iou"], "img_correct": top["img_correct"], "f1": round(top["f1"], 2)}
             for idx, top in enumerate(top5)
         ]
         
@@ -750,14 +717,11 @@ def _auto_threshold_worker(args, queue):
                         f"• 완벽 매칭 이미지: {best_img_correct}장\n"
                         f"• 예상 F1-Score: {result['best_acc']}%")
         
-        worker_logger.info(f"[AutoThreshold Worker] 탐색 완료. "
-                          f"Conf: {result['best_conf']}, IoU: {result['best_iou']}, "
-                          f"완벽매칭: {best_img_correct}장, F1: {result['best_acc']}%")
+        worker_logger.info(f"[AutoThreshold Worker] 탐색 완료. Conf: {result['best_conf']}, IoU: {result['best_iou']}, 완벽매칭: {best_img_correct}장, F1: {result['best_acc']}%")
         
     except Exception:
         result["error"] = traceback.format_exc()
         worker_logger.error(f"[AutoThreshold Worker] Exception: {result['error']}")
-    
     finally:
         clear_vram()
         queue.put(result)
@@ -774,7 +738,6 @@ def _single_fold_run(args, queue):
             interval = args.get("noti_flags", {}).get("epoch_interval", 100)
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], args["epochs"], interval))
 
-        # 👉 [개선] Graceful Stop 콜백 연결
         if args.get("stop_event"):
             model.add_callback("on_train_epoch_end", create_stop_callback(args["stop_event"]))
 
@@ -800,10 +763,11 @@ def _kfold_train_worker(args, queue):
     from pathlib import Path
     
     start_time = time.time(); result = {"success": False, "task": "train", "error": "", "msg": "", "best_model": ""}
+    stop_handler = GracefulStopHandler(args.get("stop_event"), worker_logger, queue, result)
     worker_logger.info(f"[K-Fold Worker] 학습 시작. Folds: {args['num_folds']}, Model: {args['model_name']}, Epochs: {args['epochs']}")
+    
     try:
         processed_dir, workspace_dir = Path(args["processed_dir"]), Path(args["workspace_dir"])
-        stop_event = args.get("stop_event")
         kfold_base = workspace_dir / "kfold"; runs_dir = workspace_dir / "runs" / "kfold_train"
         img_map = {f.stem: f for f in sorted((processed_dir / "images").glob("*.jpg"))}
         lbl_map = {f.stem: f for f in sorted((processed_dir / "labels").glob("*.txt"))}
@@ -819,15 +783,13 @@ def _kfold_train_worker(args, queue):
         splits = [(train_test_split(train_val, test_size=args["test_split"], random_state=args["random_seed"]))] if args["num_folds"] == 1 else list(KFold(n_splits=args["num_folds"], shuffle=True, random_state=args["random_seed"]).split(train_val))
         
         for fold, split_data in enumerate(splits):
-            # 👉 [개선] Graceful Stop 지원
-            if stop_event and stop_event.is_set():
-                worker_logger.info("🛑 사용자에 의한 K-Fold 진행 취소")
+            if stop_handler.should_stop(f"Fold {fold+1} 시작 전", put_queue=False):
                 if not fold_metrics:
                     result["error"] = "사용자에 의해 학습이 취소되었습니다."
                     queue.put(result)
                     return
                 else:
-                    worker_logger.info("지금까지 완료된 Fold 중에서 최적의 모델을 선택합니다.")
+                    worker_logger.info("지금까지 완료된 Fold 중에서 최적의 모델을 선택하고 조기 종료합니다.")
                     break
 
             fold_num = fold + 1; fd = kfold_base / f"fold_{fold_num}"; fd.mkdir(exist_ok=True)
@@ -841,7 +803,7 @@ def _kfold_train_worker(args, queue):
                 "model_name": args["model_name"], "data_yaml": data_yaml, "epochs": args["epochs"], "patience": args.get("patience",100),
                 "imgsz": args["imgsz"], "batch": args["batch"], "workers": args["workers"], "runs_dir": runs_dir, "run_name": run_name,
                 "seed": args["random_seed"], "deterministic": args["deterministic"], "aug": args["aug"], "loss": args["loss"],
-                "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}), "stop_event": stop_event
+                "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}), "stop_event": args.get("stop_event")
             }
             
             run_queue = multiprocessing.Queue()
@@ -907,7 +869,6 @@ def _retrain_worker(args, queue):
             interval = p.get("noti_flags", {}).get("epoch_interval", 10) 
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(p["webhook_url"], p["rt_epochs"], interval))
 
-        # 👉 [개선] Graceful Stop 콜백 연결
         if p.get("stop_event"):
             model.add_callback("on_train_epoch_end", create_stop_callback(p["stop_event"]))
 
@@ -2113,7 +2074,7 @@ class TuneHistoryDialog(QDialog):
 # ==========================================
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle("YOLO Training Pipeline (PyQt5) - AutoML + Auto Early Stop"); self.resize(1400, 900)
+        super().__init__(); self.setWindowTitle("YOLO Training Pipeline (PyQt5) - AutoML + Graceful Stop"); self.resize(1400, 900)
         logger.info(f"YOLO Training Pipeline 애플리케이션 시작 (OS: {platform.system()}, GPU: {torch.cuda.is_available()})")
         self.base_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
         default_proj_path = self.base_dir / "MyProject"; self.config_manager = ConfigManager(str(default_proj_path)); self.config_builder = ConfigBuilder()
@@ -2464,7 +2425,6 @@ class MainWindow(QMainWindow):
         
         self.start_dynamic_status("백그라운드 작업 진행 중")
 
-    # 👉 [개선] Taskkill 방식 대신 이벤트 트리거를 통한 우아한 종료 적용
     def stop_training(self):
         logger.warning("사용자에 의한 안전한 프로세스 종료(Graceful Stop) 요청")
         if self.training_process and self.training_process.is_alive():
@@ -2826,13 +2786,11 @@ class MainWindow(QMainWindow):
         
         h_form.addLayout(f_left); h_form.addLayout(f_right)
         
-        # AutoML 버튼 그룹
         h_tune = QHBoxLayout()
         self.t2_btn_tune = QPushButton("🤖 최적 파라미터 자동 탐색 (Auto ML)")
         self.t2_btn_tune.setStyleSheet("background-color: #dbeafe; border: 1px solid #93c5fd; padding: 8px; font-weight: bold; color: #1e3a8a;")
         self.t2_btn_tune.clicked.connect(self.run_auto_tune)
         
-        # 새로 추가된 AutoML 튜닝 기록 시각화 버튼
         self.btn_show_tune_history = QPushButton("📈 AutoML 튜닝 기록 그래프 보기")
         self.btn_show_tune_history.setStyleSheet("background-color: #fce7f3; border: 1px solid #fbcfe8; padding: 8px; font-weight: bold; color: #9d174d;")
         self.btn_show_tune_history.clicked.connect(self.show_tune_history)
@@ -2842,7 +2800,6 @@ class MainWindow(QMainWindow):
         
         self.t2_btn_run = QPushButton("🚀 K-Fold 학습 시작"); self.t2_btn_run.clicked.connect(self.run_tab2)
         
-        # 👉 [개선] 강제 종료 대신 "안전 종료(Graceful Stop)" 버튼으로 변경
         self.t2_btn_stop = QPushButton("🛑 안전 종료(Graceful Stop)"); self.t2_btn_stop.clicked.connect(self.stop_training); self.t2_btn_stop.setEnabled(False)
         
         l = QVBoxLayout(); self.t2_scroll = self._create_scroll(h_form); l.addWidget(self.t2_scroll)
