@@ -300,13 +300,14 @@ def _single_tune_run(args, queue):
 
 def _tune_worker(args, queue):
     worker_logger = setup_logger()
-    import time, traceback, random, multiprocessing
+    import time, traceback, multiprocessing
     from pathlib import Path
     from sklearn.model_selection import train_test_split
+    import optuna  # 👉 [추가] Optuna 라이브러리
     
     start_time = time.time()
     result = {"success": False, "task": "tune", "error": "", "msg": "", "best_params": {}, "history": []}
-    worker_logger.info(f"[AutoML Worker] 튜닝 시작. 반복 횟수: {args['iterations']}")
+    worker_logger.info(f"[AutoML Worker] Optuna 튜닝 시작. 반복 횟수: {args['iterations']}")
     
     try:
         processed_dir, workspace_dir = Path(args["processed_dir"]), Path(args["workspace_dir"])
@@ -335,43 +336,42 @@ def _tune_worker(args, queue):
         data_yaml = tune_base / "tune_data.yaml"
         data_yaml.write_text(f"train: {tr_txt.resolve()}\nval: {vl_txt.resolve()}\nnc: {len(args['class_names'])}\nnames: {args['class_names']}\n")
         
-        best_params = args["initial_params"].copy()
-        best_score = -1.0
         search_history = []
         
-        bounds = {
-            'box': (0.1, 20.0), 'cls': (0.1, 10.0), 'dfl': (0.1, 10.0), 
-            'hsv_h': (0.0, 0.1), 'hsv_s': (0.0, 1.0), 'hsv_v': (0.0, 1.0), 
-            'degrees': (0.0, 45.0), 'translate': (0.0, 0.5), 'scale': (0.0, 1.0), 
-            'shear': (0.0, 30.0), 'flipud': (0.0, 1.0), 'fliplr': (0.0, 1.0), 
-            'mosaic': (0.0, 1.0), 'mixup': (0.0, 1.0), 'copy_paste': (0.0, 1.0)
-        }
-        
-        rng = random.Random(time.time())
-        
-        for gen in range(iterations):
-            # 👉 [개선] Graceful Stop 지원 - 루프 시작 전 체크
+        # 👉 [핵심 변경 1] Optuna 목적 함수(Objective) 정의
+        def objective(trial):
+            # Graceful Stop 지원 - 탐색 중단
             if stop_event and stop_event.is_set():
-                worker_logger.info("🛑 사용자에 의한 탐색 취소")
-                if not search_history:
-                    result["error"] = "사용자에 의해 탐색이 취소되었습니다."
-                    queue.put(result)
-                    return
-                else:
-                    worker_logger.info("지금까지의 탐색 결과를 저장하고 종료합니다.")
-                    break
+                worker_logger.info("🛑 사용자에 의한 탐색 취소. Optuna Study를 중단합니다.")
+                trial.study.stop()
+                raise optuna.exceptions.TrialPruned()
 
-            current_params = best_params.copy()
+            # Optuna TPE 알고리즘이 추천하는 파라미터 셋
+            current_params = {
+                'box': round(trial.suggest_float('box', 0.1, 20.0), 4),
+                'cls': round(trial.suggest_float('cls', 0.1, 10.0), 4),
+                'dfl': round(trial.suggest_float('dfl', 0.1, 10.0), 4),
+                'hsv_h': round(trial.suggest_float('hsv_h', 0.0, 0.1), 4),
+                'hsv_s': round(trial.suggest_float('hsv_s', 0.0, 1.0), 4),
+                'hsv_v': round(trial.suggest_float('hsv_v', 0.0, 1.0), 4),
+                'degrees': round(trial.suggest_float('degrees', 0.0, 45.0), 4),
+                'translate': round(trial.suggest_float('translate', 0.0, 0.5), 4),
+                'scale': round(trial.suggest_float('scale', 0.0, 1.0), 4),
+                'shear': round(trial.suggest_float('shear', 0.0, 30.0), 4),
+                'flipud': round(trial.suggest_float('flipud', 0.0, 1.0), 4),
+                'fliplr': round(trial.suggest_float('fliplr', 0.0, 1.0), 4),
+                'mosaic': round(trial.suggest_float('mosaic', 0.0, 1.0), 4),
+                'mixup': round(trial.suggest_float('mixup', 0.0, 1.0), 4),
+                'copy_paste': round(trial.suggest_float('copy_paste', 0.0, 1.0), 4)
+            }
+            
+            gen = trial.number
             worker_logger.debug(f"--- 튜닝 세대 {gen+1}/{iterations} --- 시작")
             
-            mutation_strength = max(0.05, 1.0 - (gen / iterations))
-            
-            for k, (min_v, max_v) in bounds.items():
-                mutation = rng.gauss(0, (max_v - min_v) * mutation_strength * 0.1)
-                current_params[k] = round(max(min_v, min(max_v, current_params[k] + mutation)), 4)
-                
+            # Epoch 동적 할당 (초반엔 짧게, 후반엔 길게)
             adaptive_epochs = max(10, int((tune_epochs // 2) + (tune_epochs - tune_epochs // 2) * (gen / max(1, iterations - 1))))
             
+            # VRAM 관리를 위해 별도 프로세스로 학습 실행 (기존 로직 유지)
             run_args = {
                 "model_name": model_name, "data_yaml": data_yaml, "adaptive_epochs": adaptive_epochs,
                 "tune_patience": tune_patience, "batch": args["batch"], "workers": args["workers"],
@@ -379,6 +379,7 @@ def _tune_worker(args, queue):
                 "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}),
                 "stop_event": stop_event
             }
+            
             run_queue = multiprocessing.Queue()
             p = multiprocessing.Process(target=_single_tune_run, args=(run_args, run_queue))
             p.start()
@@ -395,29 +396,52 @@ def _tune_worker(args, queue):
                 worker_logger.info(f"세대 {gen+1} 조기 종료 감지됨 (Epoch: {actual_epochs})")
                 send_discord_webhook(args["webhook_url"], f"🛑 **[조기 종료]** Auto ML {gen+1}세대 - {actual_epochs} Epoch에서 조기 종료됨.")
 
-            gen_record = {
+            # 기록 저장
+            search_history.append({
                 "generation": gen + 1,
                 "fitness": fitness,
                 "mAP50": mAP50,
                 "mAP50_95": mAP50_95,
                 **current_params
-            }
-            search_history.append(gen_record)
+            })
             
-            worker_logger.info(f"세대 {gen+1}: Fitness={fitness:.2f} (Best: {best_score:.2f}) | Epochs실행: {adaptive_epochs}")
+            worker_logger.info(f"세대 {gen+1}: Fitness={fitness:.2f} | Epochs실행: {adaptive_epochs}")
             
-            if fitness > best_score: 
-                best_score = fitness
-                best_params = current_params.copy()
-                worker_logger.info(f"✨ 세대 {gen+1}에서 최고 점수 갱신!")
-            
-            if args.get("webhook_url") and args.get("noti_flags", {}).get("tune", False):
-                send_discord_webhook(args["webhook_url"], f"🤖 **[Auto ML]** {gen+1}세대 탐색 완료\n- 최고 잠재력 점수: {best_score:.1f}점")
+            return fitness # Optuna에게 평가 점수를 반환
+
+        # 👉 [핵심 변경 2] Optuna Study 생성 및 실행
+        optuna.logging.set_verbosity(optuna.logging.WARNING) # Optuna 자체 로그는 최소화
+        study = optuna.create_study(direction="maximize")    # 점수가 높을수록 좋음
+        
+        # 0세대는 사용자가 UI에서 세팅한 기본 파라미터로 먼저 평가하도록 힌트 제공
+        study.enqueue_trial(args["initial_params"])
+        
+        # 최적화 실행 (사용자가 도중에 중지하면 부분 탐색 결과 반환)
+        try:
+            study.optimize(objective, n_trials=iterations)
+        except Exception as e:
+            if stop_event and stop_event.is_set():
+                worker_logger.info("탐색이 안전하게 조기 종료되었습니다.")
+            else:
+                raise e
+
+        if not search_history:
+            result["error"] = "탐색 결과가 없습니다."
+            queue.put(result)
+            return
+
+        # 결과 수합
+        best_trial = study.best_trial
+        best_params = best_trial.params
+        best_score = best_trial.value
+        
+        if args.get("webhook_url") and args.get("noti_flags", {}).get("tune", False):
+            send_discord_webhook(args["webhook_url"], f"🤖 **[Auto ML]** 탐색 완료\n- 최고 잠재력 점수: {best_score:.1f}점 (세대: {best_trial.number + 1})")
             
         result["best_params"] = best_params
         result["success"] = True
         result["history"] = search_history
-        result["msg"] = f"✅ 맞춤형 파라미터 탐색 완료\n최고 잠재력 점수: {best_score:.1f}점\n총 {len(search_history)}세대 탐색 완료"
+        result["msg"] = f"✅ 맞춤형 파라미터 탐색 완료\n최고 잠재력 점수: {best_score:.1f}점 (세대: {best_trial.number + 1})\n총 {len(search_history)}세대 탐색 완료"
         worker_logger.info(f"[AutoML Worker] 튜닝 최종 완료. 소요시간: {time.time() - start_time:.1f}s")
         
     except Exception: 
