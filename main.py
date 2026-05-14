@@ -24,7 +24,7 @@ import seaborn as sns
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
 
 # ==========================================
-# 로깅(Logging) 설정
+# 로깅(Logging) 설정 (개선됨)
 # ==========================================
 def setup_logger():
     logger = logging.getLogger("YOLO_Pipeline")
@@ -113,6 +113,7 @@ class ConfigBuilder:
             "tab6": {"class_map": w.t6_class_map.toPlainText(), "color": w.t6_color_combo.currentText(), "auto_thr": w.t6_auto_thr.value(), "auto_nms": w.t6_auto_nms.value()}
         }
 
+# 👉 [개선] SQLite 연결 최적화 및 WAL 모드 지원
 class LogDatabase:
     def __init__(self, db_path):
         self.db_path = Path(db_path)
@@ -220,99 +221,12 @@ def create_heartbeat_callback(webhook_url, total_epochs, interval):
             send_discord_webhook(webhook_url, f"💓 **[학습 진행 상황]** {current_epoch} / {total_epochs} Epochs\n📉 현재 Total Loss: `{trainer.tloss.sum().item():.4f}`")
     return on_train_epoch_end
 
+# 👉 [개선] Graceful Stop을 위한 YOLO 커스텀 콜백 추가
 def create_stop_callback(stop_event):
     def on_train_epoch_end(trainer):
         if stop_event is not None and stop_event.is_set():
             logger.info("🛑 사용자의 중지 요청 감지. 이번 Epoch를 끝으로 학습을 안전하게 조기 종료합니다.")
             trainer.stop = True
-    return on_train_epoch_end
-
-def create_eta_callback(queue, current_fold, total_folds, transition_delay, task_name="Fold"):
-    state = {
-        "last_epoch_time": time.time(),
-        "epoch_times": [],
-        "warmup_done": False
-    }
-    
-    def format_eta(seconds):
-        """ETA를 읽기 쉬운 형식으로 변환"""
-        if seconds < 60:
-            return f"{int(seconds)}초"
-        hours, remainder = divmod(seconds, 3600)
-        minutes, _ = divmod(remainder, 60)
-        
-        if hours >= 24:
-            days = hours // 24
-            hours = hours % 24
-            return f"{int(days)}일 {int(hours)}시간 {int(minutes)}분"
-        elif hours > 0:
-            return f"{int(hours)}시간 {int(minutes)}분"
-        else:
-            return f"{int(minutes)}분"
-            
-    def on_train_epoch_end(trainer):
-        try:
-            current_time = time.time()
-            time_took = current_time - state["last_epoch_time"]
-            state["last_epoch_time"] = current_time
-            
-            # 🔧 워밍업 단계 감지 (전체 에포크가 2 이하일 때는 워밍업 무시)
-            is_short_train = trainer.epochs <= 2
-            if is_short_train or trainer.epoch >= 2 or state["warmup_done"]:
-                
-                # 워밍업이 방금 끝났다면 기존 더미 데이터 초기화
-                if not state["warmup_done"] and not is_short_train and trainer.epoch >= 2:
-                    state["warmup_done"] = True
-                    state["epoch_times"].clear()
-                    
-                state["epoch_times"].append(time_took)
-                
-                # 최근 10개 에포크 유지 (메모리 효율)
-                if len(state["epoch_times"]) > 10:
-                    state["epoch_times"].pop(0)
-            
-            # 🔧 지수이동평균(EMA) 계산
-            if len(state["epoch_times"]) >= 3:
-                latest = state["epoch_times"][-1]
-                prev_avg = sum(state["epoch_times"][:-1]) / (len(state["epoch_times"]) - 1)
-                avg_time_per_epoch = 0.3 * latest + 0.7 * prev_avg
-            elif state["epoch_times"]:
-                avg_time_per_epoch = sum(state["epoch_times"]) / len(state["epoch_times"])
-            else:
-                avg_time_per_epoch = 0  # 워밍업 중
-                
-            # 🔧 남은 에포크 계산
-            current_fold_remaining_epochs = max(0, trainer.epochs - (trainer.epoch + 1))
-            remaining_folds = max(0, total_folds - current_fold)
-            global_remaining_epochs = current_fold_remaining_epochs + (remaining_folds * trainer.epochs)
-            
-            # 🔧 안전한 ETA 계산
-            global_eta_seconds = max(0, 
-                (global_remaining_epochs * avg_time_per_epoch) + 
-                (remaining_folds * transition_delay)
-            )
-            
-            # 포맷팅
-            if global_remaining_epochs == 0 and remaining_folds == 0:
-                global_eta_str = "마무리 작업 중..."
-            elif avg_time_per_epoch == 0:
-                global_eta_str = "계산 중..."
-            else:
-                global_eta_str = format_eta(global_eta_seconds)
-                
-            queue.put({
-                "msg_type": "status_update", 
-                "task_name": task_name,
-                "fold": current_fold,
-                "total_folds": total_folds,
-                "epoch": trainer.epoch + 1,
-                "total_epochs": trainer.epochs,
-                "global_eta": global_eta_str,
-                "avg_epoch_time": f"{avg_time_per_epoch:.1f}초"
-            })
-        except Exception as e:
-            logger.debug(f"ETA 계산 중 오류 (무시됨): {e}")
-            
     return on_train_epoch_end
 
 class WebhookSettingsDialog(QDialog):
@@ -361,17 +275,9 @@ def _single_tune_run(args, queue):
             interval = args.get("noti_flags", {}).get("epoch_interval", 100)
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], args["adaptive_epochs"], interval))
             
+        # 👉 [개선] Graceful Stop 콜백 연결
         if args.get("stop_event"):
             model.add_callback("on_train_epoch_end", create_stop_callback(args["stop_event"]))
-
-        # 👉 부모로부터 전달받은 queue(run_queue)를 그대로 사용
-        model.add_callback("on_train_epoch_end", create_eta_callback(
-            queue, 
-            current_fold=args.get("gen", 0) + 1, 
-            total_folds=args.get("total_gens", 1),
-            transition_delay=10.0,
-            task_name="세대"
-        ))
 
         res = model.train(
             data=str(args["data_yaml"]), epochs=args["adaptive_epochs"], patience=args["tune_patience"], 
@@ -444,6 +350,7 @@ def _tune_worker(args, queue):
         rng = random.Random(time.time())
         
         for gen in range(iterations):
+            # 👉 [개선] Graceful Stop 지원 - 루프 시작 전 체크
             if stop_event and stop_event.is_set():
                 worker_logger.info("🛑 사용자에 의한 탐색 취소")
                 if not search_history:
@@ -468,29 +375,18 @@ def _tune_worker(args, queue):
             run_args = {
                 "model_name": model_name, "data_yaml": data_yaml, "adaptive_epochs": adaptive_epochs,
                 "tune_patience": tune_patience, "batch": args["batch"], "workers": args["workers"],
-                "tune_base": tune_base, "gen": gen, "total_gens": iterations, "current_params": current_params,
+                "tune_base": tune_base, "gen": gen, "current_params": current_params,
                 "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}),
                 "stop_event": stop_event
             }
             run_queue = multiprocessing.Queue()
             p = multiprocessing.Process(target=_single_tune_run, args=(run_args, run_queue))
             p.start()
-            
-            # 👉 릴레이 로직 (자식 -> 부모로 ETA 전달 & 데드락 방지)
-            run_res = None
-            while p.is_alive() or not run_queue.empty():
-                try:
-                    msg = run_queue.get(timeout=0.1)
-                    if isinstance(msg, dict) and msg.get("msg_type") == "status_update":
-                        queue.put(msg)  # Main UI 큐로 ETA 메시지 릴레이
-                    else:
-                        run_res = msg   # 최종 결과 저장
-                except qlib.Empty:
-                    pass
             p.join() 
             
-            if run_res is not None:
-                if not run_res.get("success"): raise Exception(f"세대 {gen+1} 학습 중 오류: {run_res.get('error')}")
+            if not run_queue.empty():
+                run_res = run_queue.get()
+                if not run_res["success"]: raise Exception(f"세대 {gen+1} 학습 중 오류: {run_res.get('error')}")
                 actual_epochs, mAP50, mAP50_95, fitness = run_res["actual_epochs"], run_res["mAP50"], run_res["mAP50_95"], run_res["fitness"]
             else:
                 raise Exception(f"세대 {gen+1} 워커 프로세스가 비정상 종료되었습니다.")
@@ -535,6 +431,7 @@ def _auto_threshold_worker(args, queue):
     from pathlib import Path
     from ultralytics import YOLO
     
+    # 👉 [추가] PyTorch 및 NMS 연산을 위한 라이브러리 임포트
     import torch
     import torchvision.ops as ops 
     
@@ -584,18 +481,22 @@ def _auto_threshold_worker(args, queue):
                         })
             gt_data.append(boxes)
         
+        # ---------------------------------------------------------
+        # 👉 [핵심 개선] 1회 전체 예측 및 캐싱 (Batch Predict Cache)
+        # ---------------------------------------------------------
         worker_logger.info("⚡ 속도 최적화를 위한 이미지 1회 일괄 추론 및 캐싱 진행 중...")
         
         res_cached = model.predict(
             source=[str(p) for p in img_files],
-            conf=0.001,  
-            iou=0.999,   
-            max_det=30000, 
+            conf=0.001,  # 가장 낮은 Conf로 모든 박스 추출
+            iou=0.999,   # NMS를 거의 수행하지 않음
+            max_det=30000, # 최대한 많은 박스 유지
             agnostic_nms=agnostic, verbose=False, stream=True
         )
         
         cached_predictions = []
         for r in res_cached:
+            # GPU VRAM을 비우기 위해 .cpu()로 RAM에 적재
             cached_predictions.append({
                 "xyxy": r.boxes.xyxy.cpu() if len(r.boxes) > 0 else torch.empty((0, 4)),
                 "xywhn": r.boxes.xywhn.cpu() if len(r.boxes) > 0 else torch.empty((0, 4)),
@@ -604,9 +505,14 @@ def _auto_threshold_worker(args, queue):
             })
             
         worker_logger.info(f"✅ 총 {len(cached_predictions)}장 캐싱 완료. 모델 메모리 해제.")
+        
+        # 신경망 추론이 끝났으므로 VRAM 해제
         del model
         clear_vram()
         
+        # ---------------------------------------------------------
+        # 👉 [핵심 개선] 캐시된 데이터를 이용한 초고속 필터링 평가 함수
+        # ---------------------------------------------------------
         def eval_yolo(test_conf, test_iou):
             total_tp = total_fp = total_fn = img_correct = 0
             
@@ -616,24 +522,28 @@ def _auto_threshold_worker(args, queue):
                 scores = cache["scores"]
                 classes = cache["classes"]
                 
+                # 1. Confidence Threshold 필터링
                 mask = scores >= test_conf
                 f_xyxy = xyxy[mask]
                 f_xywhn = xywhn[mask]
                 f_scores = scores[mask]
                 f_classes = classes[mask]
                 
+                # 2. PyTorch NMS (Non-Maximum Suppression) 적용
                 if len(f_xyxy) > 0:
                     if agnostic:
                         keep = ops.nms(f_xyxy, f_scores, test_iou)
                     else:
                         keep = ops.batched_nms(f_xyxy, f_scores, f_classes, test_iou)
                     
+                    # max_det 컷오프 (NMS는 점수 역순으로 인덱스를 반환함)
                     if len(keep) > max_det:
                         keep = keep[:max_det]
                         
                     final_xywhn = f_xywhn[keep]
                     final_classes = f_classes[keep]
                     
+                    # 기존 정답 비교 로직과 포맷 맞추기
                     pred_boxes = [
                         {"class": int(cls.item()), "box": b.tolist()}
                         for cls, b in zip(final_classes, final_xywhn)
@@ -641,6 +551,7 @@ def _auto_threshold_worker(args, queue):
                 else:
                     pred_boxes = []
                 
+                # --- 기존과 동일한 정답 매칭 로직 ---
                 gt_boxes = gt_data[idx]
                 matched_gt = set()
                 tp = fp = 0
@@ -673,6 +584,9 @@ def _auto_threshold_worker(args, queue):
             
             return img_correct, f1 * 100, precision, recall
         
+        # ---------------------------------------------------------
+        # 1차 / 2차 탐색 로직 (기존과 동일하지만 수십 배 빠르게 동작함)
+        # ---------------------------------------------------------
         conf_1st = [0.05, 0.15, 0.25, 0.45, 0.65, 0.85, 0.95]
         iou_1st = [0.25, 0.40, 0.55, 0.70, 0.85]
         
@@ -791,17 +705,9 @@ def _single_fold_run(args, queue):
             interval = args.get("noti_flags", {}).get("epoch_interval", 100)
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], args["epochs"], interval))
 
+        # 👉 [개선] Graceful Stop 콜백 연결
         if args.get("stop_event"):
             model.add_callback("on_train_epoch_end", create_stop_callback(args["stop_event"]))
-
-        # 👉 전달받은 기본 queue를 사용하여 릴레이 워커로 정보 송신
-        model.add_callback("on_train_epoch_end", create_eta_callback(
-            queue, 
-            current_fold=args.get("current_fold", 1), 
-            total_folds=args.get("total_folds", 1),
-            transition_delay=args.get("saved_transition_delay", 15.0),
-            task_name="Fold"
-        ))
 
         res = model.train(
             data=str(args["data_yaml"]), epochs=args["epochs"], patience=args["patience"], imgsz=args["imgsz"], 
@@ -843,11 +749,8 @@ def _kfold_train_worker(args, queue):
         fold_metrics, fold_save_dirs = [], {}
         splits = [(train_test_split(train_val, test_size=args["test_split"], random_state=args["random_seed"]))] if args["num_folds"] == 1 else list(KFold(n_splits=args["num_folds"], shuffle=True, random_state=args["random_seed"]).split(train_val))
         
-        avg_transition_delay = args.get("saved_transition_delay", 15.0)
-        fold_transition_times = []
-        last_fold_end_time = time.time()
-
         for fold, split_data in enumerate(splits):
+            # 👉 [개선] Graceful Stop 지원
             if stop_event and stop_event.is_set():
                 worker_logger.info("🛑 사용자에 의한 K-Fold 진행 취소")
                 if not fold_metrics:
@@ -860,14 +763,6 @@ def _kfold_train_worker(args, queue):
 
             fold_num = fold + 1; fd = kfold_base / f"fold_{fold_num}"; fd.mkdir(exist_ok=True)
             worker_logger.info(f"--- Fold {fold_num}/{args['num_folds']} 학습 시작 ---")
-            
-            current_time = time.time()
-            if fold > 0:
-                transition_time = current_time - last_fold_end_time
-                fold_transition_times.append(transition_time)
-                avg_transition_delay = sum(fold_transition_times) / len(fold_transition_times)
-                worker_logger.debug(f"Fold {fold_num-1} -> {fold_num} 전환 소요 시간 측정: {transition_time:.1f}초")
-
             tr, vl = split_data if args["num_folds"] == 1 else (np.array(train_val)[split_data[0]], np.array(train_val)[split_data[1]])
             tr_txt, vl_txt = fd / "train.txt", fd / "val.txt"; tr_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in tr)); vl_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in vl))
             data_yaml = fd / "data.yaml"; data_yaml.write_text(f"train: {tr_txt.resolve()}\nval: {vl_txt.resolve()}\ntest: {test_img_dir.resolve()}\nnc: {len(args['class_names'])}\nnames: {args['class_names']}\n")
@@ -877,31 +772,17 @@ def _kfold_train_worker(args, queue):
                 "model_name": args["model_name"], "data_yaml": data_yaml, "epochs": args["epochs"], "patience": args.get("patience",100),
                 "imgsz": args["imgsz"], "batch": args["batch"], "workers": args["workers"], "runs_dir": runs_dir, "run_name": run_name,
                 "seed": args["random_seed"], "deterministic": args["deterministic"], "aug": args["aug"], "loss": args["loss"],
-                "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}), "stop_event": stop_event,
-                "current_fold": fold_num, "total_folds": args["num_folds"], "saved_transition_delay": avg_transition_delay
+                "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}), "stop_event": stop_event
             }
             
             run_queue = multiprocessing.Queue()
             p = multiprocessing.Process(target=_single_fold_run, args=(run_args, run_queue))
             p.start()
-            
-            # 👉 릴레이 로직 (자식 -> 부모로 ETA 전달 & 데드락 방지)
-            run_res = None
-            while p.is_alive() or not run_queue.empty():
-                try:
-                    msg = run_queue.get(timeout=0.1)
-                    if isinstance(msg, dict) and msg.get("msg_type") == "status_update":
-                        queue.put(msg)  # UI 큐로 즉시 중계
-                    else:
-                        run_res = msg   # 최종 결과 데이터
-                except qlib.Empty:
-                    pass
             p.join()
             
-            last_fold_end_time = time.time()
-            
-            if run_res is not None:
-                if not run_res.get("success"): raise Exception(f"Fold {fold_num} 학습 중 오류: {run_res.get('error')}")
+            if not run_queue.empty():
+                run_res = run_queue.get()
+                if not run_res["success"]: raise Exception(f"Fold {fold_num} 학습 중 오류: {run_res.get('error')}")
                 actual_epochs, res_dict, save_dir = run_res["actual_epochs"], run_res["results_dict"], run_res["save_dir"]
             else:
                 raise Exception(f"Fold {fold_num} 워커 프로세스가 비정상 종료되었습니다.")
@@ -918,8 +799,6 @@ def _kfold_train_worker(args, queue):
                 send_discord_webhook(args["webhook_url"], f"📍 **[K-Fold]** Fold {fold_num} 완료\n- mAP50-95: {mAP:.4f}")
 
         if fold_metrics:
-            result["avg_transition_delay"] = avg_transition_delay
-
             best_n = max(range(len(fold_metrics)), key=lambda i: (fold_metrics[i].get(args["best_metric"], 0), fold_metrics[i].get(args["second_metric"], 0))) + 1
             worker_logger.info(f"[K-Fold Worker] 모든 Fold 종료. 최우수 Fold: {best_n}")
             src = Path(fold_save_dirs[best_n]) / "weights" / "best.pt"; dst = kfold_base / "best_model.pt"
@@ -959,13 +838,9 @@ def _retrain_worker(args, queue):
             interval = p.get("noti_flags", {}).get("epoch_interval", 10) 
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(p["webhook_url"], p["rt_epochs"], interval))
 
+        # 👉 [개선] Graceful Stop 콜백 연결
         if p.get("stop_event"):
             model.add_callback("on_train_epoch_end", create_stop_callback(p["stop_event"]))
-
-        # 👉 기본 queue 사용으로 변경
-        model.add_callback("on_train_epoch_end", create_eta_callback(
-            queue, 1, 1, 0.0, "재학습"
-        ))
 
         res = model.train(data=str(yaml_rt), epochs=p["rt_epochs"], imgsz=p["imgsz"], batch=p["rt_batch"], project=str(runs_dir), name=p["rt_run_name"], exist_ok=True, hsv_h=p["rt_h"], hsv_s=p["rt_s"], hsv_v=p["rt_v"], flipud=p["rt_flipud"], fliplr=p["rt_fliplr"], mosaic=p["rt_mosaic"], mixup=p["rt_mix"], copy_paste=p["rt_cp"], cls=p["rt_cls"], box=p["rt_box"], verbose=True)
         
@@ -982,36 +857,18 @@ def _retrain_worker(args, queue):
 
 class ProcessMonitorThread(QThread):
     finished_ok = pyqtSignal(dict); error = pyqtSignal(str)
-    status_update = pyqtSignal(dict) 
-
-    def __init__(self, queue, process): 
-        super().__init__()
-        self.queue = queue
-        self.process = process
-
+    def __init__(self, queue, process): super().__init__(); self.queue = queue; self.process = process
     def run(self):
         logger.debug(f"[Monitor Thread] 모니터링 시작 (PID: {self.process.pid})")
-        while True:
-            try: 
-                # 0.5초 대기하며 큐 확인
-                data = self.queue.get(timeout=0.5)
-                
-                # 👉 상태 업데이트 처리
-                if isinstance(data, dict) and data.get("msg_type") == "status_update":
-                    self.status_update.emit(data)
-                else:
-                    # 최종 결과가 도착하면 스레드 정상 종료
-                    self.finished_ok.emit(data)
-                    logger.debug("[Monitor Thread] Worker 결과 수신 성공")
-                    return
-            except qlib.Empty:
-                # 큐가 비어있는데 프로세스도 죽었다면 비정상 종료 확인 후 탈출
-                if not self.process.is_alive():
-                    if self.process.exitcode not in (0, None): 
-                        msg = f"프로세스 비정상 종료 (Exit Code: {self.process.exitcode})"
-                        logger.error(msg)
-                        self.error.emit(msg)
-                    return
+        while self.process.is_alive():
+            try: self.finished_ok.emit(self.queue.get(timeout=0.5)); logger.debug("[Monitor Thread] Worker 결과 수신 성공"); return
+            except qlib.Empty: continue
+        try: self.finished_ok.emit(self.queue.get(timeout=1.0))
+        except qlib.Empty:
+            if self.process.exitcode != 0: 
+                msg = f"프로세스 비정상 종료 (Exit Code: {self.process.exitcode})"
+                logger.error(msg)
+                self.error.emit(msg)
 
 class PreprocessThread(QThread):
     progress = pyqtSignal(int); log_msg = pyqtSignal(str); finished_ok = pyqtSignal(int); error = pyqtSignal(str)
@@ -1693,20 +1550,27 @@ class LogTabWidget(QWidget):
     def init_ui(self):
         layout = QVBoxLayout(self)
         
+        # --- Top Filter Area ---
         filter_layout = QHBoxLayout()
+        
         self.dt_from = QDateEdit(QDate.currentDate().addDays(-30))
         self.dt_from.setCalendarPopup(True)
         self.dt_to = QDateEdit(QDate.currentDate().addDays(1))
         self.dt_to.setCalendarPopup(True)
+        
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("모델명 또는 유형 검색")
         self.search_input.returnPressed.connect(self.on_search)
+        
         self.chk_ng_only = QCheckBox("NG(오답) 항목만 보기")
         self.chk_ng_only.setVisible(self.tab_type == 'eval')
+        
         btn_search = QPushButton("🔍 조회/새로고침")
         btn_search.clicked.connect(self.on_search)
+        
         btn_export = QPushButton("📥 CSV 내보내기")
         btn_export.clicked.connect(self.export_csv)
+        
         btn_delete = QPushButton("🗑️ 선택 삭제")
         btn_delete.clicked.connect(self.delete_selected)
 
@@ -1722,9 +1586,13 @@ class LogTabWidget(QWidget):
         filter_layout.addWidget(btn_export)
         filter_layout.addWidget(btn_delete)
         filter_layout.addStretch()
+        
         layout.addLayout(filter_layout)
 
+        # --- Main Splitter ---
         splitter = QSplitter(Qt.Vertical) 
+        
+        # [Top]: Table Area
         self.table = QTableWidget()
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1734,26 +1602,34 @@ class LogTabWidget(QWidget):
         self.table.itemDoubleClicked.connect(self.on_row_double_clicked)
         splitter.addWidget(self.table)
         
+        # [Bottom]: Details Panel
         self.details_panel = QWidget()
         details_layout = QVBoxLayout(self.details_panel)
         details_layout.setContentsMargins(0, 10, 0, 0)
+        
+        # 상세 정보 헤더
         detail_header_layout = QHBoxLayout()
         self.lbl_detail_title = QLabel("<b>[상세 정보]</b> 목록에서 항목을 선택하세요.")
         self.btn_open_folder = QPushButton("📂 저장 폴더 열기")
         self.btn_open_folder.setEnabled(False)
         self.btn_open_folder.clicked.connect(self.open_current_folder)
         self.btn_open_folder.setFixedWidth(150)
+        
         detail_header_layout.addWidget(self.lbl_detail_title)
         detail_header_layout.addStretch()
         detail_header_layout.addWidget(self.btn_open_folder)
         details_layout.addLayout(detail_header_layout)
         
+        # 상세 정보 탭 생성
         self.detail_tabs = QTabWidget()
+        
+        # 1. Config 탭
         self.txt_config = QTextEdit()
         self.txt_config.setReadOnly(True)
         self.txt_config.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas, monospace; font-size: 12px;")
         self.detail_tabs.addTab(self.txt_config, "⚙️ 설정 (Config) 및 변경점")
         
+        # 2. 오답 이미지 탭
         if self.tab_type == 'eval':
             self.list_wrong_imgs = QListWidget()
             self.list_wrong_imgs.itemDoubleClicked.connect(self.on_wrong_image_double_clicked)
@@ -1764,6 +1640,7 @@ class LogTabWidget(QWidget):
         splitter.setSizes([600, 400]) 
         layout.addWidget(splitter, stretch=1)
         
+        # --- Bottom Paging Area ---
         paging_layout = QHBoxLayout()
         self.btn_first = QPushButton("|<")
         self.btn_prev = QPushButton("<")
@@ -1788,6 +1665,7 @@ class LogTabWidget(QWidget):
         paging_layout.addWidget(self.btn_last) 
         paging_layout.addWidget(self.cmb_page_size)
         paging_layout.addStretch()
+        
         layout.addLayout(paging_layout)
         
         if self.tab_type == 'train':
@@ -1801,6 +1679,7 @@ class LogTabWidget(QWidget):
         self.table.setHorizontalHeaderLabels(self.headers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        
         self.current_rows = []
 
     def compare_configs(self, old_c, new_c, prefix=""):
@@ -1810,11 +1689,15 @@ class LogTabWidget(QWidget):
             for k in all_keys:
                 if k in ['saved_at', 'timestamp', 'name']: continue
                 full_key = f"{prefix}.{k}" if prefix else k
-                if k not in old_c: diffs.append((full_key, "없음(None)", new_c[k]))
-                elif k not in new_c: diffs.append((full_key, old_c[k], "삭제됨(Deleted)"))
-                else: diffs.extend(self.compare_configs(old_c[k], new_c[k], full_key))
+                if k not in old_c:
+                    diffs.append((full_key, "없음(None)", new_c[k]))
+                elif k not in new_c:
+                    diffs.append((full_key, old_c[k], "삭제됨(Deleted)"))
+                else:
+                    diffs.extend(self.compare_configs(old_c[k], new_c[k], full_key))
         else:
-            if old_c != new_c: diffs.append((prefix, old_c, new_c))
+            if old_c != new_c:
+                diffs.append((prefix, old_c, new_c))
         return diffs
 
     def on_search(self):
@@ -1834,7 +1717,8 @@ class LogTabWidget(QWidget):
     def on_header_clicked(self, logical_index):
         if logical_index == 0: return 
         col_name = self.db_cols[logical_index]
-        if self.sort_col == col_name: self.sort_order = "ASC" if self.sort_order == "DESC" else "DESC"
+        if self.sort_col == col_name:
+            self.sort_order = "ASC" if self.sort_order == "DESC" else "DESC"
         else:
             self.sort_col = col_name
             self.sort_order = "DESC"
@@ -1845,6 +1729,7 @@ class LogTabWidget(QWidget):
         d_from = self.dt_from.date().toString("yyyy-MM-dd")
         d_to = self.dt_to.date().toString("yyyy-MM-dd")
         filter_ng = self.chk_ng_only.isChecked() if self.tab_type == 'eval' else False
+        
         offset = (self.current_page - 1) * self.page_size
         
         rows, total_count = self.db_manager.fetch_logs(
@@ -1865,15 +1750,21 @@ class LogTabWidget(QWidget):
             for c_idx in range(1, len(self.headers)):
                 db_idx = c_idx - 1 
                 val = row[db_idx]
-                if self.tab_type == 'train' and c_idx == 7: val_str = f"{val:.4f}" if isinstance(val, float) else str(val)
-                elif self.tab_type == 'eval' and c_idx == 7: val_str = f"{val:.1f}%" if isinstance(val, float) else str(val)
-                else: val_str = str(val)
                 
+                if self.tab_type == 'train' and c_idx == 7: 
+                    val_str = f"{val:.4f}" if isinstance(val, float) else str(val)
+                elif self.tab_type == 'eval' and c_idx == 7: 
+                    val_str = f"{val:.1f}%" if isinstance(val, float) else str(val)
+                else:
+                    val_str = str(val)
+                    
                 item = QTableWidgetItem(val_str)
                 item.setTextAlignment(Qt.AlignCenter)
+                
                 if self.tab_type == 'eval' and c_idx == 6 and val > 0: 
                     item.setForeground(QColor("red"))
                     item.setFont(QFont("Arial", 10, QFont.Bold))
+                    
                 self.table.setItem(r_idx, c_idx, item)
                 
         total_pages = max(1, math.ceil(total_count / self.page_size))
@@ -1882,9 +1773,11 @@ class LogTabWidget(QWidget):
         self.btn_first.setEnabled(self.current_page > 1)
         self.btn_next.setEnabled(self.current_page < total_pages)
         self.btn_last.setEnabled(self.current_page < total_pages)
+        
         try: self.btn_last.clicked.disconnect()
         except: pass
         self.btn_last.clicked.connect(lambda checked=False, p=total_pages: self.change_page(p))
+        
         self.clear_details()
 
     def delete_selected(self):
@@ -1892,9 +1785,11 @@ class LogTabWidget(QWidget):
         for r in range(self.table.rowCount()):
             if self.table.item(r, 0).checkState() == Qt.Checked:
                 ids_to_delete.append(int(self.table.item(r, 1).text()))
+                
         if not ids_to_delete:
             QMessageBox.warning(self, "경고", "삭제할 항목을 체크해주세요.")
             return
+            
         if QMessageBox.question(self, "삭제 확인", f"선택한 {len(ids_to_delete)}개의 기록을 삭제하시겠습니까?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
             self.db_manager.delete_logs(self.tab_type, ids_to_delete)
             self.load_data()
@@ -1904,20 +1799,26 @@ class LogTabWidget(QWidget):
         d_from = self.dt_from.date().toString("yyyy-MM-dd")
         d_to = self.dt_to.date().toString("yyyy-MM-dd")
         filter_ng = self.chk_ng_only.isChecked() if self.tab_type == 'eval' else False
+        
         rows, _ = self.db_manager.fetch_logs(
             table_type=self.tab_type, search_kw=kw, date_from=d_from, date_to=d_to,
             filter_ng=filter_ng, offset=0, limit=-1, sort_col=self.sort_col, sort_order=self.sort_order
         )
+        
         if not rows:
             QMessageBox.warning(self, "경고", "내보낼 데이터가 없습니다.")
             return
+            
         path, _ = QFileDialog.getSaveFileName(self, "CSV 저장", f"logs_{self.tab_type}_{datetime.now().strftime('%Y%m%d')}.csv", "CSV Files (*.csv)")
         if not path: return
+        
         try:
             with open(path, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
-                if self.tab_type == 'train': writer.writerow(["ID", "Timestamp", "Task Type", "Model Name", "Epochs", "Batch Size", "Best mAP", "Save Dir", "Config JSON"])
-                else: writer.writerow(["ID", "Timestamp", "Task Type", "Model Name", "Total Imgs", "Wrong Count", "Accuracy", "Wrong Images", "Config JSON"])
+                if self.tab_type == 'train':
+                    writer.writerow(["ID", "Timestamp", "Task Type", "Model Name", "Epochs", "Batch Size", "Best mAP", "Save Dir", "Config JSON"])
+                else:
+                    writer.writerow(["ID", "Timestamp", "Task Type", "Model Name", "Total Imgs", "Wrong Count", "Accuracy", "Wrong Images", "Config JSON"])
                 writer.writerows(rows)
             logger.info(f"CSV 파일 내보내기 성공: {path}")
             QMessageBox.information(self, "성공", f"CSV 파일이 저장되었습니다:\n{path}")
@@ -1930,8 +1831,10 @@ class LogTabWidget(QWidget):
         if not selected: return
         r = selected[0].row()
         row_data = self.current_rows[r]
+        
         save_dir = ""
         config_str = ""
+        
         if self.tab_type == 'train':
             save_dir = row_data[7]
             config_str = row_data[8]
@@ -1941,6 +1844,7 @@ class LogTabWidget(QWidget):
             config_str = row_data[8]
             wrong_imgs_str = row_data[7]
             self.list_wrong_imgs.clear()
+            
             model_path_str = row_data[3].split('|')[-1].strip() if '|' in row_data[3] else row_data[3]
             try:
                 model_path = Path(model_path_str)
@@ -1949,14 +1853,18 @@ class LogTabWidget(QWidget):
                     if source_txt.exists():
                         original_path = Path(source_txt.read_text(encoding='utf-8').strip())
                         save_dir = str(original_path.parent.parent) if original_path.parent.name == "weights" else str(original_path.parent)
-                    else: save_dir = str(model_path.parent)
+                    else:
+                        save_dir = str(model_path.parent)
                 else:
                     save_dir = str(model_path.parent.parent) if model_path.parent.name == "weights" else str(model_path.parent)
-            except: save_dir = ""
+            except:
+                save_dir = ""
+                
             if wrong_imgs_str:
                 try:
                     imgs = json.loads(wrong_imgs_str)
-                    for img in imgs: self.list_wrong_imgs.addItem(img)
+                    for img in imgs:
+                        self.list_wrong_imgs.addItem(img)
                 except: pass
 
         self.btn_open_folder.setProperty("target_path", save_dir)
@@ -1965,6 +1873,7 @@ class LogTabWidget(QWidget):
         try:
             current_config = json.loads(config_str)
             prev_config = {}
+            
             if self.sort_col == "id" and self.sort_order == "DESC" and r + 1 < len(self.current_rows):
                 prev_config_str = self.current_rows[r+1][8]
                 if prev_config_str: prev_config = json.loads(prev_config_str)
@@ -1978,25 +1887,33 @@ class LogTabWidget(QWidget):
                 if diffs:
                     diff_text = "<div style='background-color:#2d2d2d; padding:8px; border-radius:4px; margin-bottom:10px;'>"
                     diff_text += "<b style='color:#fca5a5; font-size:13px;'>🔍 [바로 이전 기록 대비 변경점]</b><br>"
-                    for k, old_v, new_v in diffs: diff_text += f"&nbsp;&nbsp;• <b>{k}</b> : <span style='text-decoration:line-through; color:#9ca3af;'>{old_v}</span> ➡️ <span style='color:#34d399; font-weight:bold;'>{new_v}</span><br>"
+                    for k, old_v, new_v in diffs:
+                        diff_text += f"&nbsp;&nbsp;• <b>{k}</b> : <span style='text-decoration:line-through; color:#9ca3af;'>{old_v}</span> ➡️ <span style='color:#34d399; font-weight:bold;'>{new_v}</span><br>"
                     diff_text += "</div>"
-                else: diff_text = "<div style='color:#9ca3af; margin-bottom:10px;'>💡 바로 이전 기록과 파라미터가 동일합니다.</div>"
+                else:
+                    diff_text = "<div style='color:#9ca3af; margin-bottom:10px;'>💡 바로 이전 기록과 파라미터가 동일합니다.</div>"
             
             pretty_json = json.dumps(current_config, indent=4, ensure_ascii=False)
             escaped_json = html.escape(pretty_json)
             self.txt_config.setHtml(f"{diff_text}<pre style='color:#d4d4d4; font-family:Consolas,monospace; font-size:12px;'>{escaped_json}</pre>")
-        except Exception as e: self.txt_config.setText(config_str)
+        except Exception as e:
+            self.txt_config.setText(config_str)
 
     def on_row_double_clicked(self, item):
         r = item.row()
         path = self.btn_open_folder.property("target_path")
-        if path and Path(path).exists(): open_folder(path)
+        if path and Path(path).exists():
+            open_folder(path)
 
     def on_wrong_image_double_clicked(self, item):
         clicked_img_name = item.text()
         workspace_dir = self.db_manager.db_path.parent
         eval_runs_dir = workspace_dir / "runs" / "eval"
-        valid_paths = []; target_idx = 0; run_dir = None
+        
+        valid_paths = []
+        target_idx = 0
+        
+        run_dir = None
         selected = self.table.selectedItems()
         if selected:
             r = selected[0].row()
@@ -2004,22 +1921,29 @@ class LogTabWidget(QWidget):
             try:
                 cfg = json.loads(row_data[8])
                 base_run_name = cfg.get("tab3", {}).get("run_name", "check01")
-                if "Tab 4" in row_data[3]: run_dir = eval_runs_dir / (base_run_name + "_final_eval")
-                else: run_dir = eval_runs_dir / base_run_name
+                if "Tab 4" in row_data[3]:
+                    run_dir = eval_runs_dir / (base_run_name + "_final_eval")
+                else:
+                    run_dir = eval_runs_dir / base_run_name
             except: pass
 
         for i in range(self.list_wrong_imgs.count()):
             name = self.list_wrong_imgs.item(i).text()
             p = run_dir / name if run_dir else None
+            
             if not p or not p.exists():
                 found = list(eval_runs_dir.glob(f"*/{name}"))
                 if found: p = found[0]
+                
             if p and p.exists():
                 valid_paths.append(str(p))
-                if name == clicked_img_name: target_idx = len(valid_paths) - 1
+                if name == clicked_img_name:
+                    target_idx = len(valid_paths) - 1
                     
-        if valid_paths: ImagePreviewDialog(valid_paths, target_idx, self).exec_()
-        else: QMessageBox.warning(self, "이미지 찾기 실패", f"'{clicked_img_name}' 이미지를 찾을 수 없습니다.\n평가 폴더(runs/eval)에서 삭제되거나 다른 곳으로 이동되었을 수 있습니다.")
+        if valid_paths:
+            ImagePreviewDialog(valid_paths, target_idx, self).exec_()
+        else:
+            QMessageBox.warning(self, "이미지 찾기 실패", f"'{clicked_img_name}' 이미지를 찾을 수 없습니다.\n평가 폴더(runs/eval)에서 삭제되거나 다른 곳으로 이동되었을 수 있습니다.")
 
     def open_current_folder(self):
         path = self.btn_open_folder.property("target_path")
@@ -2029,7 +1953,8 @@ class LogTabWidget(QWidget):
         self.lbl_detail_title.setText("<b>[상세 정보]</b> 목록에서 항목을 선택하세요.")
         self.btn_open_folder.setEnabled(False)
         self.txt_config.clear()
-        if self.tab_type == 'eval': self.list_wrong_imgs.clear()
+        if self.tab_type == 'eval':
+            self.list_wrong_imgs.clear()
 
 class LogViewerDialog(QDialog):
     def __init__(self, db_manager, parent=None):
@@ -2037,13 +1962,17 @@ class LogViewerDialog(QDialog):
         self.setWindowTitle("📊 프로젝트 통합 히스토리 (고급 검색/필터 적용)")
         self.resize(1600, 800)
         self.db_manager = db_manager
+        
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
+        
         self.train_tab = LogTabWidget('train', self.db_manager, self)
         self.tabs.addTab(self.train_tab, "🏋️ 학습 기록")
+        
         self.eval_tab = LogTabWidget('eval', self.db_manager, self)
         self.tabs.addTab(self.eval_tab, "🔍 평가 및 오답 기록")
+        
         btn_close = QPushButton("닫기")
         btn_close.clicked.connect(self.accept)
         btn_close.setMinimumHeight(40)
@@ -2058,6 +1987,7 @@ class TuneHistoryDialog(QDialog):
 
         try:
             df = pd.read_csv(history_csv_path)
+            
             self.canvas = FigureCanvas(plt.Figure(figsize=(8, 4)))
             self.toolbar = NavigationToolbar(self.canvas, self)
             layout.addWidget(self.toolbar)
@@ -2120,45 +2050,20 @@ class MainWindow(QMainWindow):
         default_proj_path = self.base_dir / "MyProject"; self.config_manager = ConfigManager(str(default_proj_path)); self.config_builder = ConfigBuilder()
         self.log_db = LogDatabase(self.base_dir / "MyProject" / "workspace" / "training_history.db"); self.training_process = None; self.init_ui()
 
+        # 👉 상태바 애니메이션을 위한 타이머 설정
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.update_status_animation)
         self.status_animation_frame = 0
         self.base_status_msg = ""
 
-    def get_saved_transition_delay(self):
-        spec_file = self.base_dir / "logs" / "hardware_spec.json"
-        if spec_file.exists():
-            try:
-                with open(spec_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    return data.get("avg_transition_delay", 15.0)
-            except Exception as e:
-                logger.warning(f"하드웨어 스펙 파일을 읽는 중 오류 (기본값 사용): {e}")
-        return 15.0
-
-    def save_transition_delay(self, delay):
-        spec_dir = self.base_dir / "logs"
-        spec_dir.mkdir(exist_ok=True)
-        spec_file = spec_dir / "hardware_spec.json"
-        try:
-            with open(spec_file, 'w', encoding='utf-8') as f:
-                json.dump({"avg_transition_delay": round(delay, 2), "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f, indent=4)
-            logger.info(f"PC 하드웨어 성능 파일 저장 완료: {spec_file.name}")
-        except Exception as e:
-            logger.error(f"하드웨어 스펙 파일 저장 실패: {e}")
-
-    def update_eta_status(self, data):
-        msg = f"[{data.get('task_name', 'Fold')} {data['fold']}/{data['total_folds']}] 학습 중 (Epoch {data['epoch']}/{data['total_epochs']}) | 전체 예상 남은 시간: {data['global_eta']}"
-        self.start_dynamic_status(msg)
-
+    # 👉 상태바 애니메이션 갱신 메서드
     def update_status_animation(self):
         frames = ["⏳", "⌛"]
         frame = frames[self.status_animation_frame % len(frames)]
         dots = "." * ((self.status_animation_frame % 3) + 1)
         self.status_animation_frame += 1
-        
-        pid_info = f" (PID: {self.training_process.pid})" if self.training_process else ""
-        self.statusBar().showMessage(f"{frame} {self.base_status_msg}{dots}{pid_info}")
+        pid_info = f"[PID: {self.training_process.pid}] " if self.training_process else ""
+        self.statusBar().showMessage(f"{frame} {pid_info}{self.base_status_msg}{dots}")
 
     def start_dynamic_status(self, msg):
         self.base_status_msg = msg
@@ -2345,7 +2250,6 @@ class MainWindow(QMainWindow):
                     elif isinstance(widget, QCheckBox): widget.setChecked(default_val)
             if hasattr(self, 't1_class_map'): self.t1_class_map.setPlainText("OK\nNG")
             if hasattr(self, 't6_class_map'): self.t6_class_map.setPlainText("OK\nNG")
-            self.settings.clear() 
             self.statusBar().showMessage("🔄 모든 설정이 기본값으로 초기화되었습니다.", 3000)
 
     def save_config_dialog(self):
@@ -2467,6 +2371,7 @@ class MainWindow(QMainWindow):
     def start_training_process(self, worker_func, args):
         logger.info(f"멀티프로세싱 워커 시작. 대상 함수: {worker_func.__name__}")
         
+        # 👉 [개선] Graceful Stop Event 생성 및 args에 추가
         self.stop_event = multiprocessing.Event()
         args["stop_event"] = self.stop_event
         
@@ -2477,9 +2382,6 @@ class MainWindow(QMainWindow):
         self.monitor_thread = ProcessMonitorThread(self.train_queue, self.training_process)
         self.monitor_thread.finished_ok.connect(self.on_training_finished)
         self.monitor_thread.error.connect(self.on_training_fatal_error)
-        
-        self.monitor_thread.status_update.connect(self.update_eta_status)
-        
         self.monitor_thread.start()
         
         webhook_url = self.webhook_url
@@ -2493,6 +2395,7 @@ class MainWindow(QMainWindow):
         
         self.start_dynamic_status("백그라운드 작업 진행 중")
 
+    # 👉 [개선] Taskkill 방식 대신 이벤트 트리거를 통한 우아한 종료 적용
     def stop_training(self):
         logger.warning("사용자에 의한 안전한 프로세스 종료(Graceful Stop) 요청")
         if self.training_process and self.training_process.is_alive():
@@ -2509,15 +2412,13 @@ class MainWindow(QMainWindow):
         self.stop_dynamic_status("✅ 프로세스 완료")
         
         if self.webhook_url and self.noti_flags.get("task"):
-            if res.get("success"): send_discord_webhook(self.webhook_url, f"✅ **[작업 완료]** {res.get('task').upper()} 작업이 성공적으로 완료되었습니다.")
-            else: send_discord_webhook(self.webhook_url, f"⚠️ **[작업 실패/취소]** {res.get('task').upper()} 작업이 종료되었습니다.\n상세: {res.get('error', '알 수 없음')}")
+            if res.get("success"):
+                send_discord_webhook(self.webhook_url, f"✅ **[작업 완료]** {res.get('task').upper()} 작업이 성공적으로 완료되었습니다.")
+            else:
+                send_discord_webhook(self.webhook_url, f"⚠️ **[작업 실패/취소]** {res.get('task').upper()} 작업이 종료되었습니다.\n상세: {res.get('error', '알 수 없음')}")
 
         if res.get("success"):
             task = res.get("task"); current_config = self.config_builder.build(self)
-            
-            if task == "train" and "avg_transition_delay" in res:
-                self.save_transition_delay(res["avg_transition_delay"])
-
             if task == "tune":
                 bp = res.get("best_params", {})
                 if 'box' in bp: self.t2_lbox.setValue(float(bp['box']))
@@ -2572,6 +2473,7 @@ class MainWindow(QMainWindow):
         webhook_url = self.webhook_url
         if webhook_url and self.noti_flags.get("error"): send_discord_webhook(webhook_url, f"❌ **[프로세스 비정상 종료]**\n상세: {error_msg}")
         self._restore_training_ui(); QMessageBox.critical(self, "비정상 종료", error_msg)
+        
         self.stop_dynamic_status("🛑 프로세스가 비정상 종료되었습니다.")
         self.training_process = None
 
@@ -2591,7 +2493,7 @@ class MainWindow(QMainWindow):
     def show_kfold_metrics_dialog(self, metrics_data, title_msg, best_fold):
         logger.debug(f"K-Fold 검증 다이얼로그 오픈 (Best Fold: {best_fold})")
         dialog = QDialog(self); dialog.setWindowTitle("K-Fold 교차 검증 상세 지표"); dialog.resize(650, 350); layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel(f"<b>{title_msg.replace(chr(10), '<br>')}</b><br><span style='color: #ef4444;'>⭐ <b>최우수 모델: Fold {best_fold}</b> (가중 자동 저장됨)</span>"))
+        layout.addWidget(QLabel(f"<b>{title_msg.replace(chr(10), '<br>')}</b><br><span style='color: #ef4444;'>⭐ <b>최우수 모델: Fold {best_fold}</b> (가중치 자동 저장됨)</span>"))
         table = QTableWidget(len(metrics_data), 6); table.setHorizontalHeaderLabels(["Fold", "mAP50", "mAP50-95", "Precision", "Recall", "Fitness"]); self._apply_table_style(table)
         for i in range(table.columnCount()): table.horizontalHeader().setSectionResizeMode(i, QHeaderView.Stretch)
         for row, data in enumerate(metrics_data):
@@ -2828,14 +2730,11 @@ class MainWindow(QMainWindow):
         self.t1_thread.finished.connect(lambda: [self.t1_btn_run.setEnabled(True), QApplication.restoreOverrideCursor(), self.statusBar().showMessage("✅ 전처리 완료", 5000)]); self.t1_thread.start()
 
     def on_tab1_finished(self, ok_count):
-        if self.webhook_url and self.noti_flags.get("task"):
-            send_discord_webhook(self.webhook_url, f"✅ **[작업 완료]** 데이터 전처리 완료 (총 {ok_count}장 처리됨)")
+        if self.webhook_url and self.noti_flags.get("task"): send_discord_webhook(self.webhook_url, f"✅ **[작업 완료]** 데이터 전처리 완료 (총 {ok_count}장 처리됨)")
         QMessageBox.information(self, "완료", f"{ok_count}장 전처리 완료!")
-        
         proc_preview_dir = Path(self.w_proc_ds.get_path()) / "preview"
         target_dir = proc_preview_dir if proc_preview_dir.exists() else Path(self.w_proc_ds.get_path()) / "images"
-        if target_dir.exists():
-            self.t1_img_grid.update_images([str(f) for f in target_dir.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}])
+        if target_dir.exists(): self.t1_img_grid.update_images([str(f) for f in target_dir.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}])
             
     def setup_tab2(self):
         self.t2_epochs = QSpinBox(); self.t2_epochs.setRange(1, 5000); self.t2_epochs.setValue(400); self.t2_batch = QSpinBox(); self.t2_batch.setRange(1, 256); self.t2_batch.setValue(16); self.t2_workers = QSpinBox(); self.t2_workers.setRange(0, 32); self.t2_workers.setValue(8); self.t2_patience = QSpinBox(); self.t2_patience.setRange(0, 10000); self.t2_patience.setValue(100); self.t2_seed = QSpinBox(); self.t2_seed.setRange(0, 999999); self.t2_seed.setValue(42); self.t2_folds = QSpinBox(); self.t2_folds.setRange(1, 10); self.t2_folds.setValue(5); self.t2_test_split = QDoubleSpinBox(); self.t2_test_split.setRange(0.05, 0.6); self.t2_test_split.setValue(0.2); self.t2_test_split.setSingleStep(0.05); self.t2_lcls = QDoubleSpinBox(); self.t2_lcls.setRange(0.1, 10.0); self.t2_lcls.setValue(0.5); self.t2_lcls.setSingleStep(0.1); self.t2_lbox = QDoubleSpinBox(); self.t2_lbox.setRange(0.1, 20.0); self.t2_lbox.setValue(7.5); self.t2_lbox.setSingleStep(0.5); self.t2_ldfl = QDoubleSpinBox(); self.t2_ldfl.setRange(0.1, 10.0); self.t2_ldfl.setValue(1.5); self.t2_ldfl.setSingleStep(0.1)
@@ -2858,11 +2757,13 @@ class MainWindow(QMainWindow):
         
         h_form.addLayout(f_left); h_form.addLayout(f_right)
         
+        # AutoML 버튼 그룹
         h_tune = QHBoxLayout()
         self.t2_btn_tune = QPushButton("🤖 최적 파라미터 자동 탐색 (Auto ML)")
         self.t2_btn_tune.setStyleSheet("background-color: #dbeafe; border: 1px solid #93c5fd; padding: 8px; font-weight: bold; color: #1e3a8a;")
         self.t2_btn_tune.clicked.connect(self.run_auto_tune)
         
+        # 새로 추가된 AutoML 튜닝 기록 시각화 버튼
         self.btn_show_tune_history = QPushButton("📈 AutoML 튜닝 기록 그래프 보기")
         self.btn_show_tune_history.setStyleSheet("background-color: #fce7f3; border: 1px solid #fbcfe8; padding: 8px; font-weight: bold; color: #9d174d;")
         self.btn_show_tune_history.clicked.connect(self.show_tune_history)
@@ -2871,6 +2772,8 @@ class MainWindow(QMainWindow):
         h_tune.addWidget(self.btn_show_tune_history)
         
         self.t2_btn_run = QPushButton("🚀 K-Fold 학습 시작"); self.t2_btn_run.clicked.connect(self.run_tab2)
+        
+        # 👉 [개선] 강제 종료 대신 "안전 종료(Graceful Stop)" 버튼으로 변경
         self.t2_btn_stop = QPushButton("🛑 안전 종료(Graceful Stop)"); self.t2_btn_stop.clicked.connect(self.stop_training); self.t2_btn_stop.setEnabled(False)
         
         l = QVBoxLayout(); self.t2_scroll = self._create_scroll(h_form); l.addWidget(self.t2_scroll)
@@ -2878,6 +2781,7 @@ class MainWindow(QMainWindow):
         self.t2_btn_reset = QPushButton("🔄 이 탭 초기화"); self.t2_btn_reset.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 5px; border-radius: 4px;"); self.t2_btn_reset.clicked.connect(lambda _, w=self.t2_scroll: self.reset_tab_defaults(w, "K-Fold 학습"))
         
         l.addLayout(h_tune)
+        
         h = QHBoxLayout(); h.addWidget(self.t2_btn_run); h.addWidget(self.t2_btn_stop); h.addWidget(self.t2_btn_reset); l.addLayout(h)
         
         tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "🏋️ K-Fold 학습")
@@ -2922,20 +2826,7 @@ class MainWindow(QMainWindow):
             if QMessageBox.question(self, '확인', 'Fold 수가 1입니다. 단일 분할 학습으로 진행하시겠습니까?', QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.No: return
         success, cmap_or_error = self.parse_and_validate_class_map(self.t1_class_map.toPlainText())
         if not success: QMessageBox.warning(self, "클래스 매핑 오류", cmap_or_error); return
-        
-        saved_delay = self.get_saved_transition_delay()
-        
-        args = {
-            "processed_dir": self.w_proc_ds.get_path(), "workspace_dir": self.w_work_ds.get_path(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags(), 
-            "model_name": self.g_model.currentText(), "imgsz": int(self.g_imgsz.currentText()), "epochs": self.t2_epochs.value(), "batch": self.t2_batch.value(), 
-            "workers": self.t2_workers.value(), "patience": self.t2_patience.value(), "random_seed": self.t2_seed.value(), "deterministic": False, 
-            "num_folds": self.t2_folds.value(), "test_split": self.t2_test_split.value(), "best_metric": "metrics/mAP50-95(B)", "second_metric": "metrics/mAP50(B)", 
-            "class_names": list(cmap_or_error.keys()), 
-            "aug": {"hsv_h": self.t2_ah.value(), "hsv_s": self.t2_as.value(), "hsv_v": self.t2_av.value(), "degrees": self.t2_adeg.value(), "translate": self.t2_atrans.value(), "scale": self.t2_ascale.value(), "shear": self.t2_ashear.value(), "flipud": self.t2_afud.value(), "fliplr": self.t2_aflr.value(), "mosaic": self.t2_amos.value(), "mixup": self.t2_amix.value(), "copy_paste": self.t2_acp.value()}, 
-            "loss": {"cls": self.t2_lcls.value(), "box": self.t2_lbox.value(), "dfl": self.t2_ldfl.value()}, 
-            "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value(),
-            "saved_transition_delay": saved_delay
-        }
+        args = {"processed_dir": self.w_proc_ds.get_path(), "workspace_dir": self.w_work_ds.get_path(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags(), "model_name": self.g_model.currentText(), "imgsz": int(self.g_imgsz.currentText()), "epochs": self.t2_epochs.value(), "batch": self.t2_batch.value(), "workers": self.t2_workers.value(), "patience": self.t2_patience.value(), "random_seed": self.t2_seed.value(), "deterministic": False, "num_folds": self.t2_folds.value(), "test_split": self.t2_test_split.value(), "best_metric": "metrics/mAP50-95(B)", "second_metric": "metrics/mAP50(B)", "class_names": list(cmap_or_error.keys()), "aug": {"hsv_h": self.t2_ah.value(), "hsv_s": self.t2_as.value(), "hsv_v": self.t2_av.value(), "degrees": self.t2_adeg.value(), "translate": self.t2_atrans.value(), "scale": self.t2_ascale.value(), "shear": self.t2_ashear.value(), "flipud": self.t2_afud.value(), "fliplr": self.t2_aflr.value(), "mosaic": self.t2_amos.value(), "mixup": self.t2_amix.value(), "copy_paste": self.t2_acp.value()}, "loss": {"cls": self.t2_lcls.value(), "box": self.t2_lbox.value(), "dfl": self.t2_ldfl.value()}, "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value()}
         self.start_training_process(_kfold_train_worker, args)
 
     def setup_tab3(self):
