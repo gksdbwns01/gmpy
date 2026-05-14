@@ -50,6 +50,9 @@ AutoML과 K-Fold 교차 검증에 하위 프로세스(Subprocess) 분리 - Worke
 Threshold 자동탐색에서 예측 캐싱 적용
 이미지 Dimension 캐싱
 
+eta기능(K-Fold 학습, Auto ML, 재학습) 확인 전
+안전종료 버그 확인해야됨
+https://chatgpt.com/share/6a043432-97cc-8322-a20d-44137834a23f
 Optuna 연동?
 Resume 기능 - 학습 중간부터 이어서 다시 시작
 만약 DB에서 삭제하면 그 모델과 관련된 모든 것이 삭제됨?
