@@ -62,6 +62,25 @@ class ConfigDefaults:
 # ==========================================
 # 로깅(Logging) 설정
 # ==========================================
+class EmojiFormatter(logging.Formatter):
+    """로그 레벨에 따라 자동으로 이모지를 붙여주는 커스텀 포매터"""
+    LEVEL_EMOJIS = {
+        logging.DEBUG: "🔍 [DEBUG]",
+        logging.INFO: "ℹ️ [INFO]",
+        logging.WARNING: "⚠️ [WARN]",
+        logging.ERROR: "❌ [ERROR]",
+        logging.CRITICAL: "🔴 [CRITICAL]"
+    }
+
+    def format(self, record):
+        # record.levelname을 임시로 백업 및 교체
+        original_levelname = record.levelname
+        record.levelname = self.LEVEL_EMOJIS.get(record.levelno, original_levelname)
+        result = super().format(record)
+        # 다른 핸들러(FileHandler 등)에 영향을 주지 않도록 원상 복구
+        record.levelname = original_levelname
+        return result
+
 def setup_logger():
     logger = logging.getLogger("YOLO_Pipeline")
     if logger.hasHandlers(): return logger
@@ -71,14 +90,17 @@ def setup_logger():
     log_dir = base_dir / "logs"
     log_dir.mkdir(exist_ok=True)
     
+    # 1. File Handler: 이모지 없이 표준 포맷 적용 (분석/검색용)
     file_handler = RotatingFileHandler(log_dir / "app.log", maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter('[%(levelname)s] %(asctime)s - [PID:%(process)d|%(threadName)s] - %(funcName)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    
+    # 2. Console Handler: 이모지가 포함된 EmojiFormatter 적용 (시각적 가독성용)
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
-    
-    formatter = logging.Formatter('[%(levelname)s] %(asctime)s - [PID:%(process)d|%(threadName)s] - %(funcName)s - %(message)s')
-    file_handler.setFormatter(formatter)
-    console_handler.setFormatter(formatter)
+    console_formatter = EmojiFormatter('%(levelname)s %(asctime)s - [%(threadName)s] - %(message)s')
+    console_handler.setFormatter(console_formatter)
     
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
