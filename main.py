@@ -2259,19 +2259,74 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         logger.info("애플리케이션 종료 프로세스 시작")
-        if self.training_process and self.training_process.is_alive(): 
-            self.stop_training()
-            self.training_process.join(timeout=3)
-            # [수정] 3초 대기 후에도 살아있으면 좀비 프로세스 방지를 위해 Terminate
+        
+        # 1. 중복 알림 방지: 모니터링 스레드 시그널 연결 해제
+        # 워커가 종료되면서 던지는 시그널이 closeEvent의 동기 웹훅과 겹치지 않게 합니다.
+        if hasattr(self, 'monitor_thread') and self.monitor_thread:
+            try:
+                self.monitor_thread.finished_ok.disconnect()
+                self.monitor_thread.error.disconnect()
+                logger.debug("모니터링 스레드 시그널 연결 해제 (중복 알림 방지)")
+            except:
+                pass
+
+        # 2. 현재 백그라운드 작업(프로세스) 상태 확인
+        is_busy = (self.training_process and self.training_process.is_alive())
+        
+        # 3. 작업 중일 경우 '작업 취소' 웹훅 우선 전송 (동기 방식)
+        if is_busy and self.webhook_url and self.noti_flags.get("task"):
+            # 현재 어떤 탭의 작업이 수행 중인지 버튼 활성화 상태로 유추
+            task_name = "TASK"
+            if not self.t2_btn_run.isEnabled(): 
+                task_name = "K-FOLD TRAIN / AUTO ML"
+            elif not self.t4_btn_retrain.isEnabled(): 
+                task_name = "HARD RETRAIN"
+            elif not self.t1_btn_run.isEnabled():
+                task_name = "DATA PREPROCESS"
+            elif not self.t3_btn_run.isEnabled():
+                task_name = "EVALUATION"
+            elif not self.t5_btn_run.isEnabled():
+                task_name = "DISTANCE MEASURE"
+
+            send_discord_webhook(
+                webhook_url=self.webhook_url,
+                title=f"🛑 [작업 중단] {task_name}",
+                description="사용자가 프로그램을 종료하여 진행 중인 작업이 즉시 중단되었습니다.",
+                color=0xf39c12, # 주황색
+                sync=True # 전송이 완료될 때까지 종료를 잠시 유보 (핵심)
+            )
+
+        # 4. 프로그램 전체 종료 알림 웹훅 전송 (동기 방식)
+        if self.webhook_url:
+            status_text = " (작업 중 종료)" if is_busy else " (정상 종료)"
+            send_discord_webhook(
+                webhook_url=self.webhook_url,
+                title="⏹️ [프로그램 종료]",
+                description=f"YOLO 파이프라인 관리 도구가 종료되었습니다.{status_text}",
+                color=0x2c3e50, # 남색
+                sync=True
+            )
+
+        # 5. 백그라운드 프로세스(워커) 안전 종료 시도
+        if is_busy:
+            self.stop_training() # stop_event.set() 호출
+            self.training_process.join(timeout=1.5) # 워커가 정리될 시간을 줌
             if self.training_process.is_alive():
-                logger.warning("워커 프로세스가 종료되지 않아 강제 종료(Terminate)합니다.")
+                logger.warning("워커 프로세스가 응답하지 않아 강제 종료(Terminate)합니다.")
                 self.training_process.terminate()
 
+        # 6. 기타 UI 스레드(QThread) 정리
         for t_name in ["t1_thread", "t3_thread", "t4_thread", "t5_thread"]:
             if hasattr(self, t_name):
                 th = getattr(self, t_name)
-                if th and th.isRunning(): th.quit(); th.wait(2000)
-        self.settings.setValue("webhook_url", self.webhook_url); event.accept()
+                if th and th.isRunning():
+                    th.quit()
+                    th.wait(1000)
+
+        # 7. QSettings에 현재 설정 저장 및 종료 수락
+        self.settings.setValue("webhook_url", self.webhook_url)
+        logger.info("애플리케이션 종료 완료")
+        event.accept()
 
     def sync_base_paths(self, new_path):
         if hasattr(self, 't6_img_dir'): self.t6_img_dir.line_edit.setText(str(Path(new_path) / "image"))
