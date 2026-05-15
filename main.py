@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import zipfile, cv2, numpy as np, pandas as pd, psutil, torch, yaml
 import threading
+
 from PyQt5.QtWidgets import QSizePolicy
 from PyQt5.QtCore import QSize, Qt, QThread, pyqtSignal, QTimer, QRectF, QSettings, QDate
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
@@ -27,7 +28,6 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 # [개선] 통합 기본값 관리 (Config Defaults)
 # ==========================================
 class ConfigDefaults:
-    """모든 탭의 파라미터 기본값을 중앙 집중식으로 관리합니다."""
     GLOBAL = {"model": "yolov8n.pt", "imgsz": "640"}
     
     TAB1 = {"auto_crop": True, "margin": 50, "mw": 1280, "mh": 960, "clean": True, "exif": True}
@@ -58,12 +58,10 @@ class ConfigDefaults:
     
     TAB6 = {"auto_thr": 0.75, "auto_nms": 0.3, "color": "흰색 (White)"}
 
-
 # ==========================================
 # 로깅(Logging) 설정
 # ==========================================
 class EmojiFormatter(logging.Formatter):
-    """로그 레벨에 따라 자동으로 이모지를 붙여주는 커스텀 포매터"""
     LEVEL_EMOJIS = {
         logging.DEBUG: "🔍 [DEBUG]",
         logging.INFO: "ℹ️ [INFO]",
@@ -73,11 +71,9 @@ class EmojiFormatter(logging.Formatter):
     }
 
     def format(self, record):
-        # record.levelname을 임시로 백업 및 교체
         original_levelname = record.levelname
         record.levelname = self.LEVEL_EMOJIS.get(record.levelno, original_levelname)
         result = super().format(record)
-        # 다른 핸들러(FileHandler 등)에 영향을 주지 않도록 원상 복구
         record.levelname = original_levelname
         return result
 
@@ -90,13 +86,11 @@ def setup_logger():
     log_dir = base_dir / "logs"
     log_dir.mkdir(exist_ok=True)
     
-    # 1. File Handler: 이모지 없이 표준 포맷 적용 (분석/검색용)
     file_handler = RotatingFileHandler(log_dir / "app.log", maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)
     file_formatter = logging.Formatter('[%(levelname)s] %(asctime)s - [PID:%(process)d|%(threadName)s] - %(funcName)s - %(message)s')
     file_handler.setFormatter(file_formatter)
     
-    # 2. Console Handler: 이모지가 포함된 EmojiFormatter 적용 (시각적 가독성용)
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_formatter = EmojiFormatter('%(levelname)s %(asctime)s - [%(threadName)s] - %(message)s')
@@ -119,7 +113,6 @@ def clear_vram():
 
 
 class GracefulStopHandler:
-    """우아한 종료 처리를 위한 일관된 래퍼(Wrapper) 클래스"""
     def __init__(self, stop_event, logger, queue=None, default_result=None):
         self.stop_event = stop_event
         self.logger = logger
@@ -139,7 +132,6 @@ class GracefulStopHandler:
         if iteration % interval == 0:
             return self.should_stop(context, put_queue)
         return False
-
 
 class ConfigManager:
     def __init__(self, base_dir):
@@ -292,21 +284,34 @@ def open_folder(path):
     elif platform.system() == "Darwin": subprocess.Popen(["open", target_dir])
     else: subprocess.Popen(["xdg-open", target_dir])
 
-def send_discord_webhook(webhook_url, content, retry_count=2):
+def send_discord_webhook(webhook_url, title, description, color=0x3498db, fields=None, retry_count=2, sync=False):
     if not webhook_url or not webhook_url.startswith("http"): 
         return False
 
     def _send_task():
         import requests
         import time
+        from datetime import datetime
         from requests.exceptions import Timeout, ConnectionError, RequestException
+
+        embed = {
+            "title": title,
+            "description": description,
+            "color": color,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+        
+        if fields:
+            embed["fields"] = fields
+
+        payload = {"embeds": [embed]}
 
         for attempt in range(retry_count):
             try:
-                logger.debug(f"Discord 웹훅 전송 시도. (시도 {attempt+1}/{retry_count}, Content 길이: {len(content)})")
+                logger.debug(f"Discord 임베드 웹훅 전송 시도. (시도 {attempt+1}/{retry_count})")
                 response = requests.post(
                     webhook_url, 
-                    json={"content": content}, 
+                    json=payload, 
                     timeout=5
                 )
                 response.raise_for_status()
@@ -321,12 +326,17 @@ def send_discord_webhook(webhook_url, content, retry_count=2):
                 logger.error(f"웹훅 HTTP 에러 (Rate Limit 등): {e}")
             except Exception as e:
                 logger.error(f"웹훅 전송 중 알 수 없는 오류: {e}")
+            
             if attempt < retry_count - 1:
                 time.sleep(2)
 
         logger.error("디스코드 웹훅 최종 전송 실패")
-    import threading
-    threading.Thread(target=_send_task, daemon=True).start()
+        
+    if sync:
+        _send_task()  # 스레드를 쓰지 않고 그 자리에서 전송을 끝낼 때까지 대기
+    else:
+        import threading
+        threading.Thread(target=_send_task, daemon=True).start()  # 평소처럼 백그라운드 전송
     return True
 
 def create_heartbeat_callback(webhook_url, total_epochs, interval):
@@ -335,7 +345,19 @@ def create_heartbeat_callback(webhook_url, total_epochs, interval):
         current_epoch = trainer.epoch + 1
         if current_epoch % interval == 0:
             logger.debug(f"웹훅 Heartbeat 발생: Epoch {current_epoch}/{total_epochs}")
-            send_discord_webhook(webhook_url, f"💓 **[학습 진행 상황]** {current_epoch} / {total_epochs} Epochs\n📉 현재 Total Loss: `{trainer.tloss.sum().item():.4f}`")
+            
+            fields = [
+                {"name": "진척도 (Epochs)", "value": f"{current_epoch} / {total_epochs}", "inline": True},
+                {"name": "Total Loss", "value": f"`{trainer.tloss.sum().item():.4f}`", "inline": True}
+            ]
+            
+            send_discord_webhook(
+                webhook_url=webhook_url,
+                title="💓 [학습 진행 상황]",
+                description="모델 학습이 정상적으로 진행 중입니다.",
+                color=0x3498db,
+                fields=fields
+            )
     return on_train_epoch_end
 
 def create_stop_callback(stop_event):
@@ -455,13 +477,11 @@ def _tune_worker(args, queue):
         search_history = []
         
         def objective(trial):
-            # Graceful Stop 지원 - 탐색 중단
             if stop_handler.should_stop("Optuna 탐색 단계(Objective)", put_queue=False):
                 worker_logger.info("🛑 사용자에 의한 탐색 취소. Optuna Study를 중단합니다.")
                 trial.study.stop()
                 raise optuna.exceptions.TrialPruned()
 
-            # Optuna TPE 알고리즘 추천 파라미터
             current_params = {
                 'box': round(trial.suggest_float('box', 0.1, 20.0), 4),
                 'cls': round(trial.suggest_float('cls', 0.1, 10.0), 4),
@@ -483,7 +503,6 @@ def _tune_worker(args, queue):
             gen = trial.number
             worker_logger.debug(f"--- 튜닝 세대 {gen+1}/{iterations} --- 시작")
             
-            # Epoch 동적 할당
             adaptive_epochs = max(10, int((tune_epochs // 2) + (tune_epochs - tune_epochs // 2) * (gen / max(1, iterations - 1))))
             
             run_args = {
@@ -508,9 +527,13 @@ def _tune_worker(args, queue):
             
             if actual_epochs < adaptive_epochs and args.get("webhook_url") and args.get("noti_flags", {}).get("early_stop", False):
                 worker_logger.info(f"세대 {gen+1} 조기 종료 감지됨 (Epoch: {actual_epochs})")
-                send_discord_webhook(args["webhook_url"], f"🛑 **[조기 종료]** Auto ML {gen+1}세대 - {actual_epochs} Epoch에서 조기 종료됨.")
+                send_discord_webhook(
+                    webhook_url=args["webhook_url"],
+                    title="🛑 [조기 종료 발동]",
+                    description=f"Auto ML {gen+1}세대 - **{actual_epochs} Epoch**에서 학습이 조기 종료되었습니다.",
+                    color=0xe74c3c
+                )
 
-            # 기록 저장
             search_history.append({
                 "generation": gen + 1,
                 "fitness": fitness,
@@ -544,8 +567,18 @@ def _tune_worker(args, queue):
         best_score = best_trial.value
         
         if args.get("webhook_url") and args.get("noti_flags", {}).get("tune", False):
-            send_discord_webhook(args["webhook_url"], f"🤖 **[Auto ML]** 탐색 완료\n- 최고 잠재력 점수: {best_score:.1f}점 (세대: {best_trial.number + 1})")
-            
+            fields = [
+                {"name": "최고 잠재력 점수", "value": f"`{best_score:.1f}점`", "inline": True},
+                {"name": "최고 성능 세대", "value": f"{best_trial.number + 1}세대", "inline": True},
+                {"name": "총 탐색 세대 개수", "value": f"{len(search_history)}개", "inline": False}
+            ]
+            send_discord_webhook(
+                webhook_url=args["webhook_url"],
+                title="🤖 [Auto ML] 하이퍼파라미터 탐색 완료",
+                description="최적의 파라미터 조합 탐색이 완료되었습니다.",
+                color=0x2ecc71,
+                fields=fields
+            )   
         result["best_params"] = best_params
         result["success"] = True
         result["history"] = search_history
@@ -882,13 +915,23 @@ def _kfold_train_worker(args, queue):
             if actual_epochs < args["epochs"]:
                 worker_logger.info(f"Fold {fold_num} 조기 종료 감지. (Epoch: {actual_epochs})")
                 if args.get("webhook_url") and args.get("noti_flags", {}).get("early_stop", False):
-                    send_discord_webhook(args["webhook_url"], f"🛑 **[조기 종료 발동]** Fold {fold_num} - {actual_epochs} Epoch에서 학습이 조기 종료되었습니다.")
+                    send_discord_webhook(
+                        webhook_url=args["webhook_url"],
+                        title="🛑 [조기 종료 발동]",
+                        description=f"Fold {fold_num} - **{actual_epochs} Epoch**에서 학습이 조기 종료되었습니다.",
+                        color=0xe74c3c
+                    )
 
             fold_metrics.append(res_dict); fold_save_dirs[fold_num] = save_dir
             
             if args.get("webhook_url") and args.get("noti_flags", {}).get("fold", False):
                 mAP = res_dict.get('metrics/mAP50-95(B)', 0)
-                send_discord_webhook(args["webhook_url"], f"📍 **[K-Fold]** Fold {fold_num} 완료\n- mAP50-95: {mAP:.4f}")
+                send_discord_webhook(
+                    webhook_url=args["webhook_url"],
+                    title=f"📍 [K-Fold] Fold {fold_num} 완료",
+                    description=f"검증 mAP50-95: **{mAP:.4f}**",
+                    color=0x2ecc71
+                )
 
         if fold_metrics:
             best_n = max(range(len(fold_metrics)), key=lambda i: (fold_metrics[i].get(args["best_metric"], 0), fold_metrics[i].get(args["second_metric"], 0))) + 1
@@ -938,7 +981,12 @@ def _retrain_worker(args, queue):
         actual_epochs = len(pd.read_csv(Path(res.save_dir) / "results.csv")) if (Path(res.save_dir) / "results.csv").exists() else p["rt_epochs"]
         if actual_epochs < p["rt_epochs"] and p.get("webhook_url") and p.get("noti_flags", {}).get("early_stop", False):
             worker_logger.info(f"[Retrain Worker] 조기 종료됨 (Epoch: {actual_epochs})")
-            send_discord_webhook(p["webhook_url"], f"🛑 **[조기 종료 발동]** 재학습이 {actual_epochs} Epoch에서 조기 종료되었습니다.")
+            send_discord_webhook(
+                webhook_url=p["webhook_url"],
+                title="🛑 [조기 종료 발동]",
+                description=f"재학습이 **{actual_epochs} Epoch**에서 조기 종료되었습니다.",
+                color=0xe74c3c
+            )
 
         trained_model_path = Path(res.save_dir) / "weights" / "best.pt"; del model
         result["success"] = True; result["msg"] = f"✅ 재학습 완료!\n저장: {res.save_dir}"; result["save_dir"] = str(res.save_dir); result["model_path"] = str(trained_model_path)
@@ -1190,7 +1238,12 @@ class MeasureThread(QThread):
                         else:
                             if r_pts: cv2.line(plotted_img, r_pts[0], r_pts[1], c1, 2); cv2.putText(plotted_img, f"{r_dist:.1f}", (int((r_pts[0][0]+r_pts[1][0])/2), int((r_pts[0][1]+r_pts[1][1])/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c1, 2); measured_distances.append(round(r_dist, 1))
                             if b_pts: cv2.line(plotted_img, b_pts[0], b_pts[1], c2, 2); cv2.putText(plotted_img, f"{b_dist:.1f}", (int((b_pts[0][0]+b_pts[1][0])/2), int((b_pts[0][1]+b_pts[1][1])/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c2, 2); measured_distances.append(round(b_dist, 1))
-                cv2.imwrite(str(result_img_path), plotted_img)
+                
+                # OpenCV 한글 경로 저장 문제 해결을 위해 imencode 사용
+                is_success, im_buf_arr = cv2.imencode(".jpg", plotted_img)
+                if is_success:
+                    im_buf_arr.tofile(str(result_img_path))
+                    
                 image_pairs.append({"파일명": img_name, "탐지 수": f"{num_objects}개", "최저 신뢰도": round(worst_conf, 2), dist_col_name: ", ".join([str(d) for d in sorted(list(set(measured_distances)))]) if measured_distances else "측정된 선 없음", "_img_path": str(result_img_path)})
             
             df_export = pd.DataFrame([{k:v for k,v in item.items() if k!="_img_path"} for item in image_pairs])
@@ -1458,7 +1511,11 @@ class LabelingView(QGraphicsView):
         idx = self.selected_indices[0]
         if idx < 0 or idx >= len(self.boxes): return False, "유효하지 않은 선택입니다."
         if not self.image_item or not hasattr(self, 'current_image_path'): return False, "이미지가 없습니다."
-        img = cv2.imread(str(self.current_image_path))
+        
+        # OpenCV 한글 경로 읽기 문제 해결
+        img_array = np.fromfile(str(self.current_image_path), np.uint8)
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        
         if img is None: return False, "이미지를 읽을 수문을 읽을 수 없습니다."
         rect_item, _, class_id = self.boxes[idx]
         r = rect_item.rect(); x, y, w, h = int(r.x()), int(r.y()), int(r.width()), int(r.height())
@@ -1491,7 +1548,12 @@ class LabelingView(QGraphicsView):
 
     def save_all_templates(self):
         if not self.image_item or not hasattr(self, 'current_image_path'): return False
-        import cv2; img = cv2.imread(str(self.current_image_path))
+        
+        # OpenCV 한글 경로 읽기 문제 해결
+        import cv2; import numpy as np
+        img_array = np.fromfile(str(self.current_image_path), np.uint8)
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        
         if img is None: return False
         self.saved_templates = []
         for rect_item, _, class_id in self.boxes:
@@ -1503,7 +1565,12 @@ class LabelingView(QGraphicsView):
     def auto_label_from_saved_templates(self, threshold, nms_threshold):
         if not hasattr(self, 'saved_templates') or not self.saved_templates: return False, "저장된 기준 객체가 없습니다."
         if not self.image_item or not hasattr(self, 'current_image_path'): return False, "이미지가 로드되지 않았습니다."
-        import cv2, numpy as np; img = cv2.imread(str(self.current_image_path))
+        
+        # OpenCV 한글 경로 읽기 문제 해결
+        import cv2, numpy as np; 
+        img_array = np.fromfile(str(self.current_image_path), np.uint8)
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        
         if img is None: return False, "이미지를 읽을 수 없습니다."
         self.save_state(); total_added = 0
         for tmpl_data in self.saved_templates:
@@ -2136,7 +2203,7 @@ class TuneHistoryDialog(QDialog):
 # ==========================================
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle("YOLO Training Pipeline (PyQt5) - AutoML + Graceful Stop"); self.resize(1400, 900)
+        super().__init__(); self.setWindowTitle("YOLO Training Pipeline (PyQt5) - AutoML + Graceful Stop + Embed Webhooks"); self.resize(1400, 900)
         logger.info(f"YOLO Training Pipeline 애플리케이션 시작 (OS: {platform.system()}, GPU: {torch.cuda.is_available()})")
         self.base_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
         default_proj_path = self.base_dir / "MyProject"; self.config_manager = ConfigManager(str(default_proj_path)); self.config_builder = ConfigBuilder()
@@ -2193,7 +2260,13 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         logger.info("애플리케이션 종료 프로세스 시작")
         if self.training_process and self.training_process.is_alive(): 
-            self.stop_training(); self.training_process.join(timeout=3)
+            self.stop_training()
+            self.training_process.join(timeout=3)
+            # [수정] 3초 대기 후에도 살아있으면 좀비 프로세스 방지를 위해 Terminate
+            if self.training_process.is_alive():
+                logger.warning("워커 프로세스가 종료되지 않아 강제 종료(Terminate)합니다.")
+                self.training_process.terminate()
+
         for t_name in ["t1_thread", "t3_thread", "t4_thread", "t5_thread"]:
             if hasattr(self, t_name):
                 th = getattr(self, t_name)
@@ -2494,7 +2567,13 @@ class MainWindow(QMainWindow):
         self.monitor_thread.start()
         
         webhook_url = self.webhook_url
-        if webhook_url and self.noti_flags.get("start"): send_discord_webhook(webhook_url, "▶️ **[작업 시작]** 새로운 백그라운드 작업이 시작되었습니다.")
+        if webhook_url and self.noti_flags.get("start"): 
+            send_discord_webhook(
+                webhook_url=webhook_url, 
+                title="▶️ [작업 시작]", 
+                description="새로운 백그라운드 작업이 시작되었습니다.",
+                color=0x9b59b6
+            )
         
         self.btn_webhook_settings.setEnabled(False)
         self.t2_btn_run.setEnabled(False); self.t2_btn_tune.setEnabled(False); self.t4_btn_retrain.setEnabled(False); self.t4_btn_auto_thr.setEnabled(False); self.t3_btn_auto_thr.setEnabled(False); self.t2_scroll.setEnabled(False); self.t4_scroll.setEnabled(False); self.g_model.setEnabled(False); self.g_imgsz.setEnabled(False)
@@ -2519,13 +2598,31 @@ class MainWindow(QMainWindow):
         
         self.stop_dynamic_status("✅ 프로세스 완료")
         
-        if self.webhook_url and self.noti_flags.get("task"):
-            if res.get("success"):
-                send_discord_webhook(self.webhook_url, f"✅ **[작업 완료]** {res.get('task').upper()} 작업이 성공적으로 완료되었습니다.")
-            else:
-                send_discord_webhook(self.webhook_url, f"⚠️ **[작업 실패/취소]** {res.get('task').upper()} 작업이 종료되었습니다.\n상세: {res.get('error', '알 수 없음')}")
+        task_name = str(res.get('task', 'UNKNOWN')).upper()
+        
+        # 사용자가 안전 종료 버튼을 눌렀는지 확인
+        is_stopped_early = hasattr(self, 'stop_event') and self.stop_event.is_set()
 
         if res.get("success"):
+            if is_stopped_early:
+                # 안전 종료 시의 웹훅 전송 (주황색)
+                if self.webhook_url and self.noti_flags.get("task"):
+                    send_discord_webhook(
+                        webhook_url=self.webhook_url,
+                        title=f"🛑 [작업 중단] {task_name}",
+                        description="사용자 요청에 의해 작업이 안전하게 종료(Graceful Stop)되었습니다.\n*(중단 전까지 학습된 가중치와 결과 데이터는 정상 보존됩니다.)*",
+                        color=0xf39c12
+                    )
+            else:
+                # 일반적인 완료 시의 웹훅 전송 (초록색)
+                if self.webhook_url and self.noti_flags.get("task"):
+                    send_discord_webhook(
+                        webhook_url=self.webhook_url,
+                        title=f"✅ [작업 완료] {task_name}",
+                        description="작업이 성공적으로 완료되었습니다.",
+                        color=0x2ecc71
+                    )
+
             task = res.get("task"); current_config = self.config_builder.build(self)
             if task == "tune":
                 bp = res.get("best_params", {})
@@ -2571,7 +2668,20 @@ class MainWindow(QMainWindow):
                 if res.get("model_path"): 
                     self.t4_eval_model_display.setText(res["model_path"]); self.t4_btn_eval.setEnabled(True); self.statusBar().showMessage(f"✅ 재학습 모델 준비 완료: {Path(res['model_path']).name}")
         else: 
-            QMessageBox.critical(self, "결과 알림", res.get("error", "알 수 없는 오류"))
+            # 에러 또는 취소 처리 로직 분기
+            error_msg = res.get("error", "알 수 없는 오류")
+            
+            # 1. 사용자가 의도적으로 중단/취소한 경우 (에러가 아님)
+            if "사용자에 의해" in error_msg or "취소" in error_msg:
+                if self.webhook_url and self.noti_flags.get("task"):
+                    send_discord_webhook(self.webhook_url, f"🛑 [작업 취소] {task_name}", "사용자의 요청으로 작업이 안전하게 취소/중단되었습니다.", color=0xf39c12)
+                QMessageBox.information(self, "작업 취소 안내", error_msg)
+                
+            # 2. 진짜 에러가 발생한 경우
+            else:
+                if self.webhook_url and self.noti_flags.get("task"):
+                    send_discord_webhook(self.webhook_url, f"⚠️ [작업 실패] {task_name}", f"작업이 비정상 종료되었습니다.\n상세: {error_msg}", color=0xe74c3c)
+                QMessageBox.critical(self, "결과 알림", error_msg)
         
         self.training_process = None
 
@@ -2579,7 +2689,13 @@ class MainWindow(QMainWindow):
         logger.error(f"프로세스 비정상 종료 콜백 수신. 원인: {error_msg}")
         if self.training_process is None: return
         webhook_url = self.webhook_url
-        if webhook_url and self.noti_flags.get("error"): send_discord_webhook(webhook_url, f"❌ **[프로세스 비정상 종료]**\n상세: {error_msg}")
+        if webhook_url and self.noti_flags.get("error"): 
+            send_discord_webhook(
+                webhook_url=webhook_url,
+                title="❌ [프로세스 비정상 종료]",
+                description=f"상세 원인:\n```{error_msg}```",
+                color=0xe74c3c
+            )
         self._restore_training_ui(); QMessageBox.critical(self, "비정상 종료", error_msg)
         
         self.stop_dynamic_status("🛑 프로세스가 비정상 종료되었습니다.")
@@ -2588,7 +2704,12 @@ class MainWindow(QMainWindow):
     def on_thread_error(self, task_name, error_msg):
         logger.error(f"[{task_name}] QThread 스레드 내부 예외 발생. 원인: {error_msg}")
         if self.webhook_url and self.noti_flags.get("error"):
-            send_discord_webhook(self.webhook_url, f"❌ **[프로세스 에러]** {task_name} 중 오류 발생\n상세: {error_msg}")
+            send_discord_webhook(
+                webhook_url=self.webhook_url,
+                title="❌ [프로세스 에러 발생]",
+                description=f"[{task_name}] 작업 중 오류 발생.\n상세 원인:\n```{error_msg}```",
+                color=0xe74c3c
+            )
         QMessageBox.critical(self, f"{task_name} 오류", error_msg)
         self.statusBar().showMessage(f"🛑 {task_name} 작업이 비정상 종료되었습니다.")
 
@@ -2810,6 +2931,43 @@ class MainWindow(QMainWindow):
             logger.error(f"프로젝트 불러오기 중 에러: {e}", exc_info=True)
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "❌ 오류", f"오류 발생:\n{e}"); self.statusBar().clearMessage()
+            
+    def import_project_dialog(self):
+        logger.info("프로젝트 복구(불러오기) 실행")
+        load_path, _ = QFileDialog.getOpenFileName(self, "프로젝트 불러오기 (Zip)", "", "Zip Files (*.zip)")
+        if not load_path: return
+        import_name = Path(load_path).stem; current_root_parent = Path(self.w_proj_root.get_path()).parent; new_proj_path = current_root_parent / import_name; is_renamed = False; original_name = new_proj_path.name; counter = 1
+        while new_proj_path.exists(): is_renamed = True; new_proj_path = current_root_parent / f"{import_name}_{counter}"; counter += 1
+        new_proj_path.mkdir(parents=True, exist_ok=True); target_dir = new_proj_path / "workspace" / f"Imported_{import_name}"; target_dir.mkdir(parents=True, exist_ok=True)
+        self.statusBar().showMessage(f"📥 '{new_proj_path.name}' 프로젝트를 구성하는 중..."); QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with zipfile.ZipFile(load_path, 'r') as zf:
+                resolved_target = Path(target_dir).resolve()
+                for member in zf.infolist():
+                    member_path = Path(target_dir / member.filename).resolve()
+                    if not member_path.is_relative_to(resolved_target):
+                        raise PermissionError(f"보안 경고: 압축 파일이 지정된 경로를 벗어나려고 합니다! ({member.filename})")
+                zf.extractall(target_dir)
+
+            config_file = target_dir / "config.json"; config_data = {}
+            if config_file.exists():
+                with open(config_file, 'r', encoding='utf-8') as f: config_data = json.load(f).get("config", {})
+            self.w_proj_root.line_edit.setText(str(new_proj_path)); self.apply_loaded_config(config_data)
+            legacy_model, base_model, retrained_model = target_dir / "model.pt", target_dir / "base_model.pt", target_dir / "retrained_model.pt"
+            if base_model.exists() or legacy_model.exists():
+                model_path_str = str((base_model if base_model.exists() else legacy_model).resolve()); self.t3_model.line_edit.setText(model_path_str); self.t4_base.line_edit.setText(model_path_str); self.t5_model.line_edit.setText(model_path_str)
+            if retrained_model.exists(): retrained_path_str = str(retrained_model.resolve()); self.t4_eval_model_display.setText(retrained_path_str); self.t4_btn_eval.setEnabled(True); self.t4_btn_auto_thr.setEnabled(True); self.t5_model.line_edit.setText(retrained_path_str)
+            self.config_manager.update_workspace_path(str(new_proj_path / "workspace"))
+            QApplication.restoreOverrideCursor()
+            logger.info(f"프로젝트 불러오기 완료: {new_proj_path}")
+            if is_renamed: 
+                QMessageBox.warning(self, "⚠️ 이름 변경", f"기존에 '{original_name}' 폴더가 존재하여 이름이 변경되었습니다!\n새 폴더명: {new_proj_path.name}"); self.statusBar().showMessage(f"⚠️ 폴더 이름 변경됨: {new_proj_path.name} 로 복구 완료", 7000)
+            else: 
+                QMessageBox.information(self, "✅ 불러오기 완료", f"루트: {new_proj_path.name}\n모든 경로가 연동되었습니다."); self.statusBar().showMessage(f"✅ 프로젝트 불러오기 완료: {new_proj_path.name}", 5000)
+        except Exception as e: 
+            logger.error(f"프로젝트 불러오기 중 에러: {e}", exc_info=True)
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "❌ 오류", f"오류 발생:\n{e}"); self.statusBar().clearMessage()
 
     def setup_tab1(self):
         f = ConfigDefaults.TAB1
@@ -2847,18 +3005,31 @@ class MainWindow(QMainWindow):
         if not success: QMessageBox.warning(self, "클래스 매핑 오류", cmap_or_error); return
         config = {"base_dir": self.w_base_ds.get_path(), "processed_dir": self.w_proc_ds.get_path(), "use_auto_crop": self.t1_auto_crop.isChecked(), "margin": self.t1_margin.value(), "manual_crop": (self.t1_mx.value(), self.t1_my.value(), self.t1_mw.value(), self.t1_mh.value()), "class_map": cmap_or_error, "clean_old": self.t1_clean.isChecked(), "use_exif": self.t1_exif.isChecked(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags()}
         
-        if self.webhook_url and self.noti_flags.get("start"): send_discord_webhook(self.webhook_url, "▶️ **[작업 시작]** 데이터 전처리 작업이 시작되었습니다.")
+        if self.webhook_url and self.noti_flags.get("start"):
+            send_discord_webhook(
+                webhook_url=self.webhook_url,
+                title="▶️ [작업 시작]",
+                description="데이터 전처리 작업이 시작되었습니다.",
+                color=0x9b59b6
+            )
         
         self.t1_btn_run.setEnabled(False); self.t1_log.clear(); self.statusBar().showMessage("✂️ 데이터 전처리 진행 중... 잠시만 기다려주세요."); QApplication.setOverrideCursor(Qt.WaitCursor)
         self.t1_thread = PreprocessThread(config); self.t1_thread.progress.connect(self.t1_progress.setValue); self.t1_thread.log_msg.connect(self.t1_log.append); self.t1_thread.error.connect(lambda e: self.on_thread_error("데이터 전처리", e)); self.t1_thread.finished_ok.connect(self.on_tab1_finished)
         self.t1_thread.finished.connect(lambda: [self.t1_btn_run.setEnabled(True), QApplication.restoreOverrideCursor(), self.statusBar().showMessage("✅ 전처리 완료", 5000)]); self.t1_thread.start()
 
     def on_tab1_finished(self, ok_count):
-        if self.webhook_url and self.noti_flags.get("task"): send_discord_webhook(self.webhook_url, f"✅ **[작업 완료]** 데이터 전처리 완료 (총 {ok_count}장 처리됨)")
+        if self.webhook_url and self.noti_flags.get("task"):
+            send_discord_webhook(
+                webhook_url=self.webhook_url,
+                title="✅ [작업 완료] 데이터 전처리",
+                description=f"총 **{ok_count}장**이 성공적으로 처리되었습니다.",
+                color=0x2ecc71
+            )
         QMessageBox.information(self, "완료", f"{ok_count}장 전처리 완료!")
         proc_preview_dir = Path(self.w_proc_ds.get_path()) / "preview"
         target_dir = proc_preview_dir if proc_preview_dir.exists() else Path(self.w_proc_ds.get_path()) / "images"
         if target_dir.exists(): self.t1_img_grid.update_images([str(f) for f in target_dir.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}])
+
     def setup_tab2(self):
         d = ConfigDefaults.TAB2
         self.t2_epochs = QSpinBox(); self.t2_epochs.setRange(1, 5000); self.t2_epochs.setValue(d['epochs'])
@@ -3023,7 +3194,13 @@ class MainWindow(QMainWindow):
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
         config = {"eval_model_path": self.t3_model.get_path(), "eval_source": self.t3_img.get_path(), "gt_labels_path": self.t3_lbl.get_path(), "workspace_dir": self.w_work_ds.get_path(), "eval_run_name": self.t3_run_name.text(), "eval_conf": self.t3_conf.value(), "eval_iou": self.t3_iou.value(), "match_iou": self.t3_match_iou.value(), "max_det": self.t3_max_det.value(), "agnostic_nms": self.t3_agnostic.isChecked(), "save_relabel": self.t3_save_rel.isChecked(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags()}
         
-        if self.webhook_url and self.noti_flags.get("start"): send_discord_webhook(self.webhook_url, "▶️ **[작업 시작]** 모델 평가 및 오답 선별 작업 시작")
+        if self.webhook_url and self.noti_flags.get("start"): 
+            send_discord_webhook(
+                webhook_url=self.webhook_url,
+                title="▶️ [작업 시작]",
+                description="모델 평가 및 오답 선별 작업이 시작되었습니다.",
+                color=0x9b59b6
+            )
         
         self.t3_btn_run.setEnabled(False); self.statusBar().showMessage("🔍 평가 진행 중..."); QApplication.setOverrideCursor(Qt.WaitCursor)
         self.t3_thread = EvalThread(config); self.t3_thread.finished_ok.connect(self.on_tab3_finished); self.t3_thread.error.connect(lambda e: self.on_thread_error("모델 평가", e)); self.t3_thread.finished.connect(lambda: [self.t3_btn_run.setEnabled(True), QApplication.restoreOverrideCursor(), self.statusBar().clearMessage()]); self.t3_thread.start()
@@ -3042,7 +3219,13 @@ class MainWindow(QMainWindow):
         model_name_with_path = f"{display_name}  |  {eval_path}"
         self.log_db.insert_eval_log(task_type="Tab 3 Eval", model_name=model_name_with_path, total=stats['total'], wrong=stats['wrong'], accuracy=stats['acc'], wrong_imgs_list=wrong_imgs, config_data=self.config_builder.build(self))
         
-        if self.webhook_url and self.noti_flags.get("task"): send_discord_webhook(self.webhook_url, f"✅ **[작업 완료]** 모델 평가 완료\n- 전체 {stats['total']}장 중 {stats['wrong']}장 오답 (정확도 {stats['acc']:.1f}%)")
+        if self.webhook_url and self.noti_flags.get("task"):
+            send_discord_webhook(
+                webhook_url=self.webhook_url,
+                title="✅ [작업 완료] 모델 평가",
+                description=f"전체 {stats['total']}장 중 {stats['wrong']}장 오답 (정확도 {stats['acc']:.1f}%)",
+                color=0x2ecc71
+            )
         
         QMessageBox.information(self, "평가 완료", f"총 {stats['total']}장 중 {stats['correct']}장 완벽 일치, {stats['wrong']}장 이상 발생\n\n[객체 단위 검출 성능]\n- 정밀도(Precision): {stats.get('precision', 0):.1f}%\n- 재현율(Recall): {stats.get('recall', 0):.1f}%\n- F1-Score: {stats.get('f1_score', stats['acc']):.1f}%")
         if stats["wrong"] > 0 and stats["relabel_dir"]: self.t4_hard.line_edit.setText(stats["relabel_dir"]); self.t4_orig.line_edit.setText(self.t3_lbl.get_path()); self.t4_base.line_edit.setText(self.t3_model.get_path())
@@ -3104,7 +3287,7 @@ class MainWindow(QMainWindow):
         eval_layout.addLayout(h_eval_btns)
         
         self.btn_send_t4_to_t5 = QPushButton("➡️ 이 모델과 설정으로 거리 측정"); self.btn_send_t4_to_t5.setStyleSheet("background-color: #dbeafe; font-weight: bold; color: #1e3a8a;"); self.btn_send_t4_to_t5.clicked.connect(lambda: self.send_to_measure_tab(self.t4_eval_model_display.text(), self.t3_img.get_path(), self.t4_conf.value(), self.t4_iou.value(), self.t4_max_det.value(), self.t4_agnostic.isChecked())); eval_layout.addWidget(self.btn_send_t4_to_t5); st2_layout.addWidget(eval_group)
-        self.t4_table = QTableWidget(0, 5); self.t4_table.setHorizontalHeaderLabels(["파일명", "상태", "예측 수", "정답 수", "사유"]); self._apply_table_style(self.t4_table); header = self.t4_table.horizontalHeader()
+        self.t4_table = QTableWidget(0, 5); self.t4_table.setHorizontalHeaderLabels(["파일명", "상태", "예 예측 수", "정답 수", "사유"]); self._apply_table_style(self.t4_table); header = self.t4_table.horizontalHeader()
         for i in range(self.t4_table.columnCount()): header.setSectionResizeMode(i, QHeaderView.Stretch)
         self.t4_table.setSortingEnabled(True); self.t4_table.itemDoubleClicked.connect(self.on_t4_table_double_clicked); st2_layout.addWidget(QLabel("<b>전체 데이터 최종 평가 결과</b>")); st2_layout.addWidget(self.t4_table)
         sub_tabs.addTab(sub_tab1, "⚙️ 1. 재학습 설정 및 실행"); sub_tabs.addTab(sub_tab2, "📊 2. 재학습 모델 최종 평가"); main_split.addWidget(left_widget)
@@ -3167,7 +3350,13 @@ class MainWindow(QMainWindow):
             
         config = {"retrained_model": str(model_to_eval), "yaml_path": str(yaml_path), "eval_source": str(eval_img), "gt_labels_path": str(eval_lbl), "workspace_dir": self.w_work_ds.get_path(), "eval_run_name": self.t4_run.text(), "eval_conf": self.t4_conf.value(), "eval_iou": self.t4_iou.value(), "match_iou": self.t4_match_iou.value(), "max_det": self.t4_max_det.value(), "agnostic_nms": self.t4_agnostic.isChecked(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags()}
         
-        if self.webhook_url and self.noti_flags.get("start"): send_discord_webhook(self.webhook_url, "▶️ **[작업 시작]** 재학습 모델 최종 평가 시작")
+        if self.webhook_url and self.noti_flags.get("start"): 
+            send_discord_webhook(
+                webhook_url=self.webhook_url,
+                title="▶️ [작업 시작]",
+                description="재학습 모델 최종 평가 시작",
+                color=0x9b59b6
+            )
         
         self.t4_btn_eval.setEnabled(False); self.statusBar().showMessage(f"📊 재학습 평가 진행 중...")
         self.t4_thread = Tab4FinalEvalThread(config)
@@ -3183,7 +3372,7 @@ class MainWindow(QMainWindow):
     def on_tab4_eval_finished(self, df, wrong_imgs, all_imgs, stats, pr_curve):
         self.t4_last_wrong_imgs = wrong_imgs; self.t4_last_all_imgs = all_imgs; self.t4_table.setSortingEnabled(False); self.t4_table.setRowCount(len(df))     
         for i, row in df.iterrows():
-            self.t4_table.setItem(i, 0, QTableWidgetItem(str(row["파일명"]))); self.t4_table.setItem(i, 1, QTableWidgetItem(str(row["상태"]))); self.t4_table.setItem(i, 2, QTableWidgetItem(str(row["예측 수"]))); self.t4_table.setItem(i, 3, QTableWidgetItem(str(row["정답 수"]))); self.t4_table.setItem(i, 4, QTableWidgetItem(str(row["사유"])))
+            self.t4_table.setItem(i, 0, QTableWidgetItem(str(row["파일명"]))); self.t4_table.setItem(i, 1, QTableWidgetItem(str(row["상태"]))); self.t4_table.setItem(i, 2, QTableWidgetItem(str(row["예 예측 수"]))); self.t4_table.setItem(i, 3, QTableWidgetItem(str(row["정답 수"]))); self.t4_table.setItem(i, 4, QTableWidgetItem(str(row["사유"])))
             for col in range(5): self.t4_table.item(i, col).setTextAlignment(Qt.AlignCenter)
         self.t4_table.setSortingEnabled(True); self.t4_chk_show_all.setEnabled(True); self.t4_chk_show_all.blockSignals(True); self.t4_chk_show_all.setChecked(False); self.t4_chk_show_all.blockSignals(False); self.update_tab4_visualization()
         
@@ -3197,7 +3386,13 @@ class MainWindow(QMainWindow):
         model_name_with_path = f"{display_name}  |  {eval_path}"
         self.log_db.insert_eval_log(task_type="Tab 4 Final Eval", model_name=model_name_with_path, total=stats['total'], wrong=stats['wrong'], accuracy=stats['acc'], wrong_imgs_list=wrong_imgs, config_data=self.config_builder.build(self))
         
-        if self.webhook_url and self.noti_flags.get("task"): send_discord_webhook(self.webhook_url, f"✅ **[작업 완료]** 재학습 모델 최종 평가 완료\n- 전체 {stats['total']}장 중 {stats['wrong']}장 오답 (정확도 {stats['acc']:.1f}%)")
+        if self.webhook_url and self.noti_flags.get("task"):
+            send_discord_webhook(
+                webhook_url=self.webhook_url,
+                title="✅ [작업 완료] 재학습 모델 최종 평가 완료",
+                description=f"전체 {stats['total']}장 중 {stats['wrong']}장 오답 (정확도 {stats['acc']:.1f}%)",
+                color=0x2ecc71
+            )
         
         QMessageBox.information(self, "완료", f"총 {stats['total']}장 중 {stats['correct']}장 완벽 일치, {stats['wrong']}장 이상 발생\n\n[객체 단위 검출 성능]\n- 정밀도(Precision): {stats.get('precision', 0):.1f}%\n- 재현율(Recall): {stats.get('recall', 0):.1f}%\n- F1-Score: {stats.get('f1_score', stats['acc']):.1f}%")
 
@@ -3257,7 +3452,13 @@ class MainWindow(QMainWindow):
         if not is_valid: QMessageBox.warning(self, "오류", err); return
         config = {"dist_model_path": self.t5_model.get_path(), "dist_source": self.t5_img.get_path(), "workspace_dir": self.w_work_ds.get_path(), "measure_method": self.t5_method.currentText(), "dist_conf": self.t5_conf.value(), "dist_iou": self.t5_iou.value(), "dist_max_det": self.t5_max_det.value(), "dist_agnostic": self.t5_agnostic.isChecked(), "n_neighbors": self.t5_knn_n.value(), "edge_thresholds": self.t5_edge_thr.text(), "skip_ng": self.t5_skip_ng.isChecked(), "drop_odd_lowest": self.t5_drop_odd.isChecked(), "color1": self.t5_color1.currentText(), "color2": self.t5_color2.currentText(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags()}
         
-        if self.webhook_url and self.noti_flags.get("start"): send_discord_webhook(self.webhook_url, "▶️ **[작업 시작]** 객체 간 거리 측정 및 통계 분석 시작")
+        if self.webhook_url and self.noti_flags.get("start"): 
+            send_discord_webhook(
+                webhook_url=self.webhook_url,
+                title="▶️ [작업 시작]",
+                description="객체 간 거리 측정 및 통계 분석 시작",
+                color=0x9b59b6
+            )
         
         self.t5_btn_run.setEnabled(False); self.statusBar().showMessage("📏 측정 진행 중..."); QApplication.setOverrideCursor(Qt.WaitCursor); self.t5_progress.setValue(0)
         self.t5_thread = MeasureThread(config); self.t5_thread.progress.connect(self.t5_progress.setValue); self.t5_thread.finished_ok.connect(self.on_tab5_finished); self.t5_thread.error.connect(lambda e: self.on_thread_error("거리 측정", e))
@@ -3267,7 +3468,13 @@ class MainWindow(QMainWindow):
         msg = f"완료! (총 {len(df_export)}건)\n\n📂 저장 목록:\n - results.csv\n - statistics.csv\n"
         if not df_outliers.empty: msg += f" - outliers.csv (🚨 {len(df_outliers)}건)\n"
         
-        if self.webhook_url and self.noti_flags.get("task"): send_discord_webhook(self.webhook_url, f"✅ **[작업 완료]** 거리 측정 및 분석 완료 (총 {len(df_export)}건)")
+        if self.webhook_url and self.noti_flags.get("task"):
+            send_discord_webhook(
+                webhook_url=self.webhook_url,
+                title="✅ [작업 완료] 거리 측정",
+                description=f"거리 측정 및 분석 완료 (총 {len(df_export)}건)",
+                color=0x2ecc71
+            )
         
         QMessageBox.information(self, "완료", msg); self.t5_last_df_outliers = df_outliers; self.t5_last_image_pairs = image_pairs
         self.t5_chk_show_outliers.setEnabled(True); self.t5_chk_show_outliers.blockSignals(True); self.t5_chk_show_outliers.setChecked(False); self.t5_chk_show_outliers.blockSignals(False)
@@ -3287,7 +3494,6 @@ class MainWindow(QMainWindow):
                 outlier_files = set(self.t5_last_df_outliers["파일명"].tolist())
                 self.t5_img_grid.update_images([item["_img_path"] for item in self.t5_last_image_pairs if item["파일명"] in outlier_files])
         else: self.t5_img_grid.update_images([item["_img_path"] for item in self.t5_last_image_pairs])
-
 if __name__ == '__main__':
     multiprocessing.freeze_support()
     try:
@@ -3297,6 +3503,35 @@ if __name__ == '__main__':
     
     app = QApplication(sys.argv)
     font_name = "Malgun Gothic" if platform.system() == "Windows" else "AppleGothic"
-    app.setFont(QFont(font_name, 10)); plt.rcParams["font.family"] = font_name; plt.rcParams["axes.unicode_minus"] = False
-    window = MainWindow(); window.showMaximized()
+    app.setFont(QFont(font_name, 10))
+    plt.rcParams["font.family"] = font_name
+    plt.rcParams["axes.unicode_minus"] = False
+    
+    window = MainWindow()
+    
+    # 🚨 글로벌 에러 핸들러 (프로그램이 튕기기 직전에 낚아채서 웹훅 발송)
+    def global_exception_handler(exc_type, exc_value, exc_traceback):
+        logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+        
+        # 설정에 웹훅이 켜져있다면 유언(웹훅) 전송
+        if hasattr(window, 'webhook_url') and window.webhook_url:
+            error_details = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+            # 메시지가 너무 길면 디스코드 제한(2000자)에 걸리므로 자르기
+            if len(error_details) > 1000:
+                error_details = error_details[-1000:] 
+                
+            send_discord_webhook(
+                webhook_url=window.webhook_url,
+                title="💀 [프로세스 치명적 충돌]",
+                description=f"UI 메인 프로그램에서 처리되지 않은 에러가 발생하여 종료됩니다.\n```{error_details}```",
+                color=0x992d22, # 다크 레드
+                sync=True       # 확실하게 전송될 때까지 대기
+            )
+            
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+    # 파이썬 기본 에러 핸들러를 우리가 만든 핸들러로 덮어치기
+    sys.excepthook = global_exception_handler
+    
+    window.showMaximized()
     sys.exit(app.exec_())
