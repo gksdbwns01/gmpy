@@ -24,6 +24,42 @@ import seaborn as sns
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
 
 # ==========================================
+# [개선] 통합 기본값 관리 (Config Defaults)
+# ==========================================
+class ConfigDefaults:
+    """모든 탭의 파라미터 기본값을 중앙 집중식으로 관리합니다."""
+    GLOBAL = {"model": "yolov8n.pt", "imgsz": "640"}
+    
+    TAB1 = {"auto_crop": True, "margin": 50, "mw": 1280, "mh": 960, "clean": True, "exif": True}
+    
+    TAB2 = {
+        "epochs": 400, "batch": 16, "workers": 8, "patience": 100, "seed": 42, "folds": 5, "test_split": 0.2,
+        "lcls": 0.5, "lbox": 7.5, "ldfl": 1.5, "tune_iterations": 30,
+        "ah": 0.015, "as": 0.7, "av": 0.4, "adeg": 0.0, "atrans": 0.1, "ascale": 0.5,
+        "ashear": 0.0, "afud": 0.0, "aflr": 0.5, "amos": 1.0, "amix": 0.0, "acp": 0.0
+    }
+    
+    TAB3 = {
+        "conf": 0.25, "iou": 0.45, "match_iou": 0.50, "max_det": 99, 
+        "run_name": "check01", "agnostic": True, "save_rel": True
+    }
+    
+    TAB4 = {
+        "epochs": 10, "batch": 16, "run": "retrain_hard_01", "lcls": 0.5, "lbox": 7.5,
+        "ah": 0.015, "as": 0.7, "av": 0.4, "afud": 0.0, "aflr": 0.5, "amos": 1.0, "amix": 0.0, "acp": 0.0,
+        "eval_conf": 0.25, "eval_iou": 0.45, "eval_match": 0.50, "eval_max": 99, "eval_agnostic": True
+    }
+    
+    TAB5 = {
+        "method": "테두리 최단거리 (Edge)", "conf": 0.25, "iou": 0.45, "max_det": 300, 
+        "agnostic": True, "knn_n": 2, "edge_thr": "60", "skip_ng": True, "drop_odd": False,
+        "color1": "노란색 (Yellow)", "color2": "청록색 (Cyan)"
+    }
+    
+    TAB6 = {"auto_thr": 0.75, "auto_nms": 0.3, "color": "흰색 (White)"}
+
+
+# ==========================================
 # 로깅(Logging) 설정
 # ==========================================
 def setup_logger():
@@ -60,9 +96,6 @@ def clear_vram():
         logger.error(f"VRAM 정리 중 오류 발생: {e}", exc_info=True)
 
 
-# ==========================================
-# [개선] Graceful Stop Handler 도입
-# ==========================================
 class GracefulStopHandler:
     """우아한 종료 처리를 위한 일관된 래퍼(Wrapper) 클래스"""
     def __init__(self, stop_event, logger, queue=None, default_result=None):
@@ -72,7 +105,6 @@ class GracefulStopHandler:
         self.default_result = default_result or {"success": False, "error": "사용자에 의해 취소되었습니다."}
 
     def should_stop(self, context="", put_queue=True):
-        """현재 작업 중단 여부 확인"""
         if self.stop_event and self.stop_event.is_set():
             self.logger.info(f"🛑 사용자 중단 신호 감지 [{context}]")
             if put_queue and self.queue:
@@ -82,7 +114,6 @@ class GracefulStopHandler:
         return False
 
     def check_every_n_iterations(self, iteration, interval=10, context="", put_queue=True):
-        """N번 반복마다 한 번씩 확인 (빠른 루프에서의 성능 최적화)"""
         if iteration % interval == 0:
             return self.should_stop(context, put_queue)
         return False
@@ -110,7 +141,6 @@ class ConfigManager:
             if not config_name: 
                 config_name = f"config_{timestamp}"
             else:
-                # 🔒 Path Traversal 방지: 입력된 문자열에서 디렉토리 경로를 강제 거세하고 순수 파일명만 추출
                 config_name = Path(config_name).name
                 
             file_path = self.config_dir / f"{config_name}.json"
@@ -2078,6 +2108,7 @@ class TuneHistoryDialog(QDialog):
         except Exception as e:
             layout.addWidget(QLabel(f"기록을 불러오는 중 오류 발생:\n{traceback.format_exc()}"))
 
+
 # ==========================================
 # Main App
 # ==========================================
@@ -2089,13 +2120,11 @@ class MainWindow(QMainWindow):
         default_proj_path = self.base_dir / "MyProject"; self.config_manager = ConfigManager(str(default_proj_path)); self.config_builder = ConfigBuilder()
         self.log_db = LogDatabase(self.base_dir / "MyProject" / "workspace" / "training_history.db"); self.training_process = None; self.init_ui()
 
-        # 👉 상태바 애니메이션을 위한 타이머 설정
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.update_status_animation)
         self.status_animation_frame = 0
         self.base_status_msg = ""
 
-    # 👉 상태바 애니메이션 갱신 메서드
     def update_status_animation(self):
         frames = ["⏳", "⌛"]
         frame = frames[self.status_animation_frame % len(frames)]
@@ -2114,12 +2143,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg)
 
     def validate_paths(self, **paths):
-        """보안 및 시스템 안정성이 강화된 경로 검증 함수"""
         for name, path_obj in paths.items():
             if not path_obj or str(path_obj).strip() in ("", "."):
                 return False, f"[{name}] 경로가 입력되지 않았습니다."
                 
-            path = Path(path_obj).resolve()  # 심볼릭 링크 해제 및 절대경로 표준화
+            path = Path(path_obj).resolve() 
             if not path.exists():
                 return False, f"[{name}] 경로를 찾을 수 없습니다:\n{path}"
             if not os.access(path, os.R_OK):
@@ -2275,8 +2303,9 @@ class MainWindow(QMainWindow):
         gpu_info = f"🟢 {torch.cuda.get_device_name(0)} (VRAM: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.1f} GB)" if torch.cuda.is_available() else "GPU 없음 (CPU 연산)"
         sys_label = QLabel(f"🖥️ <b>OS:</b> {platform.system()} {platform.release()} &nbsp;&nbsp;|&nbsp;&nbsp; 💾 <b>RAM:</b> {psutil.virtual_memory().total / (1024**3):.1f} GB &nbsp;&nbsp;|&nbsp;&nbsp; 🚀 <b>GPU:</b> {gpu_info}"); sys_label.setStyleSheet("color: #4b5563; font-size: 12px;"); right_layout.addWidget(sys_label)
         opt_layout = QHBoxLayout()
-        self.g_model = QComboBox(); self.g_model.addItems(["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt", "yolo11n.pt", "yolo11s.pt"]); lbl_mod = QLabel("Model:"); self.bind_default(self.g_model, "yolov8n.pt", lbl_mod)
-        self.g_imgsz = QComboBox(); self.g_imgsz.addItems(["320", "416", "512", "640", "768", "1024"]); self.g_imgsz.setCurrentText("640"); lbl_sz = QLabel("imgsz:"); self.bind_default(self.g_imgsz, "640", lbl_sz)
+        d_glob = ConfigDefaults.GLOBAL
+        self.g_model = QComboBox(); self.g_model.addItems(["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt", "yolo11n.pt", "yolo11s.pt"]); lbl_mod = QLabel("Model:"); self.bind_default(self.g_model, d_glob["model"], lbl_mod)
+        self.g_imgsz = QComboBox(); self.g_imgsz.addItems(["320", "416", "512", "640", "768", "1024"]); self.g_imgsz.setCurrentText(d_glob["imgsz"]); lbl_sz = QLabel("imgsz:"); self.bind_default(self.g_imgsz, d_glob["imgsz"], lbl_sz)
         opt_layout.addWidget(lbl_mod); opt_layout.addWidget(self.g_model); opt_layout.addSpacing(20); opt_layout.addWidget(lbl_sz); opt_layout.addWidget(self.g_imgsz); opt_layout.addStretch(); right_layout.addLayout(opt_layout)
         btn_layout1 = QHBoxLayout()
         self.btn_save_config = QPushButton("💾 설정만 저장"); self.btn_save_config.setStyleSheet("background-color: #f3f4f6; border: 1px solid #d1d5db; padding: 5px; border-radius: 4px;"); self.btn_save_config.clicked.connect(self.save_config_dialog)
@@ -2430,7 +2459,6 @@ class MainWindow(QMainWindow):
     def start_training_process(self, worker_func, args):
         logger.info(f"멀티프로세싱 워커 시작. 대상 함수: {worker_func.__name__}")
         
-        # 👉 [개선] Graceful Stop Event 생성 및 args에 추가
         self.stop_event = multiprocessing.Event()
         args["stop_event"] = self.stop_event
         
@@ -2681,8 +2709,8 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(QLabel(help_text)); side_layout.addSpacing(15); auto_group = QGroupBox("자동 객체 찾기"); auto_layout = QVBoxLayout(auto_group)
         self.btn_auto_label = QPushButton("✨ 선택 객체 자동 찾기"); self.btn_auto_label.setStyleSheet("background-color: #fef08a; font-weight: bold; color: #854d0e; padding: 5px;"); self.btn_auto_label.clicked.connect(self.run_auto_labeling)
         self.btn_auto_label_next = QPushButton("⏭️ 다음 사진 일괄 적용"); self.btn_auto_label_next.setStyleSheet("background-color: #fed7aa; font-weight: bold; color: #9a3412; padding: 5px;"); self.btn_auto_label_next.clicked.connect(self.run_auto_labeling_next)
-        self.t6_auto_thr = QDoubleSpinBox(); self.t6_auto_thr.setRange(0.4, 0.99); self.t6_auto_thr.setValue(0.75); self.t6_auto_thr.setSingleStep(0.05); h_thr = QHBoxLayout(); h_thr.addWidget(QLabel("<b>유사도:</b>")); h_thr.addWidget(self.t6_auto_thr); h_thr.addStretch()
-        self.t6_auto_nms = QDoubleSpinBox(); self.t6_auto_nms.setRange(0.0, 1.0); self.t6_auto_nms.setValue(0.3); self.t6_auto_nms.setSingleStep(0.05); h_nms = QHBoxLayout(); h_nms.addWidget(QLabel("<b>NMS(중복제거):</b>")); h_nms.addWidget(self.t6_auto_nms); h_nms.addStretch()
+        self.t6_auto_thr = QDoubleSpinBox(); self.t6_auto_thr.setRange(0.4, 0.99); self.t6_auto_thr.setValue(ConfigDefaults.TAB6['auto_thr']); self.t6_auto_thr.setSingleStep(0.05); h_thr = QHBoxLayout(); h_thr.addWidget(QLabel("<b>유사도:</b>")); h_thr.addWidget(self.t6_auto_thr); h_thr.addStretch()
+        self.t6_auto_nms = QDoubleSpinBox(); self.t6_auto_nms.setRange(0.0, 1.0); self.t6_auto_nms.setValue(ConfigDefaults.TAB6['auto_nms']); self.t6_auto_nms.setSingleStep(0.05); h_nms = QHBoxLayout(); h_nms.addWidget(QLabel("<b>NMS(중복제거):</b>")); h_nms.addWidget(self.t6_auto_nms); h_nms.addStretch()
         auto_layout.addLayout(h_thr); auto_layout.addLayout(h_nms); auto_layout.addWidget(self.btn_auto_label); auto_layout.addWidget(self.btn_auto_label_next); side_layout.addWidget(auto_group); side_layout.addSpacing(10)
         label_info_group = QGroupBox("현재 라벨 목록"); label_info_layout = QVBoxLayout(label_info_group); label_info_layout.setContentsMargins(5, 5, 5, 5); self.t6_label_list = QListWidget(); self.t6_label_list.setSelectionMode(QListWidget.ExtendedSelection); self.t6_label_list.itemSelectionChanged.connect(self.on_label_selection_changed)
         btn_layout = QHBoxLayout(); self.btn_change_class = QPushButton("🔄 변경"); self.btn_delete_label = QPushButton("🗑️ 삭제"); self.btn_change_class.clicked.connect(self.on_change_class_clicked); self.btn_delete_label.clicked.connect(self.on_delete_label_clicked); btn_layout.addWidget(self.btn_change_class); btn_layout.addWidget(self.btn_delete_label)
@@ -2730,17 +2758,13 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"📥 '{new_proj_path.name}' 프로젝트를 구성하는 중..."); QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             with zipfile.ZipFile(load_path, 'r') as zf:
-                # 🔒 Zip Slip 방지를 위한 경로 검증 로직
                 resolved_target = Path(target_dir).resolve()
                 for member in zf.infolist():
                     member_path = Path(target_dir / member.filename).resolve()
                     if not member_path.is_relative_to(resolved_target):
                         raise PermissionError(f"보안 경고: 압축 파일이 지정된 경로를 벗어나려고 합니다! ({member.filename})")
-                
-                # 안전함이 확인된 경우에만 추출 실행
                 zf.extractall(target_dir)
 
-            # ⚠️ [복구 완료] 압축 해제 이후 UI 컴포넌트 연동 및 데이터 복구 로직
             config_file = target_dir / "config.json"; config_data = {}
             if config_file.exists():
                 with open(config_file, 'r', encoding='utf-8') as f: config_data = json.load(f).get("config", {})
@@ -2762,16 +2786,17 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "❌ 오류", f"오류 발생:\n{e}"); self.statusBar().clearMessage()
 
     def setup_tab1(self):
-        form = QFormLayout(); self.t1_auto_crop = QCheckBox(); self.t1_auto_crop.setChecked(True); self.t1_margin = QSpinBox(); self.t1_margin.setRange(0, 500); self.t1_margin.setValue(50)
-        h_crop = QHBoxLayout(); self.t1_mx = QSpinBox(); self.t1_my = QSpinBox(); self.t1_mw = QSpinBox(); self.t1_mh = QSpinBox(); self.t1_mw.setRange(1,9999); self.t1_mh.setRange(1,9999); self.t1_mw.setValue(1280); self.t1_mh.setValue(960)
+        f = ConfigDefaults.TAB1
+        form = QFormLayout(); self.t1_auto_crop = QCheckBox(); self.t1_auto_crop.setChecked(f['auto_crop']); self.t1_margin = QSpinBox(); self.t1_margin.setRange(0, 500); self.t1_margin.setValue(f['margin'])
+        h_crop = QHBoxLayout(); self.t1_mx = QSpinBox(); self.t1_my = QSpinBox(); self.t1_mw = QSpinBox(); self.t1_mh = QSpinBox(); self.t1_mw.setRange(1,9999); self.t1_mh.setRange(1,9999); self.t1_mw.setValue(f['mw']); self.t1_mh.setValue(f['mh'])
         for w, l in zip([self.t1_mx, self.t1_my, self.t1_mw, self.t1_mh], ["X", "Y", "W", "H"]): h_crop.addWidget(QLabel(l)); h_crop.addWidget(w)
         self.t1_auto_crop.stateChanged.connect(lambda state: [w.setEnabled(not state) for w in [self.t1_mx, self.t1_my, self.t1_mw, self.t1_mh]])
         [w.setEnabled(False) for w in [self.t1_mx, self.t1_my, self.t1_mw, self.t1_mh]] 
-        self.t1_class_map = QTextEdit(); self.t1_class_map.setPlainText("OK\nNG"); self.t1_class_map.setMaximumHeight(80); self.t1_clean = QCheckBox(); self.t1_clean.setChecked(True); self.t1_exif = QCheckBox(); self.t1_exif.setChecked(True)
-        self.add_param(form, "자동 크롭", self.t1_auto_crop, True); self.add_param(form, "자동 크롭 여백(px)", self.t1_margin, 50); form.addRow("수동 크롭 영역", h_crop)
+        self.t1_class_map = QTextEdit(); self.t1_class_map.setPlainText("OK\nNG"); self.t1_class_map.setMaximumHeight(80); self.t1_clean = QCheckBox(); self.t1_clean.setChecked(f['clean']); self.t1_exif = QCheckBox(); self.t1_exif.setChecked(f['exif'])
+        self.add_param(form, "자동 크롭", self.t1_auto_crop, f['auto_crop']); self.add_param(form, "자동 크롭 여백(px)", self.t1_margin, f['margin']); form.addRow("수동 크롭 영역", h_crop)
         self.btn_scan_classes = QPushButton("🔍 데이터셋에서 클래스 자동 추출"); self.btn_scan_classes.setStyleSheet("background-color: #dbeafe; font-weight: bold; color: #1e3a8a; padding: 5px;"); self.btn_scan_classes.clicked.connect(self.scan_classes_from_data)
         v_class_layout = QVBoxLayout(); v_class_layout.addWidget(self.t1_class_map); v_class_layout.addWidget(self.btn_scan_classes); form.addRow(QLabel("클래스 목록\n(엔터로 구분)"), v_class_layout)
-        self.add_param(form, "기존 출력 폴더 초기화", self.t1_clean, True); self.add_param(form, "EXIF 회전 보정", self.t1_exif, True)
+        self.add_param(form, "기존 출력 폴더 초기화", self.t1_clean, f['clean']); self.add_param(form, "EXIF 회전 보정", self.t1_exif, f['exif'])
         self.t1_btn_run = QPushButton("🚀 전처리 시작"); self.t1_btn_run.clicked.connect(self.run_tab1); self.t1_progress = QProgressBar(); self.t1_log = QTextEdit(); self.t1_log.setReadOnly(True); self.t1_img_grid = ImageGridWidget(max_display=100)
         split = QSplitter(Qt.Horizontal); left_w = QWidget(); left_l = QVBoxLayout(left_w); left_l.addWidget(self._create_scroll(form))
         
@@ -2804,25 +2829,40 @@ class MainWindow(QMainWindow):
         proc_preview_dir = Path(self.w_proc_ds.get_path()) / "preview"
         target_dir = proc_preview_dir if proc_preview_dir.exists() else Path(self.w_proc_ds.get_path()) / "images"
         if target_dir.exists(): self.t1_img_grid.update_images([str(f) for f in target_dir.iterdir() if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}])
-            
     def setup_tab2(self):
-        self.t2_epochs = QSpinBox(); self.t2_epochs.setRange(1, 5000); self.t2_epochs.setValue(400); self.t2_batch = QSpinBox(); self.t2_batch.setRange(1, 256); self.t2_batch.setValue(16); self.t2_workers = QSpinBox(); self.t2_workers.setRange(0, 32); self.t2_workers.setValue(8); self.t2_patience = QSpinBox(); self.t2_patience.setRange(0, 10000); self.t2_patience.setValue(100); self.t2_seed = QSpinBox(); self.t2_seed.setRange(0, 999999); self.t2_seed.setValue(42); self.t2_folds = QSpinBox(); self.t2_folds.setRange(1, 10); self.t2_folds.setValue(5); self.t2_test_split = QDoubleSpinBox(); self.t2_test_split.setRange(0.05, 0.6); self.t2_test_split.setValue(0.2); self.t2_test_split.setSingleStep(0.05); self.t2_lcls = QDoubleSpinBox(); self.t2_lcls.setRange(0.1, 10.0); self.t2_lcls.setValue(0.5); self.t2_lcls.setSingleStep(0.1); self.t2_lbox = QDoubleSpinBox(); self.t2_lbox.setRange(0.1, 20.0); self.t2_lbox.setValue(7.5); self.t2_lbox.setSingleStep(0.5); self.t2_ldfl = QDoubleSpinBox(); self.t2_ldfl.setRange(0.1, 10.0); self.t2_ldfl.setValue(1.5); self.t2_ldfl.setSingleStep(0.1)
-        def make_dbl(rng, val, step): b = QDoubleSpinBox(); b.setRange(*rng); b.setDecimals(3 if step < 0.01 else 2); b.setSingleStep(step); b.setValue(val); return b
-        self.t2_ah = make_dbl((0, 0.1), 0.015, 0.001); self.t2_as = make_dbl((0, 1.0), 0.7, 0.05); self.t2_av = make_dbl((0, 1.0), 0.4, 0.05); self.t2_adeg = make_dbl((0, 45.0), 0.0, 1.0); self.t2_atrans = make_dbl((0, 0.5), 0.1, 0.01); self.t2_ascale = make_dbl((0, 1.0), 0.5, 0.05); self.t2_ashear = make_dbl((0, 30.0), 0.0, 1.0); self.t2_afud = make_dbl((0, 1.0), 0.0, 0.05); self.t2_aflr = make_dbl((0, 1.0), 0.5, 0.05); self.t2_amos = make_dbl((0, 1.0), 1.0, 0.05); self.t2_amix = make_dbl((0, 1.0), 0.0, 0.05); self.t2_acp = make_dbl((0, 1.0), 0.0, 0.05)
+        d = ConfigDefaults.TAB2
+        self.t2_epochs = QSpinBox(); self.t2_epochs.setRange(1, 5000); self.t2_epochs.setValue(d['epochs'])
+        self.t2_batch = QSpinBox(); self.t2_batch.setRange(1, 256); self.t2_batch.setValue(d['batch'])
+        self.t2_workers = QSpinBox(); self.t2_workers.setRange(0, 32); self.t2_workers.setValue(d['workers'])
+        self.t2_patience = QSpinBox(); self.t2_patience.setRange(0, 10000); self.t2_patience.setValue(d['patience'])
+        self.t2_seed = QSpinBox(); self.t2_seed.setRange(0, 999999); self.t2_seed.setValue(d['seed'])
+        self.t2_folds = QSpinBox(); self.t2_folds.setRange(1, 10); self.t2_folds.setValue(d['folds'])
+        self.t2_test_split = QDoubleSpinBox(); self.t2_test_split.setRange(0.05, 0.6); self.t2_test_split.setValue(d['test_split']); self.t2_test_split.setSingleStep(0.05)
         
-        self.t2_tune_iterations = QSpinBox(); self.t2_tune_iterations.setRange(10, 300); self.t2_tune_iterations.setValue(30)
+        self.t2_lcls = QDoubleSpinBox(); self.t2_lcls.setRange(0.1, 10.0); self.t2_lcls.setValue(d['lcls']); self.t2_lcls.setSingleStep(0.1)
+        self.t2_lbox = QDoubleSpinBox(); self.t2_lbox.setRange(0.1, 20.0); self.t2_lbox.setValue(d['lbox']); self.t2_lbox.setSingleStep(0.5)
+        self.t2_ldfl = QDoubleSpinBox(); self.t2_ldfl.setRange(0.1, 10.0); self.t2_ldfl.setValue(d['ldfl']); self.t2_ldfl.setSingleStep(0.1)
+        
+        def make_dbl(rng, val, step): b = QDoubleSpinBox(); b.setRange(*rng); b.setDecimals(3 if step < 0.01 else 2); b.setSingleStep(step); b.setValue(val); return b
+        
+        self.t2_ah = make_dbl((0, 0.1), d['ah'], 0.001); self.t2_as = make_dbl((0, 1.0), d['as'], 0.05); self.t2_av = make_dbl((0, 1.0), d['av'], 0.05)
+        self.t2_adeg = make_dbl((0, 45.0), d['adeg'], 1.0); self.t2_atrans = make_dbl((0, 0.5), d['atrans'], 0.01); self.t2_ascale = make_dbl((0, 1.0), d['ascale'], 0.05)
+        self.t2_ashear = make_dbl((0, 30.0), d['ashear'], 1.0); self.t2_afud = make_dbl((0, 1.0), d['afud'], 0.05); self.t2_aflr = make_dbl((0, 1.0), d['aflr'], 0.05)
+        self.t2_amos = make_dbl((0, 1.0), d['amos'], 0.05); self.t2_amix = make_dbl((0, 1.0), d['amix'], 0.05); self.t2_acp = make_dbl((0, 1.0), d['acp'], 0.05)
+        
+        self.t2_tune_iterations = QSpinBox(); self.t2_tune_iterations.setRange(10, 300); self.t2_tune_iterations.setValue(d['tune_iterations'])
         
         h_form = QHBoxLayout(); f_left = QFormLayout(); f_right = QFormLayout()
 
         f_left.addRow(QLabel("<b>[기본 파라미터]</b>"))
-        self.add_param(f_left, "Epochs", self.t2_epochs, 400); self.add_param(f_left, "Batch", self.t2_batch, 16); self.add_param(f_left, "Workers", self.t2_workers, 8); self.add_param(f_left, "Patience (조기 종료)", self.t2_patience, 100); self.add_param(f_left, "Random Seed", self.t2_seed, 42); self.add_param(f_left, "Fold 수", self.t2_folds, 5); self.add_param(f_left, "Test 분리 비율", self.t2_test_split, 0.2)
+        self.add_param(f_left, "Epochs", self.t2_epochs, d['epochs']); self.add_param(f_left, "Batch", self.t2_batch, d['batch']); self.add_param(f_left, "Workers", self.t2_workers, d['workers']); self.add_param(f_left, "Patience (조기 종료)", self.t2_patience, d['patience']); self.add_param(f_left, "Random Seed", self.t2_seed, d['seed']); self.add_param(f_left, "Fold 수", self.t2_folds, d['folds']); self.add_param(f_left, "Test 분리 비율", self.t2_test_split, d['test_split'])
         f_left.addRow(QLabel("<br><b>[Loss 가중치]</b>"))
-        self.add_param(f_left, "cls", self.t2_lcls, 0.5); self.add_param(f_left, "box", self.t2_lbox, 7.5); self.add_param(f_left, "dfl", self.t2_ldfl, 1.5)
+        self.add_param(f_left, "cls", self.t2_lcls, d['lcls']); self.add_param(f_left, "box", self.t2_lbox, d['lbox']); self.add_param(f_left, "dfl", self.t2_ldfl, d['ldfl'])
         f_left.addRow(QLabel("<br><b>[Auto ML 최적화]</b>"))
-        self.add_param(f_left, "튜닝 반복 횟수 (Iterations)", self.t2_tune_iterations, 30)
+        self.add_param(f_left, "튜닝 반복 횟수 (Iterations)", self.t2_tune_iterations, d['tune_iterations'])
 
         f_right.addRow(QLabel("<b>[데이터 증강]</b>"))
-        self.add_param(f_right, "HSV(H)", self.t2_ah, 0.015); self.add_param(f_right, "HSV(S)", self.t2_as, 0.7); self.add_param(f_right, "HSV(V)", self.t2_av, 0.4); self.add_param(f_right, "Degrees", self.t2_adeg, 0.0); self.add_param(f_right, "Translate", self.t2_atrans, 0.1); self.add_param(f_right, "Scale", self.t2_ascale, 0.5); self.add_param(f_right, "Shear", self.t2_ashear, 0.0); self.add_param(f_right, "Flip UD", self.t2_afud, 0.0); self.add_param(f_right, "Flip LR", self.t2_aflr, 0.5); self.add_param(f_right, "Mosaic", self.t2_amos, 1.0); self.add_param(f_right, "Mixup", self.t2_amix, 0.0); self.add_param(f_right, "Copy-Paste", self.t2_acp, 0.0)
+        self.add_param(f_right, "HSV(H)", self.t2_ah, d['ah']); self.add_param(f_right, "HSV(S)", self.t2_as, d['as']); self.add_param(f_right, "HSV(V)", self.t2_av, d['av']); self.add_param(f_right, "Degrees", self.t2_adeg, d['adeg']); self.add_param(f_right, "Translate", self.t2_atrans, d['atrans']); self.add_param(f_right, "Scale", self.t2_ascale, d['ascale']); self.add_param(f_right, "Shear", self.t2_ashear, d['ashear']); self.add_param(f_right, "Flip UD", self.t2_afud, d['afud']); self.add_param(f_right, "Flip LR", self.t2_aflr, d['aflr']); self.add_param(f_right, "Mosaic", self.t2_amos, d['amos']); self.add_param(f_right, "Mixup", self.t2_amix, d['amix']); self.add_param(f_right, "Copy-Paste", self.t2_acp, d['acp'])
         
         h_form.addLayout(f_left); h_form.addLayout(f_right)
         
@@ -2896,22 +2936,36 @@ class MainWindow(QMainWindow):
         self.start_training_process(_kfold_train_worker, args)
 
     def setup_tab3(self):
+        d = ConfigDefaults.TAB3
         f = QFormLayout(); proc_dir, work_dir = Path(self.w_proc_ds.get_path()), Path(self.w_work_ds.get_path()); self.t3_model = PathInputWidget("평가 모델 (.pt)", False, str(work_dir/"kfold"/"best_model.pt")); f.addRow(self.t3_model); self.t3_img = PathInputWidget("평가 이미지", True, str(proc_dir/"images")); f.addRow(self.t3_img); self.t3_lbl = PathInputWidget("정답 라벨", True, str(proc_dir/"labels")); f.addRow(self.t3_lbl)
-        self.t3_conf = QDoubleSpinBox(); self.t3_conf.setRange(0.01, 0.99); self.t3_conf.setValue(0.25); self.t3_conf.setSingleStep(0.01); self.t3_iou = QDoubleSpinBox(); self.t3_iou.setRange(0.01, 0.99); self.t3_iou.setValue(0.45); self.t3_iou.setSingleStep(0.01); self.t3_match_iou = QDoubleSpinBox(); self.t3_match_iou.setRange(0.01, 0.99); self.t3_match_iou.setValue(0.50); self.t3_match_iou.setSingleStep(0.01); self.t3_max_det = QSpinBox(); self.t3_max_det.setRange(1, 999); self.t3_max_det.setValue(99); self.t3_run_name = QLineEdit("check01"); self.t3_agnostic = QCheckBox(); self.t3_agnostic.setChecked(True); self.t3_save_rel = QCheckBox(); self.t3_save_rel.setChecked(True)
-        self.add_param(f, "Confidence Threshold", self.t3_conf, 0.25); self.add_param(f, "IoU (NMS)", self.t3_iou, 0.45); self.add_param(f, "정답 매칭 IoU", self.t3_match_iou, 0.50); self.add_param(f, "최대 탐지 수", self.t3_max_det, 99); self.add_param(f, "실행 이름", self.t3_run_name, "check01"); self.add_param(f, "Agnostic NMS", self.t3_agnostic, True); self.add_param(f, "오답 별도 저장 (재학습용)", self.t3_save_rel, True)
+        
+        self.t3_conf = QDoubleSpinBox(); self.t3_conf.setRange(0.01, 0.99); self.t3_conf.setValue(d['conf']); self.t3_conf.setSingleStep(0.01)
+        self.t3_iou = QDoubleSpinBox(); self.t3_iou.setRange(0.01, 0.99); self.t3_iou.setValue(d['iou']); self.t3_iou.setSingleStep(0.01)
+        self.t3_match_iou = QDoubleSpinBox(); self.t3_match_iou.setRange(0.01, 0.99); self.t3_match_iou.setValue(d['match_iou']); self.t3_match_iou.setSingleStep(0.01)
+        self.t3_max_det = QSpinBox(); self.t3_max_det.setRange(1, 999); self.t3_max_det.setValue(d['max_det'])
+        self.t3_run_name = QLineEdit(d['run_name'])
+        self.t3_agnostic = QCheckBox(); self.t3_agnostic.setChecked(d['agnostic'])
+        self.t3_save_rel = QCheckBox(); self.t3_save_rel.setChecked(d['save_rel'])
+        
+        self.add_param(f, "Confidence Threshold", self.t3_conf, d['conf']); self.add_param(f, "IoU (NMS)", self.t3_iou, d['iou']); self.add_param(f, "정답 매칭 IoU", self.t3_match_iou, d['match_iou']); self.add_param(f, "최대 탐지 수", self.t3_max_det, d['max_det']); self.add_param(f, "실행 이름", self.t3_run_name, d['run_name']); self.add_param(f, "Agnostic NMS", self.t3_agnostic, d['agnostic']); self.add_param(f, "오답 별도 저장 (재학습용)", self.t3_save_rel, d['save_rel'])
+        
         self.t3_btn_run = QPushButton("🔍 평가 및 오답 선별 실행"); self.t3_btn_run.clicked.connect(self.run_tab3)
         self.t3_btn_auto_thr = QPushButton("🎯 스레숄드 찾기"); self.t3_btn_auto_thr.setStyleSheet("background-color: #fef08a; font-weight: bold; color: #854d0e;"); self.t3_btn_auto_thr.clicked.connect(self.run_auto_threshold)
         self.btn_send_t3_to_t5 = QPushButton("➡️ 이 모델과 설정으로 거리 측정"); self.btn_send_t3_to_t5.setStyleSheet("background-color: #dbeafe; font-weight: bold; color: #1e3a8a;"); self.btn_send_t3_to_t5.clicked.connect(lambda: self.send_to_measure_tab(self.t3_model.get_path(), self.t3_img.get_path(), self.t3_conf.value(), self.t3_iou.value(), self.t3_max_det.value(), self.t3_agnostic.isChecked()))
+        
         self.t3_table = QTableWidget(0, 5); self.t3_table.setHorizontalHeaderLabels(["파일명", "상태", "예측 수", "정답 수", "사유"]); self._apply_table_style(self.t3_table); header = self.t3_table.horizontalHeader()
         for i in range(self.t3_table.columnCount()): header.setSectionResizeMode(i, QHeaderView.Stretch)
         self.t3_table.setSortingEnabled(True); self.t3_table.itemDoubleClicked.connect(self.on_t3_table_double_clicked)
+        
         self.t3_img_grid = ImageGridWidget(max_display=100); self.t3_chk_show_all = QCheckBox("전체 평가 이미지 보기"); self.t3_chk_show_all.setEnabled(False); self.t3_chk_show_all.stateChanged.connect(self.update_tab3_visualization)
+        
         split = QSplitter(Qt.Horizontal); t_w = QWidget(); t_l = QVBoxLayout(t_w); t_l.addWidget(self._create_scroll(f))
         
         self.t3_btn_reset = QPushButton("🔄 이 탭 초기화"); self.t3_btn_reset.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 5px; border-radius: 4px;"); self.t3_btn_reset.clicked.connect(lambda _, w=t_w: self.reset_tab_defaults(w, "평가 & 선별"))
         
         h_t3_btns = QHBoxLayout(); h_t3_btns.addWidget(self.t3_btn_run); h_t3_btns.addWidget(self.t3_btn_auto_thr); h_t3_btns.addWidget(self.t3_btn_reset)
         t_l.addLayout(h_t3_btns); t_l.addWidget(self.btn_send_t3_to_t5); t_l.addWidget(QLabel("<b>평가 결과 목록</b>")); t_l.addWidget(self.t3_table)
+        
         i_w = QWidget(); i_l = QVBoxLayout(i_w); i_header = QHBoxLayout(); i_header.addWidget(QLabel("<b>예측 결과 시각화</b>")); i_header.addStretch(1); i_header.addWidget(self.t3_chk_show_all); i_l.addLayout(i_header); i_l.addWidget(self.t3_img_grid)
         split.addWidget(t_w); split.addWidget(i_w); split.setSizes([700, 700]); l = QVBoxLayout(); l.addWidget(split); tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "🔍 평가 & 선별")
 
@@ -2974,21 +3028,41 @@ class MainWindow(QMainWindow):
         except StopIteration: QMessageBox.warning(self, "오류", "파일을 찾을 수 없습니다.")
 
     def setup_tab4(self):
+        d = ConfigDefaults.TAB4
         main_split = QSplitter(Qt.Horizontal); left_widget = QWidget(); left_layout = QVBoxLayout(left_widget); left_layout.setContentsMargins(0, 0, 0, 0); sub_tabs = QTabWidget(); left_layout.addWidget(sub_tabs)
         sub_tab1 = QWidget(); st1_layout = QVBoxLayout(sub_tab1); f1 = QFormLayout(); proc_dir, work_dir = Path(self.w_proc_ds.get_path()), Path(self.w_work_ds.get_path())
+        
         self.t4_hard = PathInputWidget("오답(Hard) 폴더", True, ""); self.t4_orig = PathInputWidget("원본 정답 폴더", True, str(proc_dir/"labels")); self.t4_base = PathInputWidget("베이스 모델 (.pt)", False, str(work_dir/"kfold"/"best_model.pt"))
         f1.addRow(self.t4_hard); f1.addRow(self.t4_orig); f1.addRow(self.t4_base)
-        self.t4_epochs = QSpinBox(); self.t4_epochs.setRange(1, 1000); self.t4_epochs.setValue(10); self.t4_batch = QSpinBox(); self.t4_batch.setRange(1, 256); self.t4_batch.setValue(16); self.t4_run = QLineEdit("retrain_hard_01"); self.t4_lcls = QDoubleSpinBox(); self.t4_lcls.setRange(0.1, 10.0); self.t4_lcls.setValue(0.5); self.t4_lcls.setSingleStep(0.1); self.t4_lbox = QDoubleSpinBox(); self.t4_lbox.setRange(0.1, 20.0); self.t4_lbox.setValue(7.5); self.t4_lbox.setSingleStep(0.5)
+        
+        self.t4_epochs = QSpinBox(); self.t4_epochs.setRange(1, 1000); self.t4_epochs.setValue(d['epochs'])
+        self.t4_batch = QSpinBox(); self.t4_batch.setRange(1, 256); self.t4_batch.setValue(d['batch'])
+        self.t4_run = QLineEdit(d['run'])
+        self.t4_lcls = QDoubleSpinBox(); self.t4_lcls.setRange(0.1, 10.0); self.t4_lcls.setValue(d['lcls']); self.t4_lcls.setSingleStep(0.1)
+        self.t4_lbox = QDoubleSpinBox(); self.t4_lbox.setRange(0.1, 20.0); self.t4_lbox.setValue(d['lbox']); self.t4_lbox.setSingleStep(0.5)
+        
         def make_dbl(rng, val, step): b = QDoubleSpinBox(); b.setRange(*rng); b.setDecimals(3 if step < 0.01 else 2); b.setSingleStep(step); b.setValue(val); return b
-        self.t4_ah = make_dbl((0, 0.1), 0.015, 0.001); self.t4_as = make_dbl((0, 1.0), 0.7, 0.05); self.t4_av = make_dbl((0, 1.0), 0.4, 0.05); self.t4_afud = make_dbl((0, 1.0), 0.0, 0.05); self.t4_aflr = make_dbl((0, 1.0), 0.5, 0.05); self.t4_amos = make_dbl((0, 1.0), 1.0, 0.05); self.t4_amix = make_dbl((0, 1.0), 0.0, 0.05); self.t4_acp = make_dbl((0, 1.0), 0.0, 0.05)
-        f1.addRow(QLabel("<b>[기본 설정]</b>")); self.add_param(f1, "Epochs", self.t4_epochs, 10); self.add_param(f1, "Batch", self.t4_batch, 16); self.add_param(f1, "Run Name", self.t4_run, "retrain_hard_01"); self.add_param(f1, "cls Loss", self.t4_lcls, 0.5); self.add_param(f1, "box Loss", self.t4_lbox, 7.5)
-        f1.addRow(QLabel("<br><b>[재학습 증강 설정]</b>")); self.add_param(f1, "HSV(H)", self.t4_ah, 0.015); self.add_param(f1, "HSV(S)", self.t4_as, 0.7); self.add_param(f1, "HSV(V)", self.t4_av, 0.4); self.add_param(f1, "Flip UD", self.t4_afud, 0.0); self.add_param(f1, "Flip LR", self.t4_aflr, 0.5); self.add_param(f1, "Mosaic", self.t4_amos, 1.0); self.add_param(f1, "Mixup", self.t4_amix, 0.0); self.add_param(f1, "Copy-Paste", self.t4_acp, 0.0)
+        
+        self.t4_ah = make_dbl((0, 0.1), d['ah'], 0.001); self.t4_as = make_dbl((0, 1.0), d['as'], 0.05); self.t4_av = make_dbl((0, 1.0), d['av'], 0.05)
+        self.t4_afud = make_dbl((0, 1.0), d['afud'], 0.05); self.t4_aflr = make_dbl((0, 1.0), d['aflr'], 0.05); self.t4_amos = make_dbl((0, 1.0), d['amos'], 0.05)
+        self.t4_amix = make_dbl((0, 1.0), d['amix'], 0.05); self.t4_acp = make_dbl((0, 1.0), d['acp'], 0.05)
+        
+        f1.addRow(QLabel("<b>[기본 설정]</b>")); self.add_param(f1, "Epochs", self.t4_epochs, d['epochs']); self.add_param(f1, "Batch", self.t4_batch, d['batch']); self.add_param(f1, "Run Name", self.t4_run, d['run']); self.add_param(f1, "cls Loss", self.t4_lcls, d['lcls']); self.add_param(f1, "box Loss", self.t4_lbox, d['lbox'])
+        f1.addRow(QLabel("<br><b>[재학습 증강 설정]</b>")); self.add_param(f1, "HSV(H)", self.t4_ah, d['ah']); self.add_param(f1, "HSV(S)", self.t4_as, d['as']); self.add_param(f1, "HSV(V)", self.t4_av, d['av']); self.add_param(f1, "Flip UD", self.t4_afud, d['afud']); self.add_param(f1, "Flip LR", self.t4_aflr, d['aflr']); self.add_param(f1, "Mosaic", self.t4_amos, d['amos']); self.add_param(f1, "Mixup", self.t4_amix, d['amix']); self.add_param(f1, "Copy-Paste", self.t4_acp, d['acp'])
+        
         self.t4_scroll = self._create_scroll(f1); st1_layout.addWidget(self.t4_scroll); self.t4_btn_retrain = QPushButton("🔁 Hard Example 재학습 시작"); self.t4_btn_retrain.setMinimumHeight(40); self.t4_btn_retrain.clicked.connect(self.run_tab4_retrain); st1_layout.addWidget(self.t4_btn_retrain)
         
         sub_tab2 = QWidget(); st2_layout = QVBoxLayout(sub_tab2); eval_group = QGroupBox("최종 평가 설정"); eval_layout = QVBoxLayout(eval_group); f2 = QFormLayout()
-        self.t4_conf = QDoubleSpinBox(); self.t4_conf.setRange(0.01, 0.99); self.t4_conf.setValue(0.25); self.t4_conf.setSingleStep(0.01); self.t4_iou = QDoubleSpinBox(); self.t4_iou.setRange(0.01, 0.99); self.t4_iou.setValue(0.45); self.t4_iou.setSingleStep(0.01); self.t4_match_iou = QDoubleSpinBox(); self.t4_match_iou.setRange(0.01, 0.99); self.t4_match_iou.setValue(0.50); self.t4_match_iou.setSingleStep(0.01); self.t4_max_det = QSpinBox(); self.t4_max_det.setRange(1, 999); self.t4_max_det.setValue(99); self.t4_agnostic = QCheckBox(); self.t4_agnostic.setChecked(True)
+        
+        self.t4_conf = QDoubleSpinBox(); self.t4_conf.setRange(0.01, 0.99); self.t4_conf.setValue(d['eval_conf']); self.t4_conf.setSingleStep(0.01)
+        self.t4_iou = QDoubleSpinBox(); self.t4_iou.setRange(0.01, 0.99); self.t4_iou.setValue(d['eval_iou']); self.t4_iou.setSingleStep(0.01)
+        self.t4_match_iou = QDoubleSpinBox(); self.t4_match_iou.setRange(0.01, 0.99); self.t4_match_iou.setValue(d['eval_match']); self.t4_match_iou.setSingleStep(0.01)
+        self.t4_max_det = QSpinBox(); self.t4_max_det.setRange(1, 999); self.t4_max_det.setValue(d['eval_max'])
+        self.t4_agnostic = QCheckBox(); self.t4_agnostic.setChecked(d['eval_agnostic'])
+        
         h_eval_model = QHBoxLayout(); self.t4_eval_model_display = QLineEdit(); self.t4_eval_model_display.setReadOnly(True); self.t4_eval_model_display.setPlaceholderText("모델을 선택하거나 첫 번째 탭에서 재학습을 완료하세요."); self.t4_eval_model_display.setStyleSheet("background-color: #f3f4f6; color: #374151; font-weight: bold;"); self.btn_t4_eval_browse = QPushButton("📂"); self.btn_t4_eval_browse.clicked.connect(self.browse_tab4_eval_model); h_eval_model.addWidget(self.t4_eval_model_display); h_eval_model.addWidget(self.btn_t4_eval_browse)
-        f2.addRow("평가 대상 모델:", h_eval_model); self.add_param(f2, "Confidence Threshold", self.t4_conf, 0.25); self.add_param(f2, "IoU (NMS)", self.t4_iou, 0.45); self.add_param(f2, "정답 매칭 IoU", self.t4_match_iou, 0.50); self.add_param(f2, "최대 탐지 수", self.t4_max_det, 99); self.add_param(f2, "Agnostic NMS", self.t4_agnostic, True); eval_layout.addLayout(f2)
+        
+        f2.addRow("평가 대상 모델:", h_eval_model); self.add_param(f2, "Confidence Threshold", self.t4_conf, d['eval_conf']); self.add_param(f2, "IoU (NMS)", self.t4_iou, d['eval_iou']); self.add_param(f2, "정답 매칭 IoU", self.t4_match_iou, d['eval_match']); self.add_param(f2, "최대 탐지 수", self.t4_max_det, d['eval_max']); self.add_param(f2, "Agnostic NMS", self.t4_agnostic, d['eval_agnostic']); eval_layout.addLayout(f2)
         
         h_eval_btns = QHBoxLayout()
         self.t4_btn_eval = QPushButton("📊 재학습 모델 최종 평가 실행"); self.t4_btn_eval.setMinimumHeight(40); self.t4_btn_eval.clicked.connect(self.run_tab4_eval); self.t4_btn_eval.setEnabled(False)
@@ -3004,6 +3078,7 @@ class MainWindow(QMainWindow):
         for i in range(self.t4_table.columnCount()): header.setSectionResizeMode(i, QHeaderView.Stretch)
         self.t4_table.setSortingEnabled(True); self.t4_table.itemDoubleClicked.connect(self.on_t4_table_double_clicked); st2_layout.addWidget(QLabel("<b>전체 데이터 최종 평가 결과</b>")); st2_layout.addWidget(self.t4_table)
         sub_tabs.addTab(sub_tab1, "⚙️ 1. 재학습 설정 및 실행"); sub_tabs.addTab(sub_tab2, "📊 2. 재학습 모델 최종 평가"); main_split.addWidget(left_widget)
+        
         right_widget = QWidget(); right_layout = QVBoxLayout(right_widget); right_layout.setContentsMargins(10, 0, 0, 0); self.t4_chk_show_all = QCheckBox("전체 평가 이미지 보기"); self.t4_chk_show_all.setEnabled(False); self.t4_chk_show_all.stateChanged.connect(self.update_tab4_visualization)
         r_header = QHBoxLayout(); r_header.addWidget(QLabel("<b>최종 예측 결과 시각화</b>")); r_header.addStretch(1); r_header.addWidget(self.t4_chk_show_all); self.t4_img_grid = ImageGridWidget(max_display=100); right_layout.addLayout(r_header); right_layout.addWidget(self.t4_img_grid)
         main_split.addWidget(right_widget); main_split.setSizes([600, 800]); tab_layout = QVBoxLayout(); tab_layout.addWidget(main_split); tab = QWidget(); tab.setLayout(tab_layout); self.tabs.addTab(tab, "🔁 재학습")
@@ -3105,18 +3180,33 @@ class MainWindow(QMainWindow):
             except StopIteration: QMessageBox.warning(self, "오류", "파일을 찾을 수 없습니다.")
 
     def setup_tab5(self):
+        d = ConfigDefaults.TAB5
         f = QFormLayout(); proc_dir, work_dir = Path(self.w_proc_ds.get_path()), Path(self.w_work_ds.get_path())
+        
         self.t5_model = PathInputWidget("거리 측정 모델", False, str(work_dir/"kfold"/"best_model.pt")); f.addRow(self.t5_model); self.t5_img = PathInputWidget("분석할 이미지 폴더", True, str(proc_dir/"images")); f.addRow(self.t5_img)
+        
         self.t5_method = QComboBox(); self.t5_method.addItems(["테두리 최단거리 (Edge)", "중심점 유클리드 (Center)", "가장 가까운 N개 이웃 (방향 무관)"])
-        self.t5_conf = QDoubleSpinBox(); self.t5_conf.setRange(0.01, 0.99); self.t5_conf.setValue(0.25); self.t5_conf.setSingleStep(0.01); self.t5_iou = QDoubleSpinBox(); self.t5_iou.setRange(0.01, 0.99); self.t5_iou.setValue(0.45); self.t5_iou.setSingleStep(0.05); self.t5_max_det = QSpinBox(); self.t5_max_det.setRange(1, 1000); self.t5_max_det.setValue(300); self.t5_agnostic = QCheckBox(); self.t5_agnostic.setChecked(True)
-        self.t5_knn_n = QSpinBox(); self.t5_knn_n.setRange(1, 10); self.t5_knn_n.setValue(2); self.t5_edge_thr = QLineEdit("60"); self.t5_skip_ng = QCheckBox(); self.t5_skip_ng.setChecked(True); self.t5_drop_odd = QCheckBox(); self.t5_drop_odd.setChecked(False)
+        self.t5_conf = QDoubleSpinBox(); self.t5_conf.setRange(0.01, 0.99); self.t5_conf.setValue(d['conf']); self.t5_conf.setSingleStep(0.01)
+        self.t5_iou = QDoubleSpinBox(); self.t5_iou.setRange(0.01, 0.99); self.t5_iou.setValue(d['iou']); self.t5_iou.setSingleStep(0.05)
+        self.t5_max_det = QSpinBox(); self.t5_max_det.setRange(1, 1000); self.t5_max_det.setValue(d['max_det'])
+        self.t5_agnostic = QCheckBox(); self.t5_agnostic.setChecked(d['agnostic'])
+        self.t5_knn_n = QSpinBox(); self.t5_knn_n.setRange(1, 10); self.t5_knn_n.setValue(d['knn_n'])
+        self.t5_edge_thr = QLineEdit(d['edge_thr'])
+        self.t5_skip_ng = QCheckBox(); self.t5_skip_ng.setChecked(d['skip_ng'])
+        self.t5_drop_odd = QCheckBox(); self.t5_drop_odd.setChecked(d['drop_odd'])
+        
         color_map = {"노란색 (Yellow)": QColor(255, 255, 0), "초록색 (Green)": QColor(0, 255, 0), "빨간색 (Red)": QColor(255, 0, 0), "파란색 (Blue)": QColor(0, 0, 255), "청록색 (Cyan)": QColor(0, 255, 255), "자주색 (Magenta)": QColor(255, 0, 255), "흰색 (White)": QColor(255, 255, 255)}
+        
         def get_color_icon(color):
             pixmap = QPixmap(16, 16); pixmap.fill(Qt.gray); painter = QPainter(pixmap); painter.fillRect(1, 1, 14, 14, color); painter.end(); return QIcon(pixmap)
+            
         self.t5_color1 = QComboBox(); self.t5_color2 = QComboBox()
         for name, color in color_map.items(): self.t5_color1.addItem(get_color_icon(color), name); self.t5_color2.addItem(get_color_icon(color), name)
-        self.t5_color1.setCurrentText("노란색 (Yellow)"); self.t5_color2.setCurrentText("청록색 (Cyan)")
-        self.add_param(f, "측정 방식", self.t5_method, "테두리 최단거리 (Edge)"); self.add_param(f, "Confidence", self.t5_conf, 0.25); self.add_param(f, "IoU (NMS)", self.t5_iou, 0.45); self.add_param(f, "최대 탐지 수", self.t5_max_det, 300); self.add_param(f, "Agnostic NMS", self.t5_agnostic, True); self.add_param(f, "N개 이웃 (KNN 전용)", self.t5_knn_n, 2); self.add_param(f, "Edge 분류 임계값", self.t5_edge_thr, "60"); self.add_param(f, "'NG' 클래스 제외", self.t5_skip_ng, True); self.add_param(f, "홀수 개체 시 최저 신뢰도 제거", self.t5_drop_odd, False); self.add_param(f, "수평/KNN 선 색상", self.t5_color1, "노란색 (Yellow)"); self.add_param(f, "수직 선 색상 (Edge)", self.t5_color2, "청록색 (Cyan)")
+        
+        self.t5_color1.setCurrentText(d['color1']); self.t5_color2.setCurrentText(d['color2'])
+        
+        self.add_param(f, "측정 방식", self.t5_method, d['method']); self.add_param(f, "Confidence", self.t5_conf, d['conf']); self.add_param(f, "IoU (NMS)", self.t5_iou, d['iou']); self.add_param(f, "최대 탐지 수", self.t5_max_det, d['max_det']); self.add_param(f, "Agnostic NMS", self.t5_agnostic, d['agnostic']); self.add_param(f, "N개 이웃 (KNN 전용)", self.t5_knn_n, d['knn_n']); self.add_param(f, "Edge 분류 임계값", self.t5_edge_thr, d['edge_thr']); self.add_param(f, "'NG' 클래스 제외", self.t5_skip_ng, d['skip_ng']); self.add_param(f, "홀수 개체 시 최저 신뢰도 제거", self.t5_drop_odd, d['drop_odd']); self.add_param(f, "수평/KNN 선 색상", self.t5_color1, d['color1']); self.add_param(f, "수직 선 색상 (Edge)", self.t5_color2, d['color2'])
+        
         self.t5_btn_run = QPushButton("📏 측정 및 통계 분석 실행"); self.t5_btn_run.clicked.connect(self.run_tab5)
         self.t5_progress = QProgressBar(); self.t5_canvas = FigureCanvas(plt.Figure(figsize=(10, 4.5))); self.t5_canvas.setMinimumHeight(300); self.t5_toolbar = NavigationToolbar(self.t5_canvas, self); self.t5_img_grid = ImageGridWidget(max_display=100)
         self.t5_chk_show_outliers = QCheckBox("🚨 이상치(Outlier) 이미지만 필터링"); self.t5_chk_show_outliers.setStyleSheet("color: red; font-weight: bold;"); self.t5_chk_show_outliers.setEnabled(False); self.t5_chk_show_outliers.stateChanged.connect(self.update_tab5_visualization)
