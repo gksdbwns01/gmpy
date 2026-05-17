@@ -113,24 +113,22 @@ def clear_vram():
 
 
 class GracefulStopHandler:
-    def __init__(self, stop_event, logger, queue=None, default_result=None):
+    def __init__(self, stop_event, logger, result_dict=None):
         self.stop_event = stop_event
         self.logger = logger
-        self.queue = queue
-        self.default_result = default_result or {"success": False, "error": "사용자에 의해 취소되었습니다."}
+        self.result_dict = result_dict
 
-    def should_stop(self, context="", put_queue=True):
+    def should_stop(self, context=""):
         if self.stop_event and self.stop_event.is_set():
             self.logger.info(f"🛑 사용자 중단 신호 감지 [{context}]")
-            if put_queue and self.queue:
-                self.default_result["error"] = f"작업이 취소되었습니다. ({context})"
-                self.queue.put(self.default_result)
+            if self.result_dict is not None:
+                self.result_dict["error"] = f"작업이 취소되었습니다. ({context})"
             return True
         return False
 
-    def check_every_n_iterations(self, iteration, interval=10, context="", put_queue=True):
+    def check_every_n_iterations(self, iteration, interval=10, context=""):
         if iteration % interval == 0:
-            return self.should_stop(context, put_queue)
+            return self.should_stop(context)
         return False
 
 class ConfigManager:
@@ -382,11 +380,14 @@ def create_heartbeat_callback(webhook_url, total_epochs, interval):
     return on_train_epoch_end
 
 def create_stop_callback(stop_event):
-    def on_train_epoch_end(trainer):
+    def check_stop(trainer):
         if stop_event is not None and stop_event.is_set():
-            logger.info("🛑 사용자의 중지 요청 감지. 이번 Epoch를 끝으로 학습을 안전하게 조기 종료합니다.")
+            logger.info("🛑 사용자의 중지 요청 감지. 작업을 안전하게 조기 종료합니다.")
             trainer.stop = True
-    return on_train_epoch_end
+    return {
+        "on_train_epoch_end": check_stop,
+        "on_train_batch_end": check_stop
+    }
 
 class WebhookSettingsDialog(QDialog):
     def __init__(self, current_flags, current_url, parent=None):
@@ -435,12 +436,13 @@ def _single_tune_run(args, queue):
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], args["adaptive_epochs"], interval))
             
         if args.get("stop_event"):
-            model.add_callback("on_train_epoch_end", create_stop_callback(args["stop_event"]))
+            for hook, cb in create_stop_callback(args["stop_event"]).items():
+                model.add_callback(hook, cb)
 
         res = model.train(
             data=str(args["data_yaml"]), epochs=args["adaptive_epochs"], patience=args["tune_patience"], 
             batch=args["batch"], workers=args["workers"], project=str(args["tune_base"]), 
-            name=f"gen_{args['gen']+1}", seed=42, verbose=False, **args["current_params"]
+            name=f"gen_{args['gen']+1}", seed=args["seed"], verbose=False, **args["current_params"]
         )
         
         actual_epochs = len(pd.read_csv(Path(res.save_dir) / "results.csv")) if (Path(res.save_dir) / "results.csv").exists() else args["adaptive_epochs"]
@@ -474,6 +476,7 @@ def _tune_worker(args, queue):
         model_name, iterations = args["model_name"], args["iterations"]
         tune_epochs = args.get("tune_epochs", 30)
         tune_patience = args.get("tune_patience", 5)
+        user_seed = args.get("seed", 42)
         
         tune_base = workspace_dir / "runs" / "tune_custom"
         if tune_base.exists(): shutil.rmtree(tune_base); worker_logger.debug("기존 tune_custom 폴더 삭제 완료")
@@ -488,7 +491,7 @@ def _tune_worker(args, queue):
             result["error"] = "튜닝용 데이터 부족"
             worker_logger.error("데이터 부족으로 튜닝 종료"); queue.put(result); return
             
-        tr, vl = train_test_split(paired, test_size=0.2, random_state=42)
+        tr, vl = train_test_split(paired, test_size=0.2, random_state=user_seed)
         tr_txt, vl_txt = tune_base / "train.txt", tune_base / "val.txt"
         tr_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in tr))
         vl_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in vl))
@@ -498,7 +501,7 @@ def _tune_worker(args, queue):
         search_history = []
         
         def objective(trial):
-            if stop_handler.should_stop("Optuna 탐색 단계(Objective)", put_queue=False):
+            if stop_handler.should_stop("Optuna 탐색 단계(Objective)"):
                 worker_logger.info("🛑 사용자에 의한 탐색 취소. Optuna Study를 중단합니다.")
                 trial.study.stop()
                 raise optuna.exceptions.TrialPruned()
@@ -531,7 +534,7 @@ def _tune_worker(args, queue):
                 "tune_patience": tune_patience, "batch": args["batch"], "workers": args["workers"],
                 "tune_base": tune_base, "gen": gen, "current_params": current_params,
                 "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}),
-                "stop_event": args.get("stop_event")
+                "stop_event": args.get("stop_event"), "seed": user_seed
             }
             
             run_queue = multiprocessing.Queue()
@@ -574,14 +577,13 @@ def _tune_worker(args, queue):
         try:
             study.optimize(objective, n_trials=iterations)
         except Exception as e:
-            if stop_handler.should_stop("최적화 진행 중 예외 발생", put_queue=False):
+            if stop_handler.should_stop("최적화 진행 중 예외 발생"):
                 worker_logger.info("탐색이 안전하게 조기 종료되었습니다. 지금까지의 결과를 반환합니다.")
             else:
                 raise e
 
         if not search_history:
             result["error"] = "탐색 결과가 없습니다."
-            queue.put(result)
             return
 
         best_trial = study.best_trial
@@ -628,7 +630,7 @@ def _auto_threshold_worker(args, queue):
         "msg": "", "top5_params": [] 
     }
     
-    stop_handler = GracefulStopHandler(args.get("stop_event"), worker_logger, queue, result)
+    stop_handler = GracefulStopHandler(args.get("stop_event"), worker_logger, result)
     worker_logger.info(f"[AutoThreshold Worker] 임계값 자동 탐색 시작 (캐싱 모드). Model: {args['model_path']}")
     
     try:
@@ -856,7 +858,8 @@ def _single_fold_run(args, queue):
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], args["epochs"], interval))
 
         if args.get("stop_event"):
-            model.add_callback("on_train_epoch_end", create_stop_callback(args["stop_event"]))
+            for hook, cb in create_stop_callback(args["stop_event"]).items():
+                model.add_callback(hook, cb)
 
         res = model.train(
             data=str(args["data_yaml"]), epochs=args["epochs"], patience=args["patience"], imgsz=args["imgsz"], 
@@ -880,7 +883,7 @@ def _kfold_train_worker(args, queue):
     from pathlib import Path
     
     start_time = time.time(); result = {"success": False, "task": "train", "error": "", "msg": "", "best_model": ""}
-    stop_handler = GracefulStopHandler(args.get("stop_event"), worker_logger, queue, result)
+    stop_handler = GracefulStopHandler(args.get("stop_event"), worker_logger, result)
     worker_logger.info(f"[K-Fold Worker] 학습 시작. Folds: {args['num_folds']}, Model: {args['model_name']}, Epochs: {args['epochs']}")
     
     try:
@@ -900,10 +903,8 @@ def _kfold_train_worker(args, queue):
         splits = [(train_test_split(train_val, test_size=args["test_split"], random_state=args["random_seed"]))] if args["num_folds"] == 1 else list(KFold(n_splits=args["num_folds"], shuffle=True, random_state=args["random_seed"]).split(train_val))
         
         for fold, split_data in enumerate(splits):
-            if stop_handler.should_stop(f"Fold {fold+1} 시작 전", put_queue=False):
+            if stop_handler.should_stop(f"Fold {fold+1} 시작 전"):
                 if not fold_metrics:
-                    result["error"] = "사용자에 의해 학습이 취소되었습니다."
-                    queue.put(result)
                     return
                 else:
                     worker_logger.info("지금까지 완료된 Fold 중에서 최적의 모델을 선택하고 조기 종료합니다.")
@@ -999,7 +1000,8 @@ def _retrain_worker(args, queue):
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(p["webhook_url"], p["rt_epochs"], interval))
 
         if p.get("stop_event"):
-            model.add_callback("on_train_epoch_end", create_stop_callback(p["stop_event"]))
+            for hook, cb in create_stop_callback(p["stop_event"]).items():
+                model.add_callback(hook, cb)
 
         res = model.train(data=str(yaml_rt), epochs=p["rt_epochs"], imgsz=p["imgsz"], batch=p["rt_batch"], project=str(runs_dir), name=p["rt_run_name"], exist_ok=True, hsv_h=p["rt_h"], hsv_s=p["rt_s"], hsv_v=p["rt_v"], flipud=p["rt_flipud"], fliplr=p["rt_fliplr"], mosaic=p["rt_mosaic"], mixup=p["rt_mix"], copy_paste=p["rt_cp"], cls=p["rt_cls"], box=p["rt_box"], verbose=True)
         
@@ -2283,6 +2285,18 @@ class MainWindow(QMainWindow):
         return True, None
 
     def closeEvent(self, event):
+        # 작업 중 창 닫기 시도 시 경고
+        is_busy = (self.training_process and self.training_process.is_alive())
+        if is_busy:
+            reply = QMessageBox.warning(
+                self, "종료 경고", 
+                "현재 모델 학습 등 중요 작업이 진행 중입니다.\n지금 프로그램을 강제 종료하면 가중치 파일(.pt)이나 로그 데이터가 영구적으로 손상될 수 있습니다.\n\n먼저 [안전 종료] 버튼을 눌러 작업을 정상적으로 마친 후 창을 닫아주세요.\n\n그래도 무시하고 강제로 종료하시겠습니까?", 
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                event.ignore()
+                return
+
         logger.info("애플리케이션 종료 프로세스 시작")
         
         # 1. 중복 알림 방지: 모니터링 스레드 시그널 연결 해제
@@ -3162,7 +3176,7 @@ class MainWindow(QMainWindow):
             "workers": self.t2_workers.value(), "class_names": list(cmap_or_error.keys()), 
             "initial_params": initial_params, "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value(), 
             "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags(),
-            "tune_epochs": 30, "tune_patience": 5
+            "tune_epochs": 30, "tune_patience": 5, "seed": self.t2_seed.value()
         }
         self.start_training_process(_tune_worker, args)
 
