@@ -284,7 +284,7 @@ def open_folder(path):
     elif platform.system() == "Darwin": subprocess.Popen(["open", target_dir])
     else: subprocess.Popen(["xdg-open", target_dir])
 
-def send_discord_webhook(webhook_url, title, description, color=0x3498db, fields=None, retry_count=2, sync=False):
+def send_discord_webhook(webhook_url, title, description, color=0x3498db, fields=None, retry_count=3, sync=False):
     if not webhook_url or not webhook_url.startswith("http"): 
         return False
 
@@ -314,6 +314,17 @@ def send_discord_webhook(webhook_url, title, description, color=0x3498db, fields
                     json=payload, 
                     timeout=5
                 )
+                
+                # 디스코드 Rate Limit (429) 처리 추가
+                if response.status_code == 429:
+                    try:
+                        retry_after = response.json().get("retry_after", 2.0)
+                    except:
+                        retry_after = 2.0
+                    logger.warning(f"웹훅 Rate Limit 도달. {retry_after}초 대기 후 재시도...")
+                    time.sleep(retry_after)
+                    continue
+
                 response.raise_for_status()
                 logger.debug("웹훅 전송 성공")
                 return
@@ -323,7 +334,7 @@ def send_discord_webhook(webhook_url, title, description, color=0x3498db, fields
             except ConnectionError as e:
                 logger.error(f"네트워크 연결 실패: {e}")
             except RequestException as e:
-                logger.error(f"웹훅 HTTP 에러 (Rate Limit 등): {e}")
+                logger.error(f"웹훅 HTTP 에러: {e}")
             except Exception as e:
                 logger.error(f"웹훅 전송 중 알 수 없는 오류: {e}")
             
@@ -341,14 +352,23 @@ def send_discord_webhook(webhook_url, title, description, color=0x3498db, fields
 
 def create_heartbeat_callback(webhook_url, total_epochs, interval):
     if interval <= 0: return lambda trainer: None
+    
     def on_train_epoch_end(trainer):
         current_epoch = trainer.epoch + 1
         if current_epoch % interval == 0:
             logger.debug(f"웹훅 Heartbeat 발생: Epoch {current_epoch}/{total_epochs}")
             
+            # tloss 계산 중 발생할 수 있는 Ultralytics 내부 에러 방어
+            loss_val = "N/A"
+            try:
+                if hasattr(trainer, 'tloss') and trainer.tloss is not None:
+                    loss_val = f"`{trainer.tloss.sum().item():.4f}`"
+            except Exception as e:
+                logger.warning(f"웹훅: Loss 값 추출 실패 ({e})")
+
             fields = [
                 {"name": "진척도 (Epochs)", "value": f"{current_epoch} / {total_epochs}", "inline": True},
-                {"name": "Total Loss", "value": f"`{trainer.tloss.sum().item():.4f}`", "inline": True}
+                {"name": "Total Loss", "value": loss_val, "inline": True}
             ]
             
             send_discord_webhook(
@@ -356,7 +376,8 @@ def create_heartbeat_callback(webhook_url, total_epochs, interval):
                 title="💓 [학습 진행 상황]",
                 description="모델 학습이 정상적으로 진행 중입니다.",
                 color=0x3498db,
-                fields=fields
+                fields=fields,
+                sync=True # 워커 프로세스 종료 전 누락 방지를 위한 동기화 옵션 추가
             )
     return on_train_epoch_end
 
@@ -531,7 +552,8 @@ def _tune_worker(args, queue):
                     webhook_url=args["webhook_url"],
                     title="🛑 [조기 종료 발동]",
                     description=f"Auto ML {gen+1}세대 - **{actual_epochs} Epoch**에서 학습이 조기 종료되었습니다.",
-                    color=0xe74c3c
+                    color=0xe74c3c,
+                    sync=True # 동기식으로 확실하게 전송
                 )
 
             search_history.append({
@@ -577,7 +599,8 @@ def _tune_worker(args, queue):
                 title="🤖 [Auto ML] 하이퍼파라미터 탐색 완료",
                 description="최적의 파라미터 조합 탐색이 완료되었습니다.",
                 color=0x2ecc71,
-                fields=fields
+                fields=fields,
+                sync=True # 동기식으로 확실하게 전송
             )   
         result["best_params"] = best_params
         result["success"] = True
@@ -919,7 +942,8 @@ def _kfold_train_worker(args, queue):
                         webhook_url=args["webhook_url"],
                         title="🛑 [조기 종료 발동]",
                         description=f"Fold {fold_num} - **{actual_epochs} Epoch**에서 학습이 조기 종료되었습니다.",
-                        color=0xe74c3c
+                        color=0xe74c3c,
+                        sync=True # 동기식으로 확실하게 전송
                     )
 
             fold_metrics.append(res_dict); fold_save_dirs[fold_num] = save_dir
@@ -930,7 +954,8 @@ def _kfold_train_worker(args, queue):
                     webhook_url=args["webhook_url"],
                     title=f"📍 [K-Fold] Fold {fold_num} 완료",
                     description=f"검증 mAP50-95: **{mAP:.4f}**",
-                    color=0x2ecc71
+                    color=0x2ecc71,
+                    sync=True # 동기식으로 확실하게 전송
                 )
 
         if fold_metrics:
@@ -985,7 +1010,8 @@ def _retrain_worker(args, queue):
                 webhook_url=p["webhook_url"],
                 title="🛑 [조기 종료 발동]",
                 description=f"재학습이 **{actual_epochs} Epoch**에서 조기 종료되었습니다.",
-                color=0xe74c3c
+                color=0xe74c3c,
+                sync=True # 동기식으로 확실하게 전송
             )
 
         trained_model_path = Path(res.save_dir) / "weights" / "best.pt"; del model
@@ -1239,7 +1265,6 @@ class MeasureThread(QThread):
                             if r_pts: cv2.line(plotted_img, r_pts[0], r_pts[1], c1, 2); cv2.putText(plotted_img, f"{r_dist:.1f}", (int((r_pts[0][0]+r_pts[1][0])/2), int((r_pts[0][1]+r_pts[1][1])/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c1, 2); measured_distances.append(round(r_dist, 1))
                             if b_pts: cv2.line(plotted_img, b_pts[0], b_pts[1], c2, 2); cv2.putText(plotted_img, f"{b_dist:.1f}", (int((b_pts[0][0]+b_pts[1][0])/2), int((b_pts[0][1]+b_pts[1][1])/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c2, 2); measured_distances.append(round(b_dist, 1))
                 
-                # OpenCV 한글 경로 저장 문제 해결을 위해 imencode 사용
                 is_success, im_buf_arr = cv2.imencode(".jpg", plotted_img)
                 if is_success:
                     im_buf_arr.tofile(str(result_img_path))
@@ -2986,43 +3011,6 @@ class MainWindow(QMainWindow):
             logger.error(f"프로젝트 불러오기 중 에러: {e}", exc_info=True)
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "❌ 오류", f"오류 발생:\n{e}"); self.statusBar().clearMessage()
-            
-    def import_project_dialog(self):
-        logger.info("프로젝트 복구(불러오기) 실행")
-        load_path, _ = QFileDialog.getOpenFileName(self, "프로젝트 불러오기 (Zip)", "", "Zip Files (*.zip)")
-        if not load_path: return
-        import_name = Path(load_path).stem; current_root_parent = Path(self.w_proj_root.get_path()).parent; new_proj_path = current_root_parent / import_name; is_renamed = False; original_name = new_proj_path.name; counter = 1
-        while new_proj_path.exists(): is_renamed = True; new_proj_path = current_root_parent / f"{import_name}_{counter}"; counter += 1
-        new_proj_path.mkdir(parents=True, exist_ok=True); target_dir = new_proj_path / "workspace" / f"Imported_{import_name}"; target_dir.mkdir(parents=True, exist_ok=True)
-        self.statusBar().showMessage(f"📥 '{new_proj_path.name}' 프로젝트를 구성하는 중..."); QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            with zipfile.ZipFile(load_path, 'r') as zf:
-                resolved_target = Path(target_dir).resolve()
-                for member in zf.infolist():
-                    member_path = Path(target_dir / member.filename).resolve()
-                    if not member_path.is_relative_to(resolved_target):
-                        raise PermissionError(f"보안 경고: 압축 파일이 지정된 경로를 벗어나려고 합니다! ({member.filename})")
-                zf.extractall(target_dir)
-
-            config_file = target_dir / "config.json"; config_data = {}
-            if config_file.exists():
-                with open(config_file, 'r', encoding='utf-8') as f: config_data = json.load(f).get("config", {})
-            self.w_proj_root.line_edit.setText(str(new_proj_path)); self.apply_loaded_config(config_data)
-            legacy_model, base_model, retrained_model = target_dir / "model.pt", target_dir / "base_model.pt", target_dir / "retrained_model.pt"
-            if base_model.exists() or legacy_model.exists():
-                model_path_str = str((base_model if base_model.exists() else legacy_model).resolve()); self.t3_model.line_edit.setText(model_path_str); self.t4_base.line_edit.setText(model_path_str); self.t5_model.line_edit.setText(model_path_str)
-            if retrained_model.exists(): retrained_path_str = str(retrained_model.resolve()); self.t4_eval_model_display.setText(retrained_path_str); self.t4_btn_eval.setEnabled(True); self.t4_btn_auto_thr.setEnabled(True); self.t5_model.line_edit.setText(retrained_path_str)
-            self.config_manager.update_workspace_path(str(new_proj_path / "workspace"))
-            QApplication.restoreOverrideCursor()
-            logger.info(f"프로젝트 불러오기 완료: {new_proj_path}")
-            if is_renamed: 
-                QMessageBox.warning(self, "⚠️ 이름 변경", f"기존에 '{original_name}' 폴더가 존재하여 이름이 변경되었습니다!\n새 폴더명: {new_proj_path.name}"); self.statusBar().showMessage(f"⚠️ 폴더 이름 변경됨: {new_proj_path.name} 로 복구 완료", 7000)
-            else: 
-                QMessageBox.information(self, "✅ 불러오기 완료", f"루트: {new_proj_path.name}\n모든 경로가 연동되었습니다."); self.statusBar().showMessage(f"✅ 프로젝트 불러오기 완료: {new_proj_path.name}", 5000)
-        except Exception as e: 
-            logger.error(f"프로젝트 불러오기 중 에러: {e}", exc_info=True)
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "❌ 오류", f"오류 발생:\n{e}"); self.statusBar().clearMessage()
 
     def setup_tab1(self):
         f = ConfigDefaults.TAB1
@@ -3342,7 +3330,7 @@ class MainWindow(QMainWindow):
         eval_layout.addLayout(h_eval_btns)
         
         self.btn_send_t4_to_t5 = QPushButton("➡️ 이 모델과 설정으로 거리 측정"); self.btn_send_t4_to_t5.setStyleSheet("background-color: #dbeafe; font-weight: bold; color: #1e3a8a;"); self.btn_send_t4_to_t5.clicked.connect(lambda: self.send_to_measure_tab(self.t4_eval_model_display.text(), self.t3_img.get_path(), self.t4_conf.value(), self.t4_iou.value(), self.t4_max_det.value(), self.t4_agnostic.isChecked())); eval_layout.addWidget(self.btn_send_t4_to_t5); st2_layout.addWidget(eval_group)
-        self.t4_table = QTableWidget(0, 5); self.t4_table.setHorizontalHeaderLabels(["파일명", "상태", "예 예측 수", "정답 수", "사유"]); self._apply_table_style(self.t4_table); header = self.t4_table.horizontalHeader()
+        self.t4_table = QTableWidget(0, 5); self.t4_table.setHorizontalHeaderLabels(["파일명", "상태", "예측 수", "정답 수", "사유"]); self._apply_table_style(self.t4_table); header = self.t4_table.horizontalHeader()
         for i in range(self.t4_table.columnCount()): header.setSectionResizeMode(i, QHeaderView.Stretch)
         self.t4_table.setSortingEnabled(True); self.t4_table.itemDoubleClicked.connect(self.on_t4_table_double_clicked); st2_layout.addWidget(QLabel("<b>전체 데이터 최종 평가 결과</b>")); st2_layout.addWidget(self.t4_table)
         sub_tabs.addTab(sub_tab1, "⚙️ 1. 재학습 설정 및 실행"); sub_tabs.addTab(sub_tab2, "📊 2. 재학습 모델 최종 평가"); main_split.addWidget(left_widget)
@@ -3549,6 +3537,7 @@ class MainWindow(QMainWindow):
                 outlier_files = set(self.t5_last_df_outliers["파일명"].tolist())
                 self.t5_img_grid.update_images([item["_img_path"] for item in self.t5_last_image_pairs if item["파일명"] in outlier_files])
         else: self.t5_img_grid.update_images([item["_img_path"] for item in self.t5_last_image_pairs])
+
 if __name__ == '__main__':
     multiprocessing.freeze_support()
     try:

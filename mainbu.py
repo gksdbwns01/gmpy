@@ -341,14 +341,23 @@ def send_discord_webhook(webhook_url, title, description, color=0x3498db, fields
 
 def create_heartbeat_callback(webhook_url, total_epochs, interval):
     if interval <= 0: return lambda trainer: None
+    
     def on_train_epoch_end(trainer):
         current_epoch = trainer.epoch + 1
         if current_epoch % interval == 0:
             logger.debug(f"웹훅 Heartbeat 발생: Epoch {current_epoch}/{total_epochs}")
             
+            # tloss 계산 중 발생할 수 있는 Ultralytics 내부 에러 방어
+            loss_val = "N/A"
+            try:
+                if hasattr(trainer, 'tloss') and trainer.tloss is not None:
+                    loss_val = f"`{trainer.tloss.sum().item():.4f}`"
+            except Exception as e:
+                logger.warning(f"웹훅: Loss 값 추출 실패 ({e})")
+
             fields = [
                 {"name": "진척도 (Epochs)", "value": f"{current_epoch} / {total_epochs}", "inline": True},
-                {"name": "Total Loss", "value": f"`{trainer.tloss.sum().item():.4f}`", "inline": True}
+                {"name": "Total Loss", "value": loss_val, "inline": True}
             ]
             
             send_discord_webhook(
