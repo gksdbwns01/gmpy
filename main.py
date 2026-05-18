@@ -33,7 +33,7 @@ class ConfigDefaults:
     TAB1 = {"auto_crop": True, "margin": 50, "mw": 1280, "mh": 960, "clean": True, "exif": True}
     
     TAB2 = {
-        "epochs": 400, "batch": 16, "workers": 8, "patience": 100, "seed": 42, "folds": 5, "test_split": 0.2,
+        "epochs": 400, "batch": 16, "workers": 8, "patience": 100, "folds": 5, "test_split": 0.2,
         "lcls": 0.5, "lbox": 7.5, "ldfl": 1.5, "tune_iterations": 30,
         "ah": 0.015, "as": 0.7, "av": 0.4, "adeg": 0.0, "atrans": 0.1, "ascale": 0.5,
         "ashear": 0.0, "afud": 0.0, "aflr": 0.5, "amos": 1.0, "amix": 0.0, "acp": 0.0
@@ -186,7 +186,7 @@ class ConfigBuilder:
         return {
             "global": {"proj_root": w.w_proj_root.get_path(), "base_ds": w.w_base_ds.get_path(), "proc_ds": w.w_proc_ds.get_path(), "work_ds": w.w_work_ds.get_path(), "webhook_url": w.webhook_url, "noti_flags": w.get_noti_flags(), "model": w.g_model.currentText(), "imgsz": w.g_imgsz.currentText()},
             "tab1": {"auto_crop": w.t1_auto_crop.isChecked(), "margin": w.t1_margin.value(), "mx": w.t1_mx.value(), "my": w.t1_my.value(), "mw": w.t1_mw.value(), "mh": w.t1_mh.value(), "class_map": w.t1_class_map.toPlainText(), "clean": w.t1_clean.isChecked(), "exif": w.t1_exif.isChecked()},
-            "tab2": {"epochs": w.t2_epochs.value(), "batch": w.t2_batch.value(), "workers": w.t2_workers.value(), "patience": w.t2_patience.value(), "seed": w.t2_seed.value(), "folds": w.t2_folds.value(), "test_split": w.t2_test_split.value(), "lcls": w.t2_lcls.value(), "lbox": w.t2_lbox.value(), "ldfl": w.t2_ldfl.value(), "ah": w.t2_ah.value(), "as": w.t2_as.value(), "av": w.t2_av.value(), "adeg": w.t2_adeg.value(), "atrans": w.t2_atrans.value(), "ascale": w.t2_ascale.value(), "ashear": w.t2_ashear.value(), "afud": w.t2_afud.value(), "aflr": w.t2_aflr.value(), "amos": w.t2_amos.value(), "amix": w.t2_amix.value(), "acp": w.t2_acp.value()},
+            "tab2": {"epochs": w.t2_epochs.value(), "batch": w.t2_batch.value(), "workers": w.t2_workers.value(), "patience": w.t2_patience.value(), "folds": w.t2_folds.value(), "test_split": w.t2_test_split.value(), "lcls": w.t2_lcls.value(), "lbox": w.t2_lbox.value(), "ldfl": w.t2_ldfl.value(), "ah": w.t2_ah.value(), "as": w.t2_as.value(), "av": w.t2_av.value(), "adeg": w.t2_adeg.value(), "atrans": w.t2_atrans.value(), "ascale": w.t2_ascale.value(), "ashear": w.t2_ashear.value(), "afud": w.t2_afud.value(), "aflr": w.t2_aflr.value(), "amos": w.t2_amos.value(), "amix": w.t2_amix.value(), "acp": w.t2_acp.value()},
             "tab3": {"conf": w.t3_conf.value(), "iou": w.t3_iou.value(), "match_iou": w.t3_match_iou.value(), "max_det": w.t3_max_det.value(), "run_name": w.t3_run_name.text(), "agnostic": w.t3_agnostic.isChecked(), "save_rel": w.t3_save_rel.isChecked()},
             "tab4": {"epochs": w.t4_epochs.value(), "batch": w.t4_batch.value(), "run": w.t4_run.text(), "lcls": w.t4_lcls.value(), "lbox": w.t4_lbox.value(), "ah": w.t4_ah.value(), "as": w.t4_as.value(), "av": w.t4_av.value(), "afud": w.t4_afud.value(), "aflr": w.t4_aflr.value(), "amos": w.t4_amos.value(), "amix": w.t4_amix.value(), "acp": w.t4_acp.value(), "eval_conf": w.t4_conf.value(), "eval_iou": w.t4_iou.value(), "eval_match": w.t4_match_iou.value(), "eval_max": w.t4_max_det.value(), "eval_agnostic": w.t4_agnostic.isChecked()},
             "tab5": {"method": w.t5_method.currentText(), "conf": w.t5_conf.value(), "iou": w.t5_iou.value(), "max_det": w.t5_max_det.value(), "agnostic": w.t5_agnostic.isChecked(), "knn_n": w.t5_knn_n.value(), "edge_thr": w.t5_edge_thr.text(), "skip_ng": w.t5_skip_ng.isChecked(), "drop_odd": w.t5_drop_odd.isChecked(), "color1": w.t5_color1.currentText(), "color2": w.t5_color2.currentText()},
@@ -442,7 +442,7 @@ def _single_tune_run(args, queue):
         res = model.train(
             data=str(args["data_yaml"]), epochs=args["adaptive_epochs"], patience=args["tune_patience"], 
             batch=args["batch"], workers=args["workers"], project=str(args["tune_base"]), 
-            name=f"gen_{args['gen']+1}", seed=args["seed"], verbose=False, **args["current_params"]
+            name=f"gen_{args['gen']+1}", verbose=False, **args["current_params"]
         )
         
         actual_epochs = len(pd.read_csv(Path(res.save_dir) / "results.csv")) if (Path(res.save_dir) / "results.csv").exists() else args["adaptive_epochs"]
@@ -468,7 +468,7 @@ def _tune_worker(args, queue):
     start_time = time.time()
     result = {"success": False, "task": "tune", "error": "", "msg": "", "best_params": {}, "history": []}
     
-    stop_handler = GracefulStopHandler(args.get("stop_event"), worker_logger, queue, result)
+    stop_handler = GracefulStopHandler(args.get("stop_event"), worker_logger, result)
     worker_logger.info(f"[AutoML Worker] Optuna 튜닝 시작. 반복 횟수: {args['iterations']}")
     
     try:
@@ -476,7 +476,6 @@ def _tune_worker(args, queue):
         model_name, iterations = args["model_name"], args["iterations"]
         tune_epochs = args.get("tune_epochs", 30)
         tune_patience = args.get("tune_patience", 5)
-        user_seed = args.get("seed", 42)
         
         tune_base = workspace_dir / "runs" / "tune_custom"
         if tune_base.exists(): shutil.rmtree(tune_base); worker_logger.debug("기존 tune_custom 폴더 삭제 완료")
@@ -491,7 +490,7 @@ def _tune_worker(args, queue):
             result["error"] = "튜닝용 데이터 부족"
             worker_logger.error("데이터 부족으로 튜닝 종료"); queue.put(result); return
             
-        tr, vl = train_test_split(paired, test_size=0.2, random_state=user_seed)
+        tr, vl = train_test_split(paired, test_size=0.2)
         tr_txt, vl_txt = tune_base / "train.txt", tune_base / "val.txt"
         tr_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in tr))
         vl_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in vl))
@@ -534,7 +533,7 @@ def _tune_worker(args, queue):
                 "tune_patience": tune_patience, "batch": args["batch"], "workers": args["workers"],
                 "tune_base": tune_base, "gen": gen, "current_params": current_params,
                 "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}),
-                "stop_event": args.get("stop_event"), "seed": user_seed
+                "stop_event": args.get("stop_event")
             }
             
             run_queue = multiprocessing.Queue()
@@ -864,7 +863,7 @@ def _single_fold_run(args, queue):
         res = model.train(
             data=str(args["data_yaml"]), epochs=args["epochs"], patience=args["patience"], imgsz=args["imgsz"], 
             batch=args["batch"], workers=args["workers"], project=str(args["runs_dir"]), name=args["run_name"], 
-            seed=args["seed"], deterministic=args["deterministic"], verbose=True, **args["aug"], 
+            verbose=True, **args["aug"], 
             cls=args["loss"]["cls"], box=args["loss"]["box"], dfl=args["loss"]["dfl"]
         )
         
@@ -894,13 +893,13 @@ def _kfold_train_worker(args, queue):
         paired = [(str(img_map[n]), str(lbl_map[n])) for n in img_map if n in lbl_map]
         worker_logger.debug(f"[K-Fold Worker] 매칭된 데이터 수: {len(paired)}개")
         if len(paired) < 5: result["error"] = "데이터 부족"; worker_logger.error("데이터 부족으로 종료"); queue.put(result); return
-        train_val, test_files = train_test_split(paired, test_size=args["test_split"], random_state=args["random_seed"])
+        train_val, test_files = train_test_split(paired, test_size=args["test_split"])
         if kfold_base.exists(): shutil.rmtree(kfold_base); worker_logger.debug("기존 kfold 폴더 초기화 완료")
         kfold_base.mkdir(parents=True, exist_ok=True)
         test_img_dir = kfold_base / "images" / "test"; test_lbl_dir = kfold_base / "labels" / "test"; test_img_dir.mkdir(parents=True, exist_ok=True); test_lbl_dir.mkdir(parents=True, exist_ok=True)
         for img, lbl in test_files: shutil.copy(img, test_img_dir); shutil.copy(lbl, test_lbl_dir)
         fold_metrics, fold_save_dirs = [], {}
-        splits = [(train_test_split(train_val, test_size=args["test_split"], random_state=args["random_seed"]))] if args["num_folds"] == 1 else list(KFold(n_splits=args["num_folds"], shuffle=True, random_state=args["random_seed"]).split(train_val))
+        splits = [(train_test_split(train_val, test_size=args["test_split"]))] if args["num_folds"] == 1 else list(KFold(n_splits=args["num_folds"], shuffle=True).split(train_val))
         
         for fold, split_data in enumerate(splits):
             if stop_handler.should_stop(f"Fold {fold+1} 시작 전"):
@@ -920,7 +919,7 @@ def _kfold_train_worker(args, queue):
             run_args = {
                 "model_name": args["model_name"], "data_yaml": data_yaml, "epochs": args["epochs"], "patience": args.get("patience",100),
                 "imgsz": args["imgsz"], "batch": args["batch"], "workers": args["workers"], "runs_dir": runs_dir, "run_name": run_name,
-                "seed": args["random_seed"], "deterministic": args["deterministic"], "aug": args["aug"], "loss": args["loss"],
+                "aug": args["aug"], "loss": args["loss"],
                 "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}), "stop_event": args.get("stop_event")
             }
             
@@ -1542,8 +1541,7 @@ class LabelingView(QGraphicsView):
         # OpenCV 한글 경로 읽기 문제 해결
         img_array = np.fromfile(str(self.current_image_path), np.uint8)
         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-        
-        if img is None: return False, "이미지를 읽을 수문을 읽을 수 없습니다."
+        if img is None: return False, "이미지를 읽을 수 없습니다."
         rect_item, _, class_id = self.boxes[idx]
         r = rect_item.rect(); x, y, w, h = int(r.x()), int(r.y()), int(r.width()), int(r.height())
         if w < 5 or h < 5 or x < 0 or y < 0 or x+w > img.shape[1] or y+h > img.shape[0]: return False, "크기/위치가 유효하지 않습니다."
@@ -2582,7 +2580,6 @@ class MainWindow(QMainWindow):
         if "batch" in t2: self.t2_batch.setValue(t2["batch"])
         if "workers" in t2: self.t2_workers.setValue(t2["workers"])
         if "patience" in t2: self.t2_patience.setValue(t2["patience"])
-        if "seed" in t2: self.t2_seed.setValue(t2["seed"])
         if "folds" in t2: self.t2_folds.setValue(t2["folds"])
         if "test_split" in t2: self.t2_test_split.setValue(t2["test_split"])
         if "lcls" in t2: self.t2_lcls.setValue(t2["lcls"])
@@ -3093,10 +3090,9 @@ class MainWindow(QMainWindow):
         self.t2_batch = QSpinBox(); self.t2_batch.setRange(1, 256); self.t2_batch.setValue(d['batch'])
         self.t2_workers = QSpinBox(); self.t2_workers.setRange(0, 32); self.t2_workers.setValue(d['workers'])
         self.t2_patience = QSpinBox(); self.t2_patience.setRange(0, 10000); self.t2_patience.setValue(d['patience'])
-        self.t2_seed = QSpinBox(); self.t2_seed.setRange(0, 999999); self.t2_seed.setValue(d['seed'])
         self.t2_folds = QSpinBox(); self.t2_folds.setRange(1, 10); self.t2_folds.setValue(d['folds'])
         self.t2_test_split = QDoubleSpinBox(); self.t2_test_split.setRange(0.05, 0.6); self.t2_test_split.setValue(d['test_split']); self.t2_test_split.setSingleStep(0.05)
-        
+                                                                                                                          # STREAMING_CHUNK:Setting up Tab2 UI Layout (K-Fold & Auto ML)...
         self.t2_lcls = QDoubleSpinBox(); self.t2_lcls.setRange(0.1, 10.0); self.t2_lcls.setValue(d['lcls']); self.t2_lcls.setSingleStep(0.1)
         self.t2_lbox = QDoubleSpinBox(); self.t2_lbox.setRange(0.1, 20.0); self.t2_lbox.setValue(d['lbox']); self.t2_lbox.setSingleStep(0.5)
         self.t2_ldfl = QDoubleSpinBox(); self.t2_ldfl.setRange(0.1, 10.0); self.t2_ldfl.setValue(d['ldfl']); self.t2_ldfl.setSingleStep(0.1)
@@ -3113,7 +3109,7 @@ class MainWindow(QMainWindow):
         h_form = QHBoxLayout(); f_left = QFormLayout(); f_right = QFormLayout()
 
         f_left.addRow(QLabel("<b>[기본 파라미터]</b>"))
-        self.add_param(f_left, "Epochs", self.t2_epochs, d['epochs']); self.add_param(f_left, "Batch", self.t2_batch, d['batch']); self.add_param(f_left, "Workers", self.t2_workers, d['workers']); self.add_param(f_left, "Patience (조기 종료)", self.t2_patience, d['patience']); self.add_param(f_left, "Random Seed", self.t2_seed, d['seed']); self.add_param(f_left, "Fold 수", self.t2_folds, d['folds']); self.add_param(f_left, "Test 분리 비율", self.t2_test_split, d['test_split'])
+        self.add_param(f_left, "Epochs", self.t2_epochs, d['epochs']); self.add_param(f_left, "Batch", self.t2_batch, d['batch']); self.add_param(f_left, "Workers", self.t2_workers, d['workers']); self.add_param(f_left, "Patience (조기 종료)", self.t2_patience, d['patience']); self.add_param(f_left, "Fold 수", self.t2_folds, d['folds']); self.add_param(f_left, "Test 분리 비율", self.t2_test_split, d['test_split'])
         f_left.addRow(QLabel("<br><b>[Loss 가중치]</b>"))
         self.add_param(f_left, "cls", self.t2_lcls, d['lcls']); self.add_param(f_left, "box", self.t2_lbox, d['lbox']); self.add_param(f_left, "dfl", self.t2_ldfl, d['ldfl'])
         f_left.addRow(QLabel("<br><b>[Auto ML 최적화]</b>"))
@@ -3176,7 +3172,7 @@ class MainWindow(QMainWindow):
             "workers": self.t2_workers.value(), "class_names": list(cmap_or_error.keys()), 
             "initial_params": initial_params, "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value(), 
             "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags(),
-            "tune_epochs": 30, "tune_patience": 5, "seed": self.t2_seed.value()
+            "tune_epochs": 30, "tune_patience": 5
         }
         self.start_training_process(_tune_worker, args)
 
@@ -3190,9 +3186,10 @@ class MainWindow(QMainWindow):
             if QMessageBox.question(self, '확인', 'Fold 수가 1입니다. 단일 분할 학습으로 진행하시겠습니까?', QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.No: return
         success, cmap_or_error = self.parse_and_validate_class_map(self.t1_class_map.toPlainText())
         if not success: QMessageBox.warning(self, "클래스 매핑 오류", cmap_or_error); return
-        args = {"processed_dir": self.w_proc_ds.get_path(), "workspace_dir": self.w_work_ds.get_path(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags(), "model_name": self.g_model.currentText(), "imgsz": int(self.g_imgsz.currentText()), "epochs": self.t2_epochs.value(), "batch": self.t2_batch.value(), "workers": self.t2_workers.value(), "patience": self.t2_patience.value(), "random_seed": self.t2_seed.value(), "deterministic": False, "num_folds": self.t2_folds.value(), "test_split": self.t2_test_split.value(), "best_metric": "metrics/mAP50-95(B)", "second_metric": "metrics/mAP50(B)", "class_names": list(cmap_or_error.keys()), "aug": {"hsv_h": self.t2_ah.value(), "hsv_s": self.t2_as.value(), "hsv_v": self.t2_av.value(), "degrees": self.t2_adeg.value(), "translate": self.t2_atrans.value(), "scale": self.t2_ascale.value(), "shear": self.t2_ashear.value(), "flipud": self.t2_afud.value(), "fliplr": self.t2_aflr.value(), "mosaic": self.t2_amos.value(), "mixup": self.t2_amix.value(), "copy_paste": self.t2_acp.value()}, "loss": {"cls": self.t2_lcls.value(), "box": self.t2_lbox.value(), "dfl": self.t2_ldfl.value()}, "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value()}
+        args = {"processed_dir": self.w_proc_ds.get_path(), "workspace_dir": self.w_work_ds.get_path(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags(), "model_name": self.g_model.currentText(), "imgsz": int(self.g_imgsz.currentText()), "epochs": self.t2_epochs.value(), "batch": self.t2_batch.value(), "workers": self.t2_workers.value(), "patience": self.t2_patience.value(), "deterministic": False, "num_folds": self.t2_folds.value(), "test_split": self.t2_test_split.value(), "best_metric": "metrics/mAP50-95(B)", "second_metric": "metrics/mAP50(B)", "class_names": list(cmap_or_error.keys()), "aug": {"hsv_h": self.t2_ah.value(), "hsv_s": self.t2_as.value(), "hsv_v": self.t2_av.value(), "degrees": self.t2_adeg.value(), "translate": self.t2_atrans.value(), "scale": self.t2_ascale.value(), "shear": self.t2_ashear.value(), "flipud": self.t2_afud.value(), "fliplr": self.t2_aflr.value(), "mosaic": self.t2_amos.value(), "mixup": self.t2_amix.value(), "copy_paste": self.t2_acp.value()}, "loss": {"cls": self.t2_lcls.value(), "box": self.t2_lbox.value(), "dfl": self.t2_ldfl.value()}, "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value()}
         self.start_training_process(_kfold_train_worker, args)
 
+# STREAMING_CHUNK:Setting up Tab3 UI Layout (Evaluation)...
     def setup_tab3(self):
         d = ConfigDefaults.TAB3
         f = QFormLayout(); proc_dir, work_dir = Path(self.w_proc_ds.get_path()), Path(self.w_work_ds.get_path()); self.t3_model = PathInputWidget("평가 모델 (.pt)", False, str(work_dir/"kfold"/"best_model.pt")); f.addRow(self.t3_model); self.t3_img = PathInputWidget("평가 이미지", True, str(proc_dir/"images")); f.addRow(self.t3_img); self.t3_lbl = PathInputWidget("정답 라벨", True, str(proc_dir/"labels")); f.addRow(self.t3_lbl)
@@ -3297,6 +3294,7 @@ class MainWindow(QMainWindow):
         try: index = next(i for i, path in enumerate(self.t3_last_all_imgs) if Path(path).name == file_name); ImagePreviewDialog(self.t3_last_all_imgs, index, self).exec_()
         except StopIteration: QMessageBox.warning(self, "오류", "파일을 찾을 수 없습니다.")
 
+# STREAMING_CHUNK:Setting up Tab4 UI Layout (Retraining)...
     def setup_tab4(self):
         d = ConfigDefaults.TAB4
         main_split = QSplitter(Qt.Horizontal); left_widget = QWidget(); left_layout = QVBoxLayout(left_widget); left_layout.setContentsMargins(0, 0, 0, 0); sub_tabs = QTabWidget(); left_layout.addWidget(sub_tabs)
@@ -3373,7 +3371,7 @@ class MainWindow(QMainWindow):
                '- 방식: 1차 넓은 범위 탐색 후 최적점 근처 2차 정밀 탐색\n\n'
                '주의: 평가용 데이터셋이 너무 적으면 오버피팅될 수 있으므로 주의하세요.\n\n'
                '진행하시겠습니까?')
-               
+                
         if QMessageBox.question(self, '스레숄드 탐색', msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
         
         args = {"model_path": model_path, "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t4_match_iou.value(), "agnostic": self.t4_agnostic.isChecked(), "max_det": self.t4_max_det.value()}
@@ -3429,7 +3427,7 @@ class MainWindow(QMainWindow):
     def on_tab4_eval_finished(self, df, wrong_imgs, all_imgs, stats, pr_curve):
         self.t4_last_wrong_imgs = wrong_imgs; self.t4_last_all_imgs = all_imgs; self.t4_table.setSortingEnabled(False); self.t4_table.setRowCount(len(df))     
         for i, row in df.iterrows():
-            self.t4_table.setItem(i, 0, QTableWidgetItem(str(row["파일명"]))); self.t4_table.setItem(i, 1, QTableWidgetItem(str(row["상태"]))); self.t4_table.setItem(i, 2, QTableWidgetItem(str(row["예 예측 수"]))); self.t4_table.setItem(i, 3, QTableWidgetItem(str(row["정답 수"]))); self.t4_table.setItem(i, 4, QTableWidgetItem(str(row["사유"])))
+            self.t4_table.setItem(i, 0, QTableWidgetItem(str(row["파일명"]))); self.t4_table.setItem(i, 1, QTableWidgetItem(str(row["상태"]))); self.t4_table.setItem(i, 2, QTableWidgetItem(str(row["예측 수"]))); self.t4_table.setItem(i, 3, QTableWidgetItem(str(row["정답 수"]))); self.t4_table.setItem(i, 4, QTableWidgetItem(str(row["사유"])))
             for col in range(5): self.t4_table.item(i, col).setTextAlignment(Qt.AlignCenter)
         self.t4_table.setSortingEnabled(True); self.t4_chk_show_all.setEnabled(True); self.t4_chk_show_all.blockSignals(True); self.t4_chk_show_all.setChecked(False); self.t4_chk_show_all.blockSignals(False); self.update_tab4_visualization()
         
@@ -3461,6 +3459,7 @@ class MainWindow(QMainWindow):
             try: index = next(i for i, path in enumerate(self.t4_last_all_imgs) if Path(path).name == self.t4_table.item(item.row(), 0).text()); ImagePreviewDialog(self.t4_last_all_imgs, index, self).exec_()
             except StopIteration: QMessageBox.warning(self, "오류", "파일을 찾을 수 없습니다.")
 
+# STREAMING_CHUNK:Setting up Tab5 UI Layout (Measurement)...
     def setup_tab5(self):
         d = ConfigDefaults.TAB5
         f = QFormLayout(); proc_dir, work_dir = Path(self.w_proc_ds.get_path()), Path(self.w_work_ds.get_path())
