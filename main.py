@@ -639,11 +639,21 @@ def _tune_worker(args, queue):
             p.start()
             
             run_res = None
+            kill_deadline = 0
+            is_stopping = False
+
             while p.is_alive():
                 if stop_event and stop_event.is_set():
-                    worker_logger.warning("중지 요청 감지. 단일 튜닝 워커 강제 종료 시도.")
-                    kill_process_tree(p.pid)
-                    break
+                    if not is_stopping:
+                        worker_logger.warning("중지 요청 감지. 단일 프로세스의 자연 종료를 기다립니다.")
+                        is_stopping = True
+                        import time # 맨 위에 임포트 안 되어있다면 추가
+                        kill_deadline = time.time() + 300.0
+                    
+                    if time.time() > kill_deadline:
+                        worker_logger.error("시간 초과. 프로세스 트리 강제 종료 시도.")
+                        kill_process_tree(p.pid)
+                        break
                 try:
                     run_res = run_queue.get(timeout=0.5)
                     break
@@ -1048,12 +1058,21 @@ def _kfold_train_worker(args, queue):
             p.start()
             
             run_res = None
-            # [개선 1, 2] 데드락 방지 및 Subprocess 강제 종료
+            kill_deadline = 0
+            is_stopping = False
+
             while p.is_alive():
                 if stop_event and stop_event.is_set():
-                    worker_logger.warning("중지 요청 감지. 단일 폴드 워커 강제 종료 시도.")
-                    kill_process_tree(p.pid)
-                    break
+                    if not is_stopping:
+                        worker_logger.warning("중지 요청 감지. 단일 프로세스의 자연 종료를 기다립니다.")
+                        is_stopping = True
+                        import time # 맨 위에 임포트 안 되어있다면 추가
+                        kill_deadline = time.time() + 300.0
+                    
+                    if time.time() > kill_deadline:
+                        worker_logger.error("시간 초과. 프로세스 트리 강제 종료 시도.")
+                        kill_process_tree(p.pid)
+                        break
                 try:
                     run_res = run_queue.get(timeout=0.5)
                     break
@@ -1343,12 +1362,27 @@ class ProcessMonitorThread(QThread):
     def run(self):
         logger.debug(f"[Monitor Thread] 모니터링 시작 (PID: {self.process.pid})")
         result = None
+        kill_deadline = 0
+        is_stopping = False
+
         while self.process.is_alive():
             if self.stop_event and self.stop_event.is_set():
-                logger.warning("UI 쓰레드에서 중지 신호 감지 -> 워커 프로세스 강제 종료 시도")
-                kill_process_tree(self.process.pid); break
-            try: result = self.queue.get(timeout=0.5); break
-            except qlib.Empty: continue
+                if not is_stopping:
+                    logger.warning("UI 쓰레드 중지 신호 감지. 워커의 안전 종료를 대기합니다 (최대 300초).")
+                    is_stopping = True
+                    kill_deadline = time.time() + 300.0
+                
+                # 유예 기간이 지났는데도 살아있다면 그때 강제 사살
+                if time.time() > kill_deadline:
+                    logger.error("워커가 응답하지 않아 강제 종료(Kill)합니다.")
+                    kill_process_tree(self.process.pid)
+                    break
+
+            try: 
+                result = self.queue.get(timeout=0.5)
+                break
+            except qlib.Empty: 
+                continue
         self.process.join(timeout=2)
         if result is None:
             try: result = self.queue.get(timeout=0.5)
