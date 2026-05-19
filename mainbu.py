@@ -25,15 +25,15 @@ import seaborn as sns
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
 
 # ==========================================
-# [개선] 통합 기본값 관리 (Config Defaults)
+# [개선 5] 통합 기본값 관리 (Config Defaults & Schema)
 # ==========================================
 class ConfigDefaults:
     GLOBAL = {"model": "yolov8n.pt", "imgsz": "640"}
     
-    TAB1 = {"auto_crop": True, "margin": 50, "mw": 1280, "mh": 960, "clean": True, "exif": True}
+    TAB1 = {"auto_crop": True, "margin": 50, "mw": 1280, "mh": 960, "mx": 0, "my": 0, "clean": True, "exif": True, "class_map": "OK\nNG"}
     
     TAB2 = {
-        "epochs": 400, "batch": 16, "workers": 8, "patience": 100, "seed": 42, "folds": 5, "test_split": 0.2,
+        "epochs": 400, "batch": 16, "workers": 8, "patience": 100, "folds": 5, "test_split": 0.2,
         "lcls": 0.5, "lbox": 7.5, "ldfl": 1.5, "tune_iterations": 30,
         "ah": 0.015, "as": 0.7, "av": 0.4, "adeg": 0.0, "atrans": 0.1, "ascale": 0.5,
         "ashear": 0.0, "afud": 0.0, "aflr": 0.5, "amos": 1.0, "amix": 0.0, "acp": 0.0
@@ -56,7 +56,43 @@ class ConfigDefaults:
         "color1": "노란색 (Yellow)", "color2": "청록색 (Cyan)"
     }
     
-    TAB6 = {"auto_thr": 0.75, "auto_nms": 0.3, "color": "흰색 (White)"}
+    TAB6 = {"auto_thr": 0.75, "auto_nms": 0.3, "color": "흰색 (White)", "class_map": "OK\nNG"}
+
+    @staticmethod
+    def validate_and_fix(loaded_config, schema_template):
+        """재귀적으로 타입을 검사하고 누락된 키나 잘못된 값을 복구합니다 (Improvement 5)"""
+        validated = {}
+        for key, default_val in schema_template.items():
+            if key not in loaded_config:
+                validated[key] = default_val
+            elif isinstance(default_val, dict) and isinstance(loaded_config[key], dict):
+                validated[key] = ConfigDefaults.validate_and_fix(loaded_config[key], default_val)
+            else:
+                try:
+                    if isinstance(default_val, bool):
+                        validated[key] = str(loaded_config[key]).lower() in ('true', '1', 't', 'y')
+                    else:
+                        validated[key] = type(default_val)(loaded_config[key])
+                except (ValueError, TypeError):
+                    validated[key] = default_val
+        return validated
+
+# ==========================================
+# [개선 2] Subprocess Watchdog (프로세스 트리 강제 종료)
+# ==========================================
+def kill_process_tree(pid):
+    """지정된 PID와 그 자식 프로세스들까지 OS 레벨에서 확실하게 사살합니다"""
+    try:
+        parent = psutil.Process(pid)
+        children = parent.children(recursive=True)
+        for child in children:
+            child.kill()
+        parent.kill()
+        logger.info(f"프로세스 트리(PID: {pid}) 및 하위 프로세스 강제 종료 완료.")
+    except psutil.NoSuchProcess:
+        pass
+    except Exception as e:
+        logger.error(f"프로세스 트리 강제 종료 중 예외 발생: {e}")
 
 # ==========================================
 # 로깅(Logging) 설정
@@ -113,24 +149,22 @@ def clear_vram():
 
 
 class GracefulStopHandler:
-    def __init__(self, stop_event, logger, queue=None, default_result=None):
+    def __init__(self, stop_event, logger, result_dict=None):
         self.stop_event = stop_event
         self.logger = logger
-        self.queue = queue
-        self.default_result = default_result or {"success": False, "error": "사용자에 의해 취소되었습니다."}
+        self.result_dict = result_dict
 
-    def should_stop(self, context="", put_queue=True):
+    def should_stop(self, context=""):
         if self.stop_event and self.stop_event.is_set():
             self.logger.info(f"🛑 사용자 중단 신호 감지 [{context}]")
-            if put_queue and self.queue:
-                self.default_result["error"] = f"작업이 취소되었습니다. ({context})"
-                self.queue.put(self.default_result)
+            if self.result_dict is not None:
+                self.result_dict["error"] = f"작업이 취소되었습니다. ({context})"
             return True
         return False
 
-    def check_every_n_iterations(self, iteration, interval=10, context="", put_queue=True):
+    def check_every_n_iterations(self, iteration, interval=10, context=""):
         if iteration % interval == 0:
-            return self.should_stop(context, put_queue)
+            return self.should_stop(context)
         return False
 
 class ConfigManager:
@@ -173,8 +207,17 @@ class ConfigManager:
         try:
             logger.debug(f"설정 파일 불러오기 시도: {file_path}")
             with open(file_path, 'r', encoding='utf-8') as f: data = json.load(f)
-            logger.info(f"설정 불러오기 성공: {file_path}")
-            return True, data.get("config", {})
+            
+            raw_config = data.get("config", {})
+            schema = {
+                "global": ConfigDefaults.GLOBAL, "tab1": ConfigDefaults.TAB1, "tab2": ConfigDefaults.TAB2,
+                "tab3": ConfigDefaults.TAB3, "tab4": ConfigDefaults.TAB4, "tab5": ConfigDefaults.TAB5, "tab6": ConfigDefaults.TAB6
+            }
+            # [개선 5] 불러온 데이터를 스키마에 맞춰 검증 및 자동 복원
+            valid_config = ConfigDefaults.validate_and_fix(raw_config, schema)
+            
+            logger.info(f"설정 불러오기 성공 및 검증 완료: {file_path}")
+            return True, valid_config
         except Exception as e: 
             logger.error(f"설정 불러오기 실패: {e}", exc_info=True)
             return False, str(e)
@@ -188,21 +231,32 @@ class ConfigBuilder:
         return {
             "global": {"proj_root": w.w_proj_root.get_path(), "base_ds": w.w_base_ds.get_path(), "proc_ds": w.w_proc_ds.get_path(), "work_ds": w.w_work_ds.get_path(), "webhook_url": w.webhook_url, "noti_flags": w.get_noti_flags(), "model": w.g_model.currentText(), "imgsz": w.g_imgsz.currentText()},
             "tab1": {"auto_crop": w.t1_auto_crop.isChecked(), "margin": w.t1_margin.value(), "mx": w.t1_mx.value(), "my": w.t1_my.value(), "mw": w.t1_mw.value(), "mh": w.t1_mh.value(), "class_map": w.t1_class_map.toPlainText(), "clean": w.t1_clean.isChecked(), "exif": w.t1_exif.isChecked()},
-            "tab2": {"epochs": w.t2_epochs.value(), "batch": w.t2_batch.value(), "workers": w.t2_workers.value(), "patience": w.t2_patience.value(), "seed": w.t2_seed.value(), "folds": w.t2_folds.value(), "test_split": w.t2_test_split.value(), "lcls": w.t2_lcls.value(), "lbox": w.t2_lbox.value(), "ldfl": w.t2_ldfl.value(), "ah": w.t2_ah.value(), "as": w.t2_as.value(), "av": w.t2_av.value(), "adeg": w.t2_adeg.value(), "atrans": w.t2_atrans.value(), "ascale": w.t2_ascale.value(), "ashear": w.t2_ashear.value(), "afud": w.t2_afud.value(), "aflr": w.t2_aflr.value(), "amos": w.t2_amos.value(), "amix": w.t2_amix.value(), "acp": w.t2_acp.value()},
+            "tab2": {"epochs": w.t2_epochs.value(), "batch": w.t2_batch.value(), "workers": w.t2_workers.value(), "patience": w.t2_patience.value(), "folds": w.t2_folds.value(), "test_split": w.t2_test_split.value(), "lcls": w.t2_lcls.value(), "lbox": w.t2_lbox.value(), "ldfl": w.t2_ldfl.value(), "tune_iterations": w.t2_tune_iterations.value(), "ah": w.t2_ah.value(), "as": w.t2_as.value(), "av": w.t2_av.value(), "adeg": w.t2_adeg.value(), "atrans": w.t2_atrans.value(), "ascale": w.t2_ascale.value(), "ashear": w.t2_ashear.value(), "afud": w.t2_afud.value(), "aflr": w.t2_aflr.value(), "amos": w.t2_amos.value(), "amix": w.t2_amix.value(), "acp": w.t2_acp.value()},
             "tab3": {"conf": w.t3_conf.value(), "iou": w.t3_iou.value(), "match_iou": w.t3_match_iou.value(), "max_det": w.t3_max_det.value(), "run_name": w.t3_run_name.text(), "agnostic": w.t3_agnostic.isChecked(), "save_rel": w.t3_save_rel.isChecked()},
             "tab4": {"epochs": w.t4_epochs.value(), "batch": w.t4_batch.value(), "run": w.t4_run.text(), "lcls": w.t4_lcls.value(), "lbox": w.t4_lbox.value(), "ah": w.t4_ah.value(), "as": w.t4_as.value(), "av": w.t4_av.value(), "afud": w.t4_afud.value(), "aflr": w.t4_aflr.value(), "amos": w.t4_amos.value(), "amix": w.t4_amix.value(), "acp": w.t4_acp.value(), "eval_conf": w.t4_conf.value(), "eval_iou": w.t4_iou.value(), "eval_match": w.t4_match_iou.value(), "eval_max": w.t4_max_det.value(), "eval_agnostic": w.t4_agnostic.isChecked()},
             "tab5": {"method": w.t5_method.currentText(), "conf": w.t5_conf.value(), "iou": w.t5_iou.value(), "max_det": w.t5_max_det.value(), "agnostic": w.t5_agnostic.isChecked(), "knn_n": w.t5_knn_n.value(), "edge_thr": w.t5_edge_thr.text(), "skip_ng": w.t5_skip_ng.isChecked(), "drop_odd": w.t5_drop_odd.isChecked(), "color1": w.t5_color1.currentText(), "color2": w.t5_color2.currentText()},
             "tab6": {"class_map": w.t6_class_map.toPlainText(), "color": w.t6_color_combo.currentText(), "auto_thr": w.t6_auto_thr.value(), "auto_nms": w.t6_auto_nms.value()}
         }
 
+# ==========================================
+# [개선 4] LogDatabase Single Writer Thread 적용
+# ==========================================
 class LogDatabase:
     def __init__(self, db_path):
         self.db_path = Path(db_path)
         logger.debug(f"LogDatabase 초기화. 경로: {self.db_path}")
+        self._ensure_db()
+        self.log_queue = qlib.Queue()
+        # 단일 쓰기 전용 데몬 스레드 생성
+        self.writer_thread = threading.Thread(target=self._db_writer_loop, daemon=True)
+        self.writer_thread.start()
 
     def _get_connection(self):
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA mmap_size=30000000000")
         return conn
 
     def _ensure_db(self):
@@ -215,38 +269,46 @@ class LogDatabase:
             cursor.execute('CREATE TABLE IF NOT EXISTS evaluation_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, task_type TEXT, model_name TEXT, total_imgs INTEGER, wrong_count INTEGER, accuracy REAL, wrong_images TEXT, config_json TEXT)')
             conn.commit()
 
+    def _db_writer_loop(self):
+        conn = self._get_connection()
+        while True:
+            task = self.log_queue.get()
+            if task is None: break
+            try:
+                task(conn) # 큐에서 함수 객체를 꺼내어 커넥션을 주입하고 실행
+            except Exception as e:
+                logger.error(f"DB 쓰기 에러 발생: {e}", exc_info=True)
+
     def insert_log(self, task_type, model_name, epochs, batch, best_map, save_dir, config_data):
-        self._ensure_db()
-        try:
-            with self._get_connection() as conn:
-                conn.execute('INSERT INTO training_logs (timestamp, task_type, model_name, epochs, batch_size, best_map, save_dir, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), task_type, model_name, epochs, batch, best_map, save_dir, json.dumps(config_data, ensure_ascii=False)))
-                conn.commit()
+        params = (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), task_type, model_name, epochs, batch, best_map, save_dir, json.dumps(config_data, ensure_ascii=False))
+        def _task(conn):
+            conn.execute('INSERT INTO training_logs (timestamp, task_type, model_name, epochs, batch_size, best_map, save_dir, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', params)
+            conn.commit()
             logger.info(f"학습 로그 DB 삽입 완료. Task: {task_type}, Best mAP: {best_map:.4f}")
-        except Exception as e: logger.error(f"학습 로그 삽입 중 오류: {e}", exc_info=True)
+        self.log_queue.put(_task)
 
     def insert_eval_log(self, task_type, model_name, total, wrong, accuracy, wrong_imgs_list, config_data):
-        self._ensure_db()
-        try:
-            with self._get_connection() as conn:
-                conn.execute('INSERT INTO evaluation_logs (timestamp, task_type, model_name, total_imgs, wrong_count, accuracy, wrong_images, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), task_type, model_name, total, wrong, accuracy, json.dumps([Path(p).name for p in wrong_imgs_list], ensure_ascii=False), json.dumps(config_data, ensure_ascii=False)))
-                conn.commit()
+        params = (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), task_type, model_name, total, wrong, accuracy, json.dumps([Path(p).name for p in wrong_imgs_list], ensure_ascii=False), json.dumps(config_data, ensure_ascii=False))
+        def _task(conn):
+            conn.execute('INSERT INTO evaluation_logs (timestamp, task_type, model_name, total_imgs, wrong_count, accuracy, wrong_images, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', params)
+            conn.commit()
             logger.info(f"평가 로그 DB 삽입 완료. Task: {task_type}, Acc: {accuracy:.2f}%")
-        except Exception as e: logger.error(f"평가 로그 삽입 중 오류: {e}", exc_info=True)
+        self.log_queue.put(_task)
 
     def delete_logs(self, table_type, ids):
         if not ids: return
-        self._ensure_db()
         table_name = 'training_logs' if table_type == 'train' else 'evaluation_logs'
         placeholders = ','.join('?' for _ in ids)
-        try:
-            with self._get_connection() as conn:
-                conn.execute(f'DELETE FROM {table_name} WHERE id IN ({placeholders})', ids)
-                conn.commit()
-            logger.info(f"DB 레코드 삭제 완료. Table: {table_name}, IDs: {ids}")
-        except Exception as e: logger.error(f"DB 레코드 삭제 중 오류: {e}", exc_info=True)
+        evt = threading.Event()
+        def _task(conn):
+            conn.execute(f'DELETE FROM {table_name} WHERE id IN ({placeholders})', ids)
+            conn.commit()
+            evt.set()
+        self.log_queue.put(_task)
+        evt.wait() # UI 쓰레드가 삭제 완료를 대기함
+        logger.info(f"DB 레코드 삭제 완료. Table: {table_name}, IDs: {ids}")
 
     def fetch_logs(self, table_type, search_kw="", date_from=None, date_to=None, filter_ng=False, offset=0, limit=100, sort_col="id", sort_order="DESC"):
-        self._ensure_db()
         table_name = 'training_logs' if table_type == 'train' else 'evaluation_logs'
         query = f"SELECT * FROM {table_name} WHERE 1=1"
         params = []
@@ -284,7 +346,7 @@ def open_folder(path):
     elif platform.system() == "Darwin": subprocess.Popen(["open", target_dir])
     else: subprocess.Popen(["xdg-open", target_dir])
 
-def send_discord_webhook(webhook_url, title, description, color=0x3498db, fields=None, retry_count=2, sync=False):
+def send_discord_webhook(webhook_url, title, description, color=0x3498db, fields=None, retry_count=3, sync=False):
     if not webhook_url or not webhook_url.startswith("http"): 
         return False
 
@@ -314,6 +376,17 @@ def send_discord_webhook(webhook_url, title, description, color=0x3498db, fields
                     json=payload, 
                     timeout=5
                 )
+                
+                # 디스코드 Rate Limit (429) 처리
+                if response.status_code == 429:
+                    try:
+                        retry_after = response.json().get("retry_after", 2.0)
+                    except:
+                        retry_after = 2.0
+                    logger.warning(f"웹훅 Rate Limit 도달. {retry_after}초 대기 후 재시도...")
+                    time.sleep(retry_after)
+                    continue
+
                 response.raise_for_status()
                 logger.debug("웹훅 전송 성공")
                 return
@@ -323,7 +396,7 @@ def send_discord_webhook(webhook_url, title, description, color=0x3498db, fields
             except ConnectionError as e:
                 logger.error(f"네트워크 연결 실패: {e}")
             except RequestException as e:
-                logger.error(f"웹훅 HTTP 에러 (Rate Limit 등): {e}")
+                logger.error(f"웹훅 HTTP 에러: {e}")
             except Exception as e:
                 logger.error(f"웹훅 전송 중 알 수 없는 오류: {e}")
             
@@ -365,16 +438,20 @@ def create_heartbeat_callback(webhook_url, total_epochs, interval):
                 title="💓 [학습 진행 상황]",
                 description="모델 학습이 정상적으로 진행 중입니다.",
                 color=0x3498db,
-                fields=fields
+                fields=fields,
+                sync=True # 워커 프로세스 종료 전 누락 방지를 위한 동기화 옵션 추가
             )
     return on_train_epoch_end
 
 def create_stop_callback(stop_event):
-    def on_train_epoch_end(trainer):
+    def check_stop(trainer):
         if stop_event is not None and stop_event.is_set():
-            logger.info("🛑 사용자의 중지 요청 감지. 이번 Epoch를 끝으로 학습을 안전하게 조기 종료합니다.")
+            logger.info("🛑 사용자의 중지 요청 감지. 작업을 안전하게 조기 종료합니다.")
             trainer.stop = True
-    return on_train_epoch_end
+    return {
+        "on_train_epoch_end": check_stop,
+        "on_train_batch_end": check_stop
+    }
 
 class WebhookSettingsDialog(QDialog):
     def __init__(self, current_flags, current_url, parent=None):
@@ -410,6 +487,9 @@ class WebhookSettingsDialog(QDialog):
     def get_url(self): return self.txt_url.text().strip()
     def get_flags(self): return {"error": self.chk_error.isChecked(), "early_stop": self.chk_early_stop.isChecked(), "start": self.chk_start.isChecked(), "fold": self.chk_fold.isChecked(), "tune": self.chk_tune.isChecked(), "epoch": self.chk_epoch.isChecked(), "epoch_interval": {0: 10, 1: 50, 2: 100, 3: 500}[self.cmb_epoch.currentIndex()], "task": self.chk_task.isChecked()}
 
+# =========================================================
+# Worker Functions (Improvement 1, 2, 3: 완전 분리형 아키텍처)
+# =========================================================
 def _single_tune_run(args, queue):
     worker_logger = setup_logger()
     import traceback, pandas as pd
@@ -423,12 +503,13 @@ def _single_tune_run(args, queue):
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], args["adaptive_epochs"], interval))
             
         if args.get("stop_event"):
-            model.add_callback("on_train_epoch_end", create_stop_callback(args["stop_event"]))
+            for hook, cb in create_stop_callback(args["stop_event"]).items():
+                model.add_callback(hook, cb)
 
         res = model.train(
             data=str(args["data_yaml"]), epochs=args["adaptive_epochs"], patience=args["tune_patience"], 
             batch=args["batch"], workers=args["workers"], project=str(args["tune_base"]), 
-            name=f"gen_{args['gen']+1}", seed=42, verbose=False, **args["current_params"]
+            name=f"gen_{args['gen']+1}", verbose=False, **args["current_params"]
         )
         
         actual_epochs = len(pd.read_csv(Path(res.save_dir) / "results.csv")) if (Path(res.save_dir) / "results.csv").exists() else args["adaptive_epochs"]
@@ -453,8 +534,8 @@ def _tune_worker(args, queue):
     
     start_time = time.time()
     result = {"success": False, "task": "tune", "error": "", "msg": "", "best_params": {}, "history": []}
-    
-    stop_handler = GracefulStopHandler(args.get("stop_event"), worker_logger, queue, result)
+    stop_event = args.get("stop_event")
+    stop_handler = GracefulStopHandler(stop_event, worker_logger, result)
     worker_logger.info(f"[AutoML Worker] Optuna 튜닝 시작. 반복 횟수: {args['iterations']}")
     
     try:
@@ -476,7 +557,7 @@ def _tune_worker(args, queue):
             result["error"] = "튜닝용 데이터 부족"
             worker_logger.error("데이터 부족으로 튜닝 종료"); queue.put(result); return
             
-        tr, vl = train_test_split(paired, test_size=0.2, random_state=42)
+        tr, vl = train_test_split(paired, test_size=0.2)
         tr_txt, vl_txt = tune_base / "train.txt", tune_base / "val.txt"
         tr_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in tr))
         vl_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in vl))
@@ -486,7 +567,7 @@ def _tune_worker(args, queue):
         search_history = []
         
         def objective(trial):
-            if stop_handler.should_stop("Optuna 탐색 단계(Objective)", put_queue=False):
+            if stop_handler.should_stop("Optuna 탐색 단계(Objective)"):
                 worker_logger.info("🛑 사용자에 의한 탐색 취소. Optuna Study를 중단합니다.")
                 trial.study.stop()
                 raise optuna.exceptions.TrialPruned()
@@ -519,20 +600,36 @@ def _tune_worker(args, queue):
                 "tune_patience": tune_patience, "batch": args["batch"], "workers": args["workers"],
                 "tune_base": tune_base, "gen": gen, "current_params": current_params,
                 "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}),
-                "stop_event": args.get("stop_event")
+                "stop_event": stop_event
             }
             
             run_queue = multiprocessing.Queue()
             p = multiprocessing.Process(target=_single_tune_run, args=(run_args, run_queue))
             p.start()
-            p.join() 
             
-            if not run_queue.empty():
+            run_res = None
+            # [개선 1, 2] 데드락 방지 및 Subprocess 강제 종료
+            while p.is_alive():
+                if stop_event and stop_event.is_set():
+                    worker_logger.warning("중지 요청 감지. 단일 튜닝 워커 강제 종료 시도.")
+                    kill_process_tree(p.pid)
+                    break
+                try:
+                    run_res = run_queue.get(timeout=0.5)
+                    break
+                except qlib.Empty:
+                    continue
+            p.join(timeout=2)
+            
+            # 큐에 남은 게 있을 수 있으니 한번 더 확인
+            if run_res is None and not run_queue.empty():
                 run_res = run_queue.get()
-                if not run_res["success"]: raise Exception(f"세대 {gen+1} 학습 중 오류: {run_res.get('error')}")
-                actual_epochs, mAP50, mAP50_95, fitness = run_res["actual_epochs"], run_res["mAP50"], run_res["mAP50_95"], run_res["fitness"]
-            else:
-                raise Exception(f"세대 {gen+1} 워커 프로세스가 비정상 종료되었습니다.")
+            
+            if not run_res or not run_res.get("success"):
+                err_msg = run_res.get('error') if run_res else '강제 종료됨'
+                raise Exception(f"세대 {gen+1} 학습 중 오류: {err_msg}")
+                
+            actual_epochs, mAP50, mAP50_95, fitness = run_res["actual_epochs"], run_res["mAP50"], run_res["mAP50_95"], run_res["fitness"]
             
             if actual_epochs < adaptive_epochs and args.get("webhook_url") and args.get("noti_flags", {}).get("early_stop", False):
                 worker_logger.info(f"세대 {gen+1} 조기 종료 감지됨 (Epoch: {actual_epochs})")
@@ -540,7 +637,8 @@ def _tune_worker(args, queue):
                     webhook_url=args["webhook_url"],
                     title="🛑 [조기 종료 발동]",
                     description=f"Auto ML {gen+1}세대 - **{actual_epochs} Epoch**에서 학습이 조기 종료되었습니다.",
-                    color=0xe74c3c
+                    color=0xe74c3c,
+                    sync=True # 동기식으로 확실하게 전송
                 )
 
             search_history.append({
@@ -560,15 +658,16 @@ def _tune_worker(args, queue):
         
         try:
             study.optimize(objective, n_trials=iterations)
+        except optuna.exceptions.TrialPruned:
+            worker_logger.info("탐색이 안전하게 조기 종료되었습니다. 지금까지의 결과를 반환합니다.")
         except Exception as e:
-            if stop_handler.should_stop("최적화 진행 중 예외 발생", put_queue=False):
+            if stop_handler.should_stop("최적화 진행 중 예외 발생"):
                 worker_logger.info("탐색이 안전하게 조기 종료되었습니다. 지금까지의 결과를 반환합니다.")
             else:
                 raise e
 
         if not search_history:
             result["error"] = "탐색 결과가 없습니다."
-            queue.put(result)
             return
 
         best_trial = study.best_trial
@@ -586,7 +685,8 @@ def _tune_worker(args, queue):
                 title="🤖 [Auto ML] 하이퍼파라미터 탐색 완료",
                 description="최적의 파라미터 조합 탐색이 완료되었습니다.",
                 color=0x2ecc71,
-                fields=fields
+                fields=fields,
+                sync=True # 동기식으로 확실하게 전송
             )   
         result["best_params"] = best_params
         result["success"] = True
@@ -614,7 +714,8 @@ def _auto_threshold_worker(args, queue):
         "msg": "", "top5_params": [] 
     }
     
-    stop_handler = GracefulStopHandler(args.get("stop_event"), worker_logger, queue, result)
+    stop_event = args.get("stop_event")
+    stop_handler = GracefulStopHandler(stop_event, worker_logger, result)
     worker_logger.info(f"[AutoThreshold Worker] 임계값 자동 탐색 시작 (캐싱 모드). Model: {args['model_path']}")
     
     try:
@@ -842,12 +943,13 @@ def _single_fold_run(args, queue):
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(args["webhook_url"], args["epochs"], interval))
 
         if args.get("stop_event"):
-            model.add_callback("on_train_epoch_end", create_stop_callback(args["stop_event"]))
+            for hook, cb in create_stop_callback(args["stop_event"]).items():
+                model.add_callback(hook, cb)
 
         res = model.train(
             data=str(args["data_yaml"]), epochs=args["epochs"], patience=args["patience"], imgsz=args["imgsz"], 
             batch=args["batch"], workers=args["workers"], project=str(args["runs_dir"]), name=args["run_name"], 
-            seed=args["seed"], deterministic=args["deterministic"], verbose=True, **args["aug"], 
+            verbose=True, **args["aug"], 
             cls=args["loss"]["cls"], box=args["loss"]["box"], dfl=args["loss"]["dfl"]
         )
         
@@ -866,7 +968,8 @@ def _kfold_train_worker(args, queue):
     from pathlib import Path
     
     start_time = time.time(); result = {"success": False, "task": "train", "error": "", "msg": "", "best_model": ""}
-    stop_handler = GracefulStopHandler(args.get("stop_event"), worker_logger, queue, result)
+    stop_event = args.get("stop_event")
+    stop_handler = GracefulStopHandler(stop_event, worker_logger, result)
     worker_logger.info(f"[K-Fold Worker] 학습 시작. Folds: {args['num_folds']}, Model: {args['model_name']}, Epochs: {args['epochs']}")
     
     try:
@@ -877,19 +980,17 @@ def _kfold_train_worker(args, queue):
         paired = [(str(img_map[n]), str(lbl_map[n])) for n in img_map if n in lbl_map]
         worker_logger.debug(f"[K-Fold Worker] 매칭된 데이터 수: {len(paired)}개")
         if len(paired) < 5: result["error"] = "데이터 부족"; worker_logger.error("데이터 부족으로 종료"); queue.put(result); return
-        train_val, test_files = train_test_split(paired, test_size=args["test_split"], random_state=args["random_seed"])
+        train_val, test_files = train_test_split(paired, test_size=args["test_split"])
         if kfold_base.exists(): shutil.rmtree(kfold_base); worker_logger.debug("기존 kfold 폴더 초기화 완료")
         kfold_base.mkdir(parents=True, exist_ok=True)
         test_img_dir = kfold_base / "images" / "test"; test_lbl_dir = kfold_base / "labels" / "test"; test_img_dir.mkdir(parents=True, exist_ok=True); test_lbl_dir.mkdir(parents=True, exist_ok=True)
         for img, lbl in test_files: shutil.copy(img, test_img_dir); shutil.copy(lbl, test_lbl_dir)
         fold_metrics, fold_save_dirs = [], {}
-        splits = [(train_test_split(train_val, test_size=args["test_split"], random_state=args["random_seed"]))] if args["num_folds"] == 1 else list(KFold(n_splits=args["num_folds"], shuffle=True, random_state=args["random_seed"]).split(train_val))
+        splits = [(train_test_split(train_val, test_size=args["test_split"]))] if args["num_folds"] == 1 else list(KFold(n_splits=args["num_folds"], shuffle=True).split(train_val))
         
         for fold, split_data in enumerate(splits):
-            if stop_handler.should_stop(f"Fold {fold+1} 시작 전", put_queue=False):
+            if stop_handler.should_stop(f"Fold {fold+1} 시작 전"):
                 if not fold_metrics:
-                    result["error"] = "사용자에 의해 학습이 취소되었습니다."
-                    queue.put(result)
                     return
                 else:
                     worker_logger.info("지금까지 완료된 Fold 중에서 최적의 모델을 선택하고 조기 종료합니다.")
@@ -905,21 +1006,36 @@ def _kfold_train_worker(args, queue):
             run_args = {
                 "model_name": args["model_name"], "data_yaml": data_yaml, "epochs": args["epochs"], "patience": args.get("patience",100),
                 "imgsz": args["imgsz"], "batch": args["batch"], "workers": args["workers"], "runs_dir": runs_dir, "run_name": run_name,
-                "seed": args["random_seed"], "deterministic": args["deterministic"], "aug": args["aug"], "loss": args["loss"],
-                "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}), "stop_event": args.get("stop_event")
+                "aug": args["aug"], "loss": args["loss"],
+                "webhook_url": args.get("webhook_url"), "noti_flags": args.get("noti_flags", {}), "stop_event": stop_event
             }
             
             run_queue = multiprocessing.Queue()
             p = multiprocessing.Process(target=_single_fold_run, args=(run_args, run_queue))
             p.start()
-            p.join()
             
-            if not run_queue.empty():
+            run_res = None
+            # [개선 1, 2] 데드락 방지 및 Subprocess 강제 종료
+            while p.is_alive():
+                if stop_event and stop_event.is_set():
+                    worker_logger.warning("중지 요청 감지. 단일 폴드 워커 강제 종료 시도.")
+                    kill_process_tree(p.pid)
+                    break
+                try:
+                    run_res = run_queue.get(timeout=0.5)
+                    break
+                except qlib.Empty:
+                    continue
+            p.join(timeout=2)
+            
+            if run_res is None and not run_queue.empty():
                 run_res = run_queue.get()
-                if not run_res["success"]: raise Exception(f"Fold {fold_num} 학습 중 오류: {run_res.get('error')}")
-                actual_epochs, res_dict, save_dir = run_res["actual_epochs"], run_res["results_dict"], run_res["save_dir"]
-            else:
-                raise Exception(f"Fold {fold_num} 워커 프로세스가 비정상 종료되었습니다.")
+            
+            if not run_res or not run_res.get("success"):
+                err_msg = run_res.get('error') if run_res else '강제 종료됨'
+                raise Exception(f"Fold {fold_num} 학습 중 오류: {err_msg}")
+                
+            actual_epochs, res_dict, save_dir = run_res["actual_epochs"], run_res["results_dict"], run_res["save_dir"]
             
             if actual_epochs < args["epochs"]:
                 worker_logger.info(f"Fold {fold_num} 조기 종료 감지. (Epoch: {actual_epochs})")
@@ -928,7 +1044,8 @@ def _kfold_train_worker(args, queue):
                         webhook_url=args["webhook_url"],
                         title="🛑 [조기 종료 발동]",
                         description=f"Fold {fold_num} - **{actual_epochs} Epoch**에서 학습이 조기 종료되었습니다.",
-                        color=0xe74c3c
+                        color=0xe74c3c,
+                        sync=True # 동기식으로 확실하게 전송
                     )
 
             fold_metrics.append(res_dict); fold_save_dirs[fold_num] = save_dir
@@ -939,7 +1056,8 @@ def _kfold_train_worker(args, queue):
                     webhook_url=args["webhook_url"],
                     title=f"📍 [K-Fold] Fold {fold_num} 완료",
                     description=f"검증 mAP50-95: **{mAP:.4f}**",
-                    color=0x2ecc71
+                    color=0x2ecc71,
+                    sync=True # 동기식으로 확실하게 전송
                 )
 
         if fold_metrics:
@@ -983,7 +1101,8 @@ def _retrain_worker(args, queue):
             model.add_callback("on_train_epoch_end", create_heartbeat_callback(p["webhook_url"], p["rt_epochs"], interval))
 
         if p.get("stop_event"):
-            model.add_callback("on_train_epoch_end", create_stop_callback(p["stop_event"]))
+            for hook, cb in create_stop_callback(p["stop_event"]).items():
+                model.add_callback(hook, cb)
 
         res = model.train(data=str(yaml_rt), epochs=p["rt_epochs"], imgsz=p["imgsz"], batch=p["rt_batch"], project=str(runs_dir), name=p["rt_run_name"], exist_ok=True, hsv_h=p["rt_h"], hsv_s=p["rt_s"], hsv_v=p["rt_v"], flipud=p["rt_flipud"], fliplr=p["rt_fliplr"], mosaic=p["rt_mosaic"], mixup=p["rt_mix"], copy_paste=p["rt_cp"], cls=p["rt_cls"], box=p["rt_box"], verbose=True)
         
@@ -994,7 +1113,8 @@ def _retrain_worker(args, queue):
                 webhook_url=p["webhook_url"],
                 title="🛑 [조기 종료 발동]",
                 description=f"재학습이 **{actual_epochs} Epoch**에서 조기 종료되었습니다.",
-                color=0xe74c3c
+                color=0xe74c3c,
+                sync=True # 동기식으로 확실하게 전송
             )
 
         trained_model_path = Path(res.save_dir) / "weights" / "best.pt"; del model
@@ -1003,20 +1123,258 @@ def _retrain_worker(args, queue):
     except Exception: result["error"] = traceback.format_exc(); worker_logger.error(f"[Retrain Worker] Exception: {result['error']}")
     finally: clear_vram(); queue.put(result)
 
+# =========================================================
+# [개선 3] 완벽한 VRAM 격리를 위한 Eval / Measure Worker 분리
+# =========================================================
+def _eval_worker(args, queue):
+    worker_logger = setup_logger()
+    import shutil
+    from ultralytics import YOLO
+    result = {"success": False, "task": "eval", "error": ""}
+    stop_event = args.get("stop_event")
+    try:
+        c = args; eval_project_dir = Path(c["workspace_dir"]) / "runs" / "eval"
+        relabel_dir = eval_project_dir / f"{c['eval_run_name']}_needs_relabel"
+        if c["save_relabel"]:
+            if relabel_dir.exists(): shutil.rmtree(relabel_dir)
+            relabel_dir.mkdir(parents=True, exist_ok=True)
+        model = YOLO(str(c["eval_model_path"]))
+        res = model.predict(source=str(c["eval_source"]), save=True, conf=c["eval_conf"], iou=c["eval_iou"], max_det=c["max_det"], project=str(eval_project_dir), name=c["eval_run_name"], agnostic_nms=c["agnostic_nms"], exist_ok=True)
+        
+        def calc_iou(b1, b2):
+            ax1,ay1,ax2,ay2 = b1[0]-b1[2]/2, b1[1]-b1[3]/2, b1[0]+b1[2]/2, b1[1]+b1[3]/2
+            bx1,by1,bx2,by2 = b2[0]-b2[2]/2, b2[1]-b2[3]/2, b2[0]+b2[2]/2, b2[1]+b2[3]/2
+            ix, iy = max(0, min(ax2,bx2)-max(ax1,bx1)), max(0, min(ay2,by2)-max(ay1,by1))
+            ia = ix*iy; return ia/((ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-ia+1e-6)
+            
+        rows, wrong, wrong_imgs, all_imgs = [], 0, [], []; total_tp, total_fp, total_fn = 0, 0, 0
+        for r in res:
+            if stop_event and stop_event.is_set(): raise Exception("사용자 취소됨")
+            img_name = Path(r.path).name; current_img_path = str(eval_project_dir / c["eval_run_name"] / img_name); all_imgs.append(current_img_path)
+            pred_boxes = [{"class": int(cls.item()), "box": b.tolist()} for cls, b in zip(r.boxes.cls, r.boxes.xywhn)] if len(r.boxes) > 0 else []
+            gt_boxes = []; txt = Path(c["gt_labels_path"]) / Path(img_name).with_suffix(".txt").name
+            if txt.exists():
+                for line in txt.read_text().splitlines():
+                    parts = line.strip().split()
+                    if len(parts) == 5: gt_boxes.append({"class": int(parts[0]), "box": [float(x) for x in parts[1:]]})
+            matched_gt = set(); tp = fp = 0
+            for pb in pred_boxes:
+                best_iou, best_gt = 0.0, -1
+                for j, gb in enumerate(gt_boxes):
+                    if j not in matched_gt and pb["class"] == gb["class"]:
+                        iou = calc_iou(pb["box"], gb["box"])
+                        if iou > best_iou: best_iou, best_gt = iou, j
+                if best_iou >= max(c.get("match_iou", 0.5), 0.5): tp += 1; matched_gt.add(best_gt)
+                else: fp += 1
+            fn = len(gt_boxes) - len(matched_gt); total_tp += tp; total_fp += fp; total_fn += fn
+            correct = (fp == 0 and fn == 0); reasons = []
+            if fn > 0: reasons.append(f"미검 {fn}개")
+            if fp > 0: reasons.append(f"과검 {fp}개")
+            if not correct:
+                wrong += 1; wrong_imgs.append(current_img_path)
+                if c["save_relabel"]: shutil.copy(r.path, relabel_dir / img_name)
+            rows.append({"파일명": img_name, "상태": "✅ 정상" if correct else "❌ 오답", "예측 수": len(pred_boxes), "정답 수": len(gt_boxes), "사유": ", ".join(reasons) if reasons else "정확히 일치"})
+        precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+        recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+        f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        stats = {"total": len(rows), "correct": len(rows) - wrong, "wrong": wrong, "acc": f1_score * 100, "precision": precision * 100, "recall": recall * 100, "f1_score": f1_score * 100, "relabel_dir": str(relabel_dir) if c["save_relabel"] else ""}
+        worker_logger.info(f"[Eval Worker] 평가 완료. F1-Score: {f1_score*100:.2f}%, 오답: {wrong}건")
+        
+        result.update({"success": True, "rows": rows, "wrong_imgs": wrong_imgs, "all_imgs": all_imgs, "stats": stats})
+    except Exception: result["error"] = traceback.format_exc(); worker_logger.error("[Eval Worker] 에러 발생", exc_info=True)
+    finally: clear_vram(); queue.put(result)
+
+def _tab4_eval_worker(args, queue):
+    worker_logger = setup_logger()
+    try:
+        from ultralytics import YOLO
+        c = args; model = YOLO(str(c["retrained_model"]))
+        val_metrics = model.val(data=str(c["yaml_path"]), conf=c["eval_conf"], iou=c["eval_iou"], max_det=c["max_det"], project=str(Path(c["workspace_dir"]) / "runs" / "eval"), name=c["eval_run_name"] + "_val")
+        pr_curve = str(Path(val_metrics.save_dir) / "PR_curve.png")
+        
+        eval_config = c.copy(); eval_config["eval_model_path"] = c["retrained_model"]; eval_config["eval_run_name"] = c["eval_run_name"] + "_final_eval"; eval_config["save_relabel"] = False
+        del model; clear_vram()
+        
+        import queue as local_q
+        q2 = local_q.Queue()
+        _eval_worker(eval_config, q2)
+        res = q2.get()
+        if res.get("success"):
+            res["pr_curve"] = pr_curve
+            queue.put(res)
+        else:
+            queue.put(res)
+    except Exception: 
+        worker_logger.error("[Tab4FinalEval Worker] 에러 발생", exc_info=True)
+        queue.put({"success": False, "error": traceback.format_exc()})
+    finally: clear_vram()
+
+def _measure_worker(args, queue):
+    worker_logger = setup_logger()
+    from ultralytics import YOLO
+    import math
+    COLOR_MAP = {"노란색 (Yellow)": (0, 255, 255), "초록색 (Green)": (0, 255, 0), "빨간색 (Red)": (0, 0, 255), "파란색 (Blue)": (255, 0, 0), "청록색 (Cyan)": (255, 255, 0), "자주색 (Magenta)": (255, 0, 255), "흰색 (White)": (255, 255, 255)}
+    result = {"success": False, "task": "measure", "error": ""}
+    stop_event = args.get("stop_event")
+    
+    try:
+        c = args; dist_source = Path(c["dist_source"])
+        is_edge, is_knn = c["measure_method"] == "테두리 최단거리 (Edge)", c["measure_method"] == "가장 가까운 N개 이웃 (방향 무관)"
+        c1 = COLOR_MAP.get(c.get("color1", "노란색 (Yellow)"), (0, 255, 255)); c2 = COLOR_MAP.get(c.get("color2", "청록색 (Cyan)"), (255, 255, 0))
+        dist_run_name = "ok_edge_distance" if is_edge else "ok_knn_distance" if is_knn else "ok_euclidean_distance"
+        dist_col_name = "수평/수직 테두리 거리(px)" if is_edge else "최단 중심점 거리_N개(px)" if is_knn else "중심점 간 유클리드 거리(px)"
+        base_dir = Path(c["workspace_dir"]) / "runs" / "measure"; base_dir.mkdir(parents=True, exist_ok=True); folder_idx = 1
+        while (base_dir / f"{dist_run_name}_{folder_idx:02d}").exists(): folder_idx += 1
+        final_save_dir = base_dir / f"{dist_run_name}_{folder_idx:02d}"; final_save_dir.mkdir()
+        
+        model = YOLO(str(c["dist_model_path"]))
+        img_files = [f for f in dist_source.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png")]; total_imgs = len(img_files)
+        results = model.predict(source=str(dist_source), save=False, conf=c["dist_conf"], iou=c["dist_iou"], max_det=c["dist_max_det"], agnostic_nms=c["dist_agnostic"], stream=True)
+        
+        image_pairs = []; processed = 0; all_data = []
+        thresholds = [float(x.strip()) for x in c["edge_thresholds"].split(",") if x.strip()] if is_edge else [60.0]
+        def get_cat(d, thr):
+            if d < thr[0]: return f"유형 1 ( < {thr[0]} )"
+            for i in range(len(thr)-1):
+                if thr[i] <= d < thr[i+1]: return f"유형 {i+2} ( {thr[i]}~{thr[i+1]} )"
+            return f"유형 {len(thr)+1} ( >= {thr[-1]} )"
+
+        for r in results:
+            if stop_event and stop_event.is_set(): raise Exception("사용자 취소됨")
+            processed += 1
+            if processed % 10 == 0: queue.put({"type": "progress", "val": int(processed / max(total_imgs, 1) * 100)})
+            img_name = Path(r.path).name; result_img_path = final_save_dir / img_name
+            detected = [r.names[int(cls_id)].lower() for cls_id in r.boxes.cls]
+            if c["skip_ng"] and "ng" in detected: continue
+            num_objects = len(r.boxes)
+            if c["drop_odd_lowest"] and num_objects % 2 != 0 and num_objects > 0:
+                r = r[[i for i in range(num_objects) if i != int(r.boxes.conf.argmin().item())]]; num_objects = len(r.boxes)
+            plotted_img = r.plot(line_width=1, conf=False, labels=False); measured_distances = []; worst_conf = r.boxes.conf.min().item() if num_objects > 0 else 0.0
+            if num_objects >= 2:
+                boxes = r.boxes.xyxy.cpu().numpy()
+                for i, b1 in enumerate(boxes):
+                    min_x = min_y = float("inf"); r_pts = b_pts = None; r_dist = b_dist = 0
+                    cx1, cy1 = (b1[0] + b1[2]) / 2, (b1[1] + b1[3]) / 2; knn_cands = []
+                    for j, b2 in enumerate(boxes):
+                        if i == j: continue
+                        ox, oy = min(b1[2], b2[2]) - max(b1[0], b2[0]), min(b1[3], b2[3]) - max(b1[1], b2[1])
+                        cx2, cy2 = (b2[0] + b2[2]) / 2, (b2[1] + b2[3]) / 2; dist = math.sqrt((cx2 - cx1)**2 + (cy2 - cy1)**2)
+                        if is_knn: knn_cands.append((dist, (int(cx1), int(cy1)), (int(cx2), int(cy2))))
+                        elif is_edge:
+                            if oy > 0 and b2[0] >= b1[2] and (b2[0] - b1[2]) < min_x: min_x = r_dist = b2[0] - b1[2]; y_cen = int((max(b1[1], b2[1]) + min(b1[3], b2[3])) / 2); r_pts = ((int(b1[2]), y_cen), (int(b2[0]), y_cen))
+                            if ox > 0 and b2[1] >= b1[3] and (b2[1] - b1[3]) < min_y: min_y = b_dist = b2[1] - b1[3]; x_cen = int((max(b1[0], b2[0]) + min(b1[2], b2[2])) / 2); b_pts = ((x_cen, int(b1[3])), (x_cen, int(b2[1])))
+                        else:
+                            if oy > 0 and cx2 > cx1 and dist < min_x: min_x = r_dist = dist; r_pts = ((int(cx1), int(cy1)), (int(cx2), int(cy2)))
+                            if ox > 0 and cy2 > cy1 and dist < min_y: min_y = b_dist = dist; b_pts = ((int(cx1), int(cy1)), (int(cx2), int(cy2)))
+                    if is_knn:
+                        for d, pt1, pt2 in sorted(knn_cands, key=lambda x: x[0])[:c["n_neighbors"]]:
+                            cv2.line(plotted_img, pt1, pt2, c1, 2); cv2.putText(plotted_img, f"{d:.1f}", (int((pt1[0]+pt2[0])/2), int((pt1[1]+pt2[1])/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c1, 2); measured_distances.append(round(d, 1))
+                    else:
+                        if r_pts: cv2.line(plotted_img, r_pts[0], r_pts[1], c1, 2); cv2.putText(plotted_img, f"{r_dist:.1f}", (int((r_pts[0][0]+r_pts[1][0])/2), int((r_pts[0][1]+r_pts[1][1])/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c1, 2); measured_distances.append(round(r_dist, 1))
+                        if b_pts: cv2.line(plotted_img, b_pts[0], b_pts[1], c2, 2); cv2.putText(plotted_img, f"{b_dist:.1f}", (int((b_pts[0][0]+b_pts[1][0])/2), int((b_pts[0][1]+b_pts[1][1])/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c2, 2); measured_distances.append(round(b_dist, 1))
+                
+                is_success, im_buf_arr = cv2.imencode(".jpg", plotted_img)
+                if is_success: im_buf_arr.tofile(str(result_img_path))
+                
+            dstr = ", ".join([str(d) for d in sorted(list(set(measured_distances)))]) if measured_distances else "측정된 선 없음"
+            image_pairs.append({"파일명": img_name, "탐지 수": f"{num_objects}개", "최저 신뢰도": round(worst_conf, 2), dist_col_name: dstr, "_img_path": str(result_img_path)})
+            if measured_distances:
+                for d in measured_distances: all_data.append({"파일명": img_name, "구분": get_cat(d, thresholds) if is_edge else "유클리드", "거리(px)": d})
+            
+        df_export = pd.DataFrame([{k:v for k,v in item.items() if k!="_img_path"} for item in image_pairs])
+        df_export.to_csv(final_save_dir / f"{dist_run_name}_results.csv", index=False, encoding="utf-8-sig")
+        df_parsed = pd.DataFrame(all_data); outliers_list = []
+        if not df_parsed.empty:
+            stats_list = []  
+            for cat in df_parsed["구분"].unique():
+                subset = df_parsed[df_parsed["구분"] == cat]
+                Q1, Q3 = subset["거리(px)"].quantile(0.25), subset["거리(px)"].quantile(0.75); IQR = Q3 - Q1; lo, hi = Q1 - 1.5*IQR, Q3 + 1.5*IQR
+                outs = subset[(subset["거리(px)"] < lo) | (subset["거리(px)"] > hi)].copy()
+                if not outs.empty: outs["하한"], outs["상한"] = round(lo, 2), round(hi, 2); outliers_list.append(outs)
+                stats_list.append({"구분(유형)": cat, "데이터 수(Count)": len(subset), "평균(Mean)": round(subset["거리(px)"].mean(), 2), "표준편차(Std)": round(subset["거리(px)"].std(), 2) if len(subset) > 1 else 0.0, "최소값(Min)": round(subset["거리(px)"].min(), 2), "1사분위(Q1)": round(Q1, 2), "중앙값(Median)": round(subset["거리(px)"].median(), 2), "3사분위(Q3)": round(Q3, 2), "최대값(Max)": round(subset["거리(px)"].max(), 2), "IQR": round(IQR, 2), "정상 하한값(Lower Bounds)": round(lo, 2), "정상 상한값(Upper Bounds)": round(hi, 2), "이상치 개수": len(outs)})
+            pd.DataFrame(stats_list).to_csv(final_save_dir / f"{dist_run_name}_statistics.csv", index=False, encoding="utf-8-sig")
+            if outliers_list: pd.concat(outliers_list, ignore_index=True).to_csv(final_save_dir / f"{dist_run_name}_outliers.csv", index=False, encoding="utf-8-sig")
+            
+        df_outliers_dict = pd.concat(outliers_list, ignore_index=True).to_dict() if outliers_list else {}
+        worker_logger.info(f"[Measure Worker] 측정 완료. 결과 건수: {len(df_export)}, 이상치: {len(outliers_list)}")
+        result.update({"success": True, "type": "result", "df_export": df_export.to_dict(), "df_parsed": df_parsed.to_dict(), "df_outliers": df_outliers_dict, "image_pairs": image_pairs})
+    except Exception: result["error"] = traceback.format_exc(); worker_logger.error("[Measure Worker] 에러 발생", exc_info=True)
+    finally: clear_vram(); queue.put(result)
+
+# =========================================================
+# QThread Wrappers (UI와 통신하기 위해 Process를 관장)
+# =========================================================
 class ProcessMonitorThread(QThread):
     finished_ok = pyqtSignal(dict); error = pyqtSignal(str)
-    def __init__(self, queue, process): super().__init__(); self.queue = queue; self.process = process
+    def __init__(self, queue, process, stop_event=None): super().__init__(); self.queue = queue; self.process = process; self.stop_event = stop_event
     def run(self):
         logger.debug(f"[Monitor Thread] 모니터링 시작 (PID: {self.process.pid})")
+        result = None
         while self.process.is_alive():
-            try: self.finished_ok.emit(self.queue.get(timeout=0.5)); logger.debug("[Monitor Thread] Worker 결과 수신 성공"); return
+            if self.stop_event and self.stop_event.is_set():
+                logger.warning("UI 쓰레드에서 중지 신호 감지 -> 워커 프로세스 강제 종료 시도")
+                kill_process_tree(self.process.pid); break
+            try: result = self.queue.get(timeout=0.5); break
             except qlib.Empty: continue
-        try: self.finished_ok.emit(self.queue.get(timeout=1.0))
-        except qlib.Empty:
-            if self.process.exitcode != 0: 
-                msg = f"프로세스 비정상 종료 (Exit Code: {self.process.exitcode})"
-                logger.error(msg)
-                self.error.emit(msg)
+        self.process.join(timeout=2)
+        if result is None:
+            try: result = self.queue.get(timeout=0.5)
+            except qlib.Empty: pass
+        if result: self.finished_ok.emit(result)
+        else: self.error.emit(f"프로세스 비정상 종료 (Exit Code: {self.process.exitcode})")
+
+class EvalThread(QThread):
+    finished_ok = pyqtSignal(pd.DataFrame, list, list, dict); error = pyqtSignal(str)
+    def __init__(self, config): super().__init__(); self.config = config
+    def run(self):
+        logger.info(f"[Eval Thread] QThread 시작 (Process 분리). 대상 모델: {self.config['eval_model_path']}")
+        run_queue = multiprocessing.Queue(); p = multiprocessing.Process(target=_eval_worker, args=(self.config, run_queue)); p.start()
+        res = None; stop_event = self.config.get("stop_event")
+        while p.is_alive():
+            if stop_event and stop_event.is_set(): kill_process_tree(p.pid); break
+            try: res = run_queue.get(timeout=0.5); break
+            except qlib.Empty: continue
+        p.join(timeout=2)
+        if not res and not run_queue.empty(): res = run_queue.get()
+        if res and res.get("success"): self.finished_ok.emit(pd.DataFrame(res["rows"]).sort_values("상태"), res["wrong_imgs"], res["all_imgs"], res["stats"])
+        else: self.error.emit(res.get("error") if res else "프로세스 강제 종료됨")
+
+class Tab4FinalEvalThread(QThread):
+    finished_ok = pyqtSignal(pd.DataFrame, list, list, dict, str); error = pyqtSignal(str)
+    def __init__(self, config): super().__init__(); self.config = config
+    def run(self):
+        logger.info("[Tab4FinalEval Thread] QThread 시작 (Process 분리)")
+        run_queue = multiprocessing.Queue(); p = multiprocessing.Process(target=_tab4_eval_worker, args=(self.config, run_queue)); p.start()
+        res = None; stop_event = self.config.get("stop_event")
+        while p.is_alive():
+            if stop_event and stop_event.is_set(): kill_process_tree(p.pid); break
+            try: res = run_queue.get(timeout=0.5); break
+            except qlib.Empty: continue
+        p.join(timeout=2)
+        if not res and not run_queue.empty(): res = run_queue.get()
+        if res and res.get("success"): self.finished_ok.emit(pd.DataFrame(res["rows"]).sort_values("상태"), res["wrong_imgs"], res["all_imgs"], res["stats"], res["pr_curve"])
+        else: self.error.emit(res.get("error") if res else "프로세스 강제 종료됨")
+
+class MeasureThread(QThread):
+    progress = pyqtSignal(int); finished_ok = pyqtSignal(pd.DataFrame, pd.DataFrame, pd.DataFrame, list); error = pyqtSignal(str)
+    def __init__(self, config): super().__init__(); self.config = config
+    def run(self):
+        logger.info("[Measure Thread] QThread 시작 (Process 분리)")
+        run_queue = multiprocessing.Queue(); p = multiprocessing.Process(target=_measure_worker, args=(self.config, run_queue)); p.start()
+        res = None; stop_event = self.config.get("stop_event")
+        while p.is_alive():
+            if stop_event and stop_event.is_set(): kill_process_tree(p.pid); break
+            try:
+                msg = run_queue.get(timeout=0.5)
+                if msg.get("type") == "progress": self.progress.emit(msg["val"])
+                elif msg.get("type") == "result": res = msg; break
+            except qlib.Empty: continue
+        p.join(timeout=2)
+        if not res and not run_queue.empty():
+            msg = run_queue.get()
+            if msg.get("type") == "result": res = msg
+        if res and res.get("success"): self.finished_ok.emit(pd.DataFrame(res["df_export"]), pd.DataFrame(res["df_parsed"]), pd.DataFrame(res["df_outliers"]), res["image_pairs"])
+        else: self.error.emit(res.get("error") if res else "프로세스 강제 종료됨")
 
 class PreprocessThread(QThread):
     progress = pyqtSignal(int); log_msg = pyqtSignal(str); finished_ok = pyqtSignal(int); error = pyqtSignal(str)
@@ -1119,175 +1477,9 @@ class PreprocessThread(QThread):
             logger.error("[Preprocess Thread] 치명적 오류 발생", exc_info=True)
             self.error.emit(traceback.format_exc())
 
-class EvalThread(QThread):
-    finished_ok = pyqtSignal(pd.DataFrame, list, list, dict); error = pyqtSignal(str)
-    def __init__(self, config): super().__init__(); self.config = config
-    def run(self):
-        logger.info(f"[Eval Thread] 평가 시작. 대상 모델: {self.config['eval_model_path']}")
-        try:
-            from ultralytics import YOLO
-            c = self.config; eval_project_dir = Path(c["workspace_dir"]) / "runs" / "eval"
-            relabel_dir = eval_project_dir / f"{c['eval_run_name']}_needs_relabel"
-            if c["save_relabel"]:
-                if relabel_dir.exists(): shutil.rmtree(relabel_dir)
-                relabel_dir.mkdir(parents=True, exist_ok=True)
-            model = YOLO(str(c["eval_model_path"]))
-            res = model.predict(source=str(c["eval_source"]), save=True, conf=c["eval_conf"], iou=c["eval_iou"], max_det=c["max_det"], project=str(eval_project_dir), name=c["eval_run_name"], agnostic_nms=c["agnostic_nms"], exist_ok=True)
-            def calc_iou(b1, b2):
-                ax1,ay1,ax2,ay2 = b1[0]-b1[2]/2, b1[1]-b1[3]/2, b1[0]+b1[2]/2, b1[1]+b1[3]/2
-                bx1,by1,bx2,by2 = b2[0]-b2[2]/2, b2[1]-b2[3]/2, b2[0]+b2[2]/2, b2[1]+b2[3]/2
-                ix, iy = max(0, min(ax2,bx2)-max(ax1,bx1)), max(0, min(ay2,by2)-max(ay1,by1))
-                ia = ix*iy; return ia/((ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-ia+1e-6)
-            rows, wrong, wrong_imgs, all_imgs = [], 0, [], []; total_tp, total_fp, total_fn = 0, 0, 0
-            for r in res:
-                img_name = Path(r.path).name; current_img_path = str(eval_project_dir / c["eval_run_name"] / img_name); all_imgs.append(current_img_path)
-                pred_boxes = [{"class": int(cls.item()), "box": b.tolist()} for cls, b in zip(r.boxes.cls, r.boxes.xywhn)] if len(r.boxes) > 0 else []
-                gt_boxes = []; txt = Path(c["gt_labels_path"]) / Path(img_name).with_suffix(".txt").name
-                if txt.exists():
-                    for line in txt.read_text().splitlines():
-                        parts = line.strip().split(); 
-                        if len(parts) == 5: gt_boxes.append({"class": int(parts[0]), "box": [float(x) for x in parts[1:]]})
-                matched_gt = set(); tp = fp = 0
-                for pb in pred_boxes:
-                    best_iou, best_gt = 0.0, -1
-                    for j, gb in enumerate(gt_boxes):
-                        if j not in matched_gt and pb["class"] == gb["class"]:
-                            iou = calc_iou(pb["box"], gb["box"])
-                            if iou > best_iou: best_iou, best_gt = iou, j
-                    if best_iou >= max(c.get("match_iou", 0.5), 0.5): tp += 1; matched_gt.add(best_gt)
-                    else: fp += 1
-                fn = len(gt_boxes) - len(matched_gt); total_tp += tp; total_fp += fp; total_fn += fn
-                correct = (fp == 0 and fn == 0); reasons = []
-                if fn > 0: reasons.append(f"미검 {fn}개")
-                if fp > 0: reasons.append(f"과검 {fp}개")
-                if not correct:
-                    wrong += 1; wrong_imgs.append(current_img_path)
-                    if c["save_relabel"]: shutil.copy(r.path, relabel_dir / img_name)
-                rows.append({"파일명": img_name, "상태": "✅ 정상" if correct else "❌ 오답", "예측 수": len(pred_boxes), "정답 수": len(gt_boxes), "사유": ", ".join(reasons) if reasons else "정확히 일치"})
-            precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-            recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-            f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-            stats = {"total": len(rows), "correct": len(rows) - wrong, "wrong": wrong, "acc": f1_score * 100, "precision": precision * 100, "recall": recall * 100, "f1_score": f1_score * 100, "relabel_dir": str(relabel_dir) if c["save_relabel"] else ""}
-            logger.info(f"[Eval Thread] 평가 완료. F1-Score: {f1_score*100:.2f}%, 오답: {wrong}건")
-            del model; clear_vram()
-            self.finished_ok.emit(pd.DataFrame(rows).sort_values("상태"), wrong_imgs, all_imgs, stats)
-        except Exception as e: 
-            logger.error("[Eval Thread] 에러 발생", exc_info=True)
-            self.error.emit(traceback.format_exc())
-
-class Tab4FinalEvalThread(QThread):
-    finished_ok = pyqtSignal(pd.DataFrame, list, list, dict, str); error = pyqtSignal(str)
-    def __init__(self, config): super().__init__(); self.config = config
-    def run(self):
-        logger.info("[Tab4FinalEval Thread] 재학습 모델 최종 평가 시작")
-        try:
-            from ultralytics import YOLO
-            c = self.config; model = YOLO(str(c["retrained_model"]))
-            val_metrics = model.val(data=str(c["yaml_path"]), conf=c["eval_conf"], iou=c["eval_iou"], max_det=c["max_det"], project=str(Path(c["workspace_dir"]) / "runs" / "eval"), name=c["eval_run_name"] + "_val")
-            pr_curve = str(Path(val_metrics.save_dir) / "PR_curve.png"); eval_config = c.copy(); eval_config["eval_model_path"] = c["retrained_model"]; eval_config["eval_run_name"] = c["eval_run_name"] + "_final_eval"; eval_config["save_relabel"] = False
-            del model; clear_vram(); eval_thread = EvalThread(eval_config)
-            eval_thread.finished_ok.connect(lambda df, imgs, a_imgs, st: self.finished_ok.emit(df, imgs, a_imgs, st, pr_curve))
-            eval_thread.error.connect(self.error.emit); eval_thread.run()
-        except Exception as e: 
-            logger.error("[Tab4FinalEval Thread] 에러 발생", exc_info=True)
-            self.error.emit(traceback.format_exc())
-
-class MeasureThread(QThread):
-    progress = pyqtSignal(int); log_msg = pyqtSignal(str); finished_ok = pyqtSignal(pd.DataFrame, pd.DataFrame, pd.DataFrame, list); error = pyqtSignal(str)
-    COLOR_MAP = {"노란색 (Yellow)": (0, 255, 255), "초록색 (Green)": (0, 255, 0), "빨간색 (Red)": (0, 0, 255), "파란색 (Blue)": (255, 0, 0), "청록색 (Cyan)": (255, 255, 0), "자주색 (Magenta)": (255, 0, 255), "흰색 (White)": (255, 255, 255)}
-    def __init__(self, config): super().__init__(); self.config = config
-    def run(self):
-        logger.info(f"[Measure Thread] 거리 측정 시작 (Method: {self.config['measure_method']})")
-        try:
-            from ultralytics import YOLO
-            c = self.config; dist_source = Path(c["dist_source"])
-            is_edge, is_knn = c["measure_method"] == "테두리 최단거리 (Edge)", c["measure_method"] == "가장 가까운 N개 이웃 (방향 무관)"
-            c1 = self.COLOR_MAP.get(c.get("color1", "노란색 (Yellow)"), (0, 255, 255)); c2 = self.COLOR_MAP.get(c.get("color2", "청록색 (Cyan)"), (255, 255, 0))
-            dist_run_name = "ok_edge_distance" if is_edge else "ok_knn_distance" if is_knn else "ok_euclidean_distance"
-            dist_col_name = "수평/수직 테두리 거리(px)" if is_edge else "최단 중심점 거리_N개(px)" if is_knn else "중심점 간 유클리드 거리(px)"
-            base_dir = Path(c["workspace_dir"]) / "runs" / "measure"; base_dir.mkdir(parents=True, exist_ok=True); folder_idx = 1
-            while (base_dir / f"{dist_run_name}_{folder_idx:02d}").exists(): folder_idx += 1
-            final_save_dir = base_dir / f"{dist_run_name}_{folder_idx:02d}"; final_save_dir.mkdir()
-            model = YOLO(str(c["dist_model_path"]))
-            img_files = [f for f in dist_source.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png")]; total_imgs = len(img_files)
-            results = model.predict(source=str(dist_source), save=False, conf=c["dist_conf"], iou=c["dist_iou"], max_det=c["dist_max_det"], agnostic_nms=c["dist_agnostic"], stream=True)
-            image_pairs = []; processed = 0
-            for r in results:
-                processed += 1; self.progress.emit(int(processed / max(total_imgs, 1) * 100))
-                if processed % 50 == 0: logger.debug(f"[Measure Thread] 처리 중: {processed}/{total_imgs}")
-                img_name = Path(r.path).name; result_img_path = final_save_dir / img_name
-                detected = [r.names[int(cls_id)].lower() for cls_id in r.boxes.cls]
-                if c["skip_ng"] and "ng" in detected: continue
-                num_objects = len(r.boxes)
-                if c["drop_odd_lowest"] and num_objects % 2 != 0 and num_objects > 0:
-                    r = r[[i for i in range(num_objects) if i != int(r.boxes.conf.argmin().item())]]
-                    num_objects = len(r.boxes)
-                plotted_img = r.plot(line_width=1, conf=False, labels=False); measured_distances = []; worst_conf = r.boxes.conf.min().item() if num_objects > 0 else 0.0
-                if num_objects >= 2:
-                    boxes = r.boxes.xyxy.cpu().numpy()
-                    for i, b1 in enumerate(boxes):
-                        min_x = min_y = float("inf"); r_pts = b_pts = None; r_dist = b_dist = 0
-                        cx1, cy1 = (b1[0] + b1[2]) / 2, (b1[1] + b1[3]) / 2; knn_cands = []
-                        for j, b2 in enumerate(boxes):
-                            if i == j: continue
-                            ox, oy = min(b1[2], b2[2]) - max(b1[0], b2[0]), min(b1[3], b2[3]) - max(b1[1], b2[1])
-                            cx2, cy2 = (b2[0] + b2[2]) / 2, (b2[1] + b2[3]) / 2; dist = math.sqrt((cx2 - cx1)**2 + (cy2 - cy1)**2)
-                            if is_knn: knn_cands.append((dist, (int(cx1), int(cy1)), (int(cx2), int(cy2))))
-                            elif is_edge:
-                                if oy > 0 and b2[0] >= b1[2] and (b2[0] - b1[2]) < min_x:
-                                    min_x = r_dist = b2[0] - b1[2]; y_cen = int((max(b1[1], b2[1]) + min(b1[3], b2[3])) / 2); r_pts = ((int(b1[2]), y_cen), (int(b2[0]), y_cen))
-                                if ox > 0 and b2[1] >= b1[3] and (b2[1] - b1[3]) < min_y:
-                                    min_y = b_dist = b2[1] - b1[3]; x_cen = int((max(b1[0], b2[0]) + min(b1[2], b2[2])) / 2); b_pts = ((x_cen, int(b1[3])), (x_cen, int(b2[1])))
-                            else:
-                                if oy > 0 and cx2 > cx1 and dist < min_x: min_x = r_dist = dist; r_pts = ((int(cx1), int(cy1)), (int(cx2), int(cy2)))
-                                if ox > 0 and cy2 > cy1 and dist < min_y: min_y = b_dist = dist; b_pts = ((int(cx1), int(cy1)), (int(cx2), int(cy2)))
-                        if is_knn:
-                            for d, pt1, pt2 in sorted(knn_cands, key=lambda x: x[0])[:c["n_neighbors"]]:
-                                cv2.line(plotted_img, pt1, pt2, c1, 2); cv2.putText(plotted_img, f"{d:.1f}", (int((pt1[0]+pt2[0])/2), int((pt1[1]+pt2[1])/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c1, 2); measured_distances.append(round(d, 1))
-                        else:
-                            if r_pts: cv2.line(plotted_img, r_pts[0], r_pts[1], c1, 2); cv2.putText(plotted_img, f"{r_dist:.1f}", (int((r_pts[0][0]+r_pts[1][0])/2), int((r_pts[0][1]+r_pts[1][1])/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c1, 2); measured_distances.append(round(r_dist, 1))
-                            if b_pts: cv2.line(plotted_img, b_pts[0], b_pts[1], c2, 2); cv2.putText(plotted_img, f"{b_dist:.1f}", (int((b_pts[0][0]+b_pts[1][0])/2), int((b_pts[0][1]+b_pts[1][1])/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c2, 2); measured_distances.append(round(b_dist, 1))
-                
-                # OpenCV 한글 경로 저장 문제 해결을 위해 imencode 사용
-                is_success, im_buf_arr = cv2.imencode(".jpg", plotted_img)
-                if is_success:
-                    im_buf_arr.tofile(str(result_img_path))
-                    
-                image_pairs.append({"파일명": img_name, "탐지 수": f"{num_objects}개", "최저 신뢰도": round(worst_conf, 2), dist_col_name: ", ".join([str(d) for d in sorted(list(set(measured_distances)))]) if measured_distances else "측정된 선 없음", "_img_path": str(result_img_path)})
-            
-            df_export = pd.DataFrame([{k:v for k,v in item.items() if k!="_img_path"} for item in image_pairs])
-            df_export.to_csv(final_save_dir / f"{dist_run_name}_results.csv", index=False, encoding="utf-8-sig")
-            thresholds = [float(x.strip()) for x in c["edge_thresholds"].split(",") if x.strip()] if is_edge else [60.0]
-            def get_cat(d, thr):
-                if d < thr[0]: return f"유형 1 ( < {thr[0]} )"
-                for i in range(len(thr)-1):
-                    if thr[i] <= d < thr[i+1]: return f"유형 {i+2} ( {thr[i]}~{thr[i+1]} )"
-                return f"유형 {len(thr)+1} ( >= {thr[-1]} )"
-            all_data = []
-            for _, row in df_export.iterrows():
-                dstr = str(row[dist_col_name])
-                if dstr != "nan" and "없음" not in dstr:
-                    for d in [float(x.strip()) for x in dstr.split(",")]: all_data.append({"파일명": row["파일명"], "구분": get_cat(d, thresholds) if is_edge else "유클리드", "거리(px)": d})
-            df_parsed = pd.DataFrame(all_data); outliers_list = []
-            if not df_parsed.empty:
-                stats_list = []  
-                for cat in df_parsed["구분"].unique():
-                    subset = df_parsed[df_parsed["구분"] == cat]
-                    Q1, Q3 = subset["거리(px)"].quantile(0.25), subset["거리(px)"].quantile(0.75); IQR = Q3 - Q1
-                    lo, hi = Q1 - 1.5*IQR, Q3 + 1.5*IQR
-                    outs = subset[(subset["거리(px)"] < lo) | (subset["거리(px)"] > hi)].copy()
-                    if not outs.empty: outs["하한"], outs["상한"] = round(lo, 2), round(hi, 2); outliers_list.append(outs)
-                    stats_list.append({"구분(유형)": cat, "데이터 수(Count)": len(subset), "평균(Mean)": round(subset["거리(px)"].mean(), 2), "표준편차(Std)": round(subset["거리(px)"].std(), 2) if len(subset) > 1 else 0.0, "최소값(Min)": round(subset["거리(px)"].min(), 2), "1사분위(Q1)": round(Q1, 2), "중앙값(Median)": round(subset["거리(px)"].median(), 2), "3사분위(Q3)": round(Q3, 2), "최대값(Max)": round(subset["거리(px)"].max(), 2), "IQR": round(IQR, 2), "정상 하한값(Lower Bounds)": round(lo, 2), "정상 상한값(Upper Bounds)": round(hi, 2), "이상치 개수": len(outs)})
-                pd.DataFrame(stats_list).to_csv(final_save_dir / f"{dist_run_name}_statistics.csv", index=False, encoding="utf-8-sig")
-                if outliers_list: pd.concat(outliers_list, ignore_index=True).to_csv(final_save_dir / f"{dist_run_name}_outliers.csv", index=False, encoding="utf-8-sig")
-            df_outliers = pd.concat(outliers_list, ignore_index=True) if outliers_list else pd.DataFrame()
-            del model; clear_vram(); 
-            logger.info(f"[Measure Thread] 측정 완료. 결과 건수: {len(df_export)}, 이상치: {len(df_outliers)}")
-            self.finished_ok.emit(df_export, df_parsed, df_outliers, image_pairs)
-        except Exception as e: 
-            logger.error("[Measure Thread] 에러 발생", exc_info=True)
-            self.error.emit(traceback.format_exc())
-
+# ==========================================
+# 기존 UI 클래스들 (LabelDialog, LabelingView 등)
+# ==========================================
 class LabelDialog(QDialog):
     def __init__(self, class_names, parent=None):
         super().__init__(parent); self.setWindowTitle("클래스 선택"); self.class_id = -1
@@ -1521,11 +1713,9 @@ class LabelingView(QGraphicsView):
         if idx < 0 or idx >= len(self.boxes): return False, "유효하지 않은 선택입니다."
         if not self.image_item or not hasattr(self, 'current_image_path'): return False, "이미지가 없습니다."
         
-        # OpenCV 한글 경로 읽기 문제 해결
         img_array = np.fromfile(str(self.current_image_path), np.uint8)
         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-        
-        if img is None: return False, "이미지를 읽을 수문을 읽을 수 없습니다."
+        if img is None: return False, "이미지를 읽을 수 없습니다."
         rect_item, _, class_id = self.boxes[idx]
         r = rect_item.rect(); x, y, w, h = int(r.x()), int(r.y()), int(r.width()), int(r.height())
         if w < 5 or h < 5 or x < 0 or y < 0 or x+w > img.shape[1] or y+h > img.shape[0]: return False, "크기/위치가 유효하지 않습니다."
@@ -1558,7 +1748,6 @@ class LabelingView(QGraphicsView):
     def save_all_templates(self):
         if not self.image_item or not hasattr(self, 'current_image_path'): return False
         
-        # OpenCV 한글 경로 읽기 문제 해결
         import cv2; import numpy as np
         img_array = np.fromfile(str(self.current_image_path), np.uint8)
         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
@@ -1575,7 +1764,6 @@ class LabelingView(QGraphicsView):
         if not hasattr(self, 'saved_templates') or not self.saved_templates: return False, "저장된 기준 객체가 없습니다."
         if not self.image_item or not hasattr(self, 'current_image_path'): return False, "이미지가 로드되지 않았습니다."
         
-        # OpenCV 한글 경로 읽기 문제 해결
         import cv2, numpy as np; 
         img_array = np.fromfile(str(self.current_image_path), np.uint8)
         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
@@ -1583,7 +1771,7 @@ class LabelingView(QGraphicsView):
         if img is None: return False, "이미지를 읽을 수 없습니다."
         self.save_state(); total_added = 0
         for tmpl_data in self.saved_templates:
-            template, class_id, w, h = tmpl_data['template'], class_id, tmpl_data['w'], tmpl_data['h']
+            template, class_id, w, h = tmpl_data['template'], tmpl_data['class_id'], tmpl_data['w'], tmpl_data['h']
             res = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
             loc = np.where(res >= threshold)
             cand_boxes, scores = [], []
@@ -2206,13 +2394,157 @@ class TuneHistoryDialog(QDialog):
         except Exception as e:
             layout.addWidget(QLabel(f"기록을 불러오는 중 오류 발생:\n{traceback.format_exc()}"))
 
+class IntegrityThread(QThread):
+    progress = pyqtSignal(int, str)
+    finished_ok = pyqtSignal(list)
+    error = pyqtSignal(str)
 
+    def __init__(self, img_dir, lbl_dir, num_classes):
+        super().__init__()
+        self.img_dir = Path(img_dir)
+        self.lbl_dir = Path(lbl_dir)
+        self.num_classes = num_classes
+
+    def run(self):
+        issues = []
+        try:
+            valid_exts = {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}
+            img_files = [f for f in self.img_dir.iterdir() if f.suffix.lower() in valid_exts]
+            lbl_files = [f for f in self.lbl_dir.iterdir() if f.suffix.lower() == ".txt"]
+
+            img_stems = {f.stem: f for f in img_files}
+            lbl_stems = {f.stem: f for f in lbl_files}
+
+            all_stems = set(img_stems.keys()).union(set(lbl_stems.keys()))
+            total = len(all_stems)
+            hashes = {}
+
+            for i, stem in enumerate(all_stems):
+                if total > 0:
+                    self.progress.emit(int((i / total) * 100), f"무결성 검사 중... ({i}/{total})")
+
+                # 1. 미스매치 검사
+                if stem not in img_stems:
+                    issues.append({"file": lbl_stems[stem].name, "type": "이미지 누락", "desc": "라벨은 있지만 짝이 되는 이미지 파일이 없습니다."})
+                    continue
+                if stem not in lbl_stems:
+                    issues.append({"file": img_stems[stem].name, "type": "라벨 누락", "desc": "이미지는 있지만 짝이 되는 라벨(.txt) 파일이 없습니다."})
+                    continue
+
+                img_path = img_stems[stem]
+                lbl_path = lbl_stems[stem]
+
+                # 2. 이미지 손상 및 중복(Hash) 검사
+                img = cv2.imread(str(img_path))
+                if img is None:
+                    issues.append({"file": img_path.name, "type": "이미지 손상", "desc": "이미지 파일을 읽을 수 없거나 깨졌습니다."})
+                    continue
+                else:
+                    # 초고속 dHash 생성 (8x8)
+                    resized = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (9, 8))
+                    diff = resized[:, 1:] > resized[:, :-1]
+                    dhash = sum([2 ** idx for (idx, v) in enumerate(diff.flatten()) if v])
+                    
+                    if dhash in hashes:
+                        issues.append({"file": img_path.name, "type": "이미지 중복", "desc": f"'{hashes[dhash]}' 파일과 이미지가 완벽히 동일합니다. (Data Leakage 위험)"})
+                    else:
+                        hashes[dhash] = img_path.name
+
+                # 3. 빈 라벨 검사
+                if lbl_path.stat().st_size == 0:
+                    issues.append({"file": lbl_path.name, "type": "빈 라벨", "desc": "라벨 파일이 0 바이트로 비어있습니다. (객체 없음)"})
+                    continue
+
+                lines = lbl_path.read_text(encoding="utf-8").strip().splitlines()
+                if not lines:
+                    issues.append({"file": lbl_path.name, "type": "빈 라벨", "desc": "라벨 파일 내부에 내용이 없습니다."})
+                    continue
+
+                # 4. Class ID 및 BBox 유효성 검사
+                for line_idx, line in enumerate(lines):
+                    parts = line.strip().split()
+                    if len(parts) != 5:
+                        issues.append({"file": lbl_path.name, "type": "포맷 오류", "desc": f"{line_idx+1}번째 줄: YOLO 포맷(값 5개)이 아닙니다."})
+                        continue
+
+                    try:
+                        cls_id = int(parts[0])
+                        x, y, w, h = map(float, parts[1:])
+
+                        if cls_id < 0 or cls_id >= self.num_classes:
+                            issues.append({"file": lbl_path.name, "type": "Class ID 범위 오류", "desc": f"{line_idx+1}번째 줄: ID({cls_id})가 설정된 클래스 범위를 벗어납니다."})
+
+                        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+                            issues.append({"file": lbl_path.name, "type": "범위 이탈 (Out-of-bounds)", "desc": f"{line_idx+1}번째 줄: 중심 좌표(x,y)가 0~1 범위를 벗어납니다."})
+
+                        if w <= 0.001 or h <= 0.001:
+                            issues.append({"file": lbl_path.name, "type": "극단적 BBox (Extreme)", "desc": f"{line_idx+1}번째 줄: BBox 너비나 높이가 너무 작습니다 (0.001 이하)."})
+                        elif w > 1.05 or h > 1.05:
+                            issues.append({"file": lbl_path.name, "type": "범위 이탈 (Out-of-bounds)", "desc": f"{line_idx+1}번째 줄: BBox 크기가 이미지 크기를 과도하게 벗어납니다."})
+
+                    except ValueError:
+                        issues.append({"file": lbl_path.name, "type": "값 오류", "desc": f"{line_idx+1}번째 줄: 문자가 섞여 있거나 숫자로 변환할 수 없습니다."})
+
+            self.progress.emit(100, "검사 완료")
+            self.finished_ok.emit(issues)
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+class IntegrityReportDialog(QDialog):
+    request_fix = pyqtSignal(str) # 이미지 수정을 위한 시그널
+
+    def __init__(self, issues, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🚨 데이터셋 무결성 검사 리포트")
+        self.resize(800, 500)
+        
+        layout = QVBoxLayout(self)
+        
+        lbl_info = QLabel(f"<b>총 {len(issues)}개의 잠재적 문제</b>가 발견되었습니다.<br>"
+                          "<span style='color: #d97706;'>💡 항목을 <b>더블클릭</b>하면 라벨링 툴로 자동 이동하여 바로 수정할 수 있습니다.</span>")
+        layout.addWidget(lbl_info)
+        
+        self.table = QTableWidget(len(issues), 3)
+        self.table.setHorizontalHeaderLabels(["파일명", "오류 유형", "상세 설명"])
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        
+        for i, issue in enumerate(issues):
+            self.table.setItem(i, 0, QTableWidgetItem(issue["file"]))
+            
+            type_item = QTableWidgetItem(issue["type"])
+            type_item.setForeground(QColor("#dc2626") if "오류" in issue["type"] or "누락" in issue["type"] or "손상" in issue["type"] else QColor("#b45309"))
+            type_item.setFont(QFont("Arial", 10, QFont.Bold))
+            self.table.setItem(i, 1, type_item)
+            
+            self.table.setItem(i, 2, QTableWidgetItem(issue["desc"]))
+            
+        self.table.itemDoubleClicked.connect(self.on_double_click)
+        layout.addWidget(self.table)
+        
+        btn_close = QPushButton("닫기")
+        btn_close.clicked.connect(self.accept)
+        btn_close.setMinimumHeight(40)
+        layout.addWidget(btn_close)
+
+    def on_double_click(self, item):
+        row = item.row()
+        file_name = self.table.item(row, 0).text()
+        self.request_fix.emit(file_name)
+        self.accept()
 # ==========================================
 # Main App
 # ==========================================
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle("YOLO Training Pipeline (PyQt5) - AutoML + Graceful Stop + Embed Webhooks"); self.resize(1400, 900)
+        super().__init__(); self.setWindowTitle("YOLO Training Pipeline (PyQt5) - AutoML + Graceful Stop + Embed Webhooks + VRAM Isolation"); self.resize(1400, 900)
         logger.info(f"YOLO Training Pipeline 애플리케이션 시작 (OS: {platform.system()}, GPU: {torch.cuda.is_available()})")
         self.base_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
         default_proj_path = self.base_dir / "MyProject"; self.config_manager = ConfigManager(str(default_proj_path)); self.config_builder = ConfigBuilder()
@@ -2228,7 +2560,7 @@ class MainWindow(QMainWindow):
         frame = frames[self.status_animation_frame % len(frames)]
         dots = "." * ((self.status_animation_frame % 3) + 1)
         self.status_animation_frame += 1
-        pid_info = f"[PID: {self.training_process.pid}] " if self.training_process else ""
+        pid_info = f"[PID: {self.training_process.pid}] " if self.training_process and self.training_process.is_alive() else ""
         self.statusBar().showMessage(f"{frame} {pid_info}{self.base_status_msg}{dots}")
 
     def start_dynamic_status(self, msg):
@@ -2267,10 +2599,19 @@ class MainWindow(QMainWindow):
         return True, None
 
     def closeEvent(self, event):
+        is_busy = (self.training_process and self.training_process.is_alive())
+        if is_busy:
+            reply = QMessageBox.warning(
+                self, "종료 경고", 
+                "현재 모델 학습 등 중요 작업이 진행 중입니다.\n지금 프로그램을 강제 종료하면 가중치 파일(.pt)이나 로그 데이터가 영구적으로 손상될 수 있습니다.\n\n먼저 [안전 종료] 버튼을 눌러 작업을 정상적으로 마친 후 창을 닫아주세요.\n\n그래도 무시하고 강제로 종료하시겠습니까?", 
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                event.ignore()
+                return
+
         logger.info("애플리케이션 종료 프로세스 시작")
         
-        # 1. 중복 알림 방지: 모니터링 스레드 시그널 연결 해제
-        # 워커가 종료되면서 던지는 시그널이 closeEvent의 동기 웹훅과 겹치지 않게 합니다.
         if hasattr(self, 'monitor_thread') and self.monitor_thread:
             try:
                 self.monitor_thread.finished_ok.disconnect()
@@ -2279,52 +2620,39 @@ class MainWindow(QMainWindow):
             except:
                 pass
 
-        # 2. 현재 백그라운드 작업(프로세스) 상태 확인
-        is_busy = (self.training_process and self.training_process.is_alive())
-        
-        # 3. 작업 중일 경우 '작업 취소' 웹훅 우선 전송 (동기 방식)
         if is_busy and self.webhook_url and self.noti_flags.get("task"):
-            # 현재 어떤 탭의 작업이 수행 중인지 버튼 활성화 상태로 유추
             task_name = "TASK"
-            if not self.t2_btn_run.isEnabled(): 
-                task_name = "K-FOLD TRAIN / AUTO ML"
-            elif not self.t4_btn_retrain.isEnabled(): 
-                task_name = "HARD RETRAIN"
-            elif not self.t1_btn_run.isEnabled():
-                task_name = "DATA PREPROCESS"
-            elif not self.t3_btn_run.isEnabled():
-                task_name = "EVALUATION"
-            elif not self.t5_btn_run.isEnabled():
-                task_name = "DISTANCE MEASURE"
+            if not self.t2_btn_run.isEnabled(): task_name = "K-FOLD TRAIN / AUTO ML"
+            elif not self.t4_btn_retrain.isEnabled(): task_name = "HARD RETRAIN"
+            elif not self.t1_btn_run.isEnabled(): task_name = "DATA PREPROCESS"
+            elif not self.t3_btn_run.isEnabled(): task_name = "EVALUATION"
+            elif not self.t5_btn_run.isEnabled(): task_name = "DISTANCE MEASURE"
 
             send_discord_webhook(
                 webhook_url=self.webhook_url,
                 title=f"🛑 [작업 중단] {task_name}",
                 description="사용자가 프로그램을 종료하여 진행 중인 작업이 즉시 중단되었습니다.",
-                color=0xf39c12, # 주황색
-                sync=True # 전송이 완료될 때까지 종료를 잠시 유보 (핵심)
+                color=0xf39c12, 
+                sync=True 
             )
 
-        # 4. 프로그램 전체 종료 알림 웹훅 전송 (동기 방식)
         if self.webhook_url:
             status_text = " (작업 중 종료)" if is_busy else " (정상 종료)"
             send_discord_webhook(
                 webhook_url=self.webhook_url,
                 title="⏹️ [프로그램 종료]",
                 description=f"YOLO 파이프라인 관리 도구가 종료되었습니다.{status_text}",
-                color=0x2c3e50, # 남색
+                color=0x2c3e50,
                 sync=True
             )
 
-        # 5. 백그라운드 프로세스(워커) 안전 종료 시도
         if is_busy:
-            self.stop_training() # stop_event.set() 호출
-            self.training_process.join(timeout=1.5) # 워커가 정리될 시간을 줌
+            self.stop_training()
+            self.training_process.join(timeout=1.5)
             if self.training_process.is_alive():
                 logger.warning("워커 프로세스가 응답하지 않아 강제 종료(Terminate)합니다.")
-                self.training_process.terminate()
+                kill_process_tree(self.training_process.pid)
 
-        # 6. 기타 UI 스레드(QThread) 정리
         for t_name in ["t1_thread", "t3_thread", "t4_thread", "t5_thread"]:
             if hasattr(self, t_name):
                 th = getattr(self, t_name)
@@ -2332,7 +2660,6 @@ class MainWindow(QMainWindow):
                     th.quit()
                     th.wait(1000)
 
-        # 7. QSettings에 현재 설정 저장 및 종료 수락
         self.settings.setValue("webhook_url", self.webhook_url)
         logger.info("애플리케이션 종료 완료")
         event.accept()
@@ -2410,9 +2737,7 @@ class MainWindow(QMainWindow):
         update_lbl()
 
     def add_param(self, form_layout, label_text, widget, default_val): lbl = QLabel(label_text); form_layout.addRow(lbl, widget); self.bind_default(widget, default_val, lbl)
-
     def _create_scroll(self, layout): w = QWidget(); w.setLayout(layout); scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(w); return scroll
-
     def _apply_table_style(self, table): table.setAlternatingRowColors(True); table.setEditTriggers(QTableWidget.NoEditTriggers); table.setSelectionBehavior(QTableWidget.SelectRows)
 
     def get_noti_flags(self):
@@ -2552,12 +2877,12 @@ class MainWindow(QMainWindow):
         if "batch" in t2: self.t2_batch.setValue(t2["batch"])
         if "workers" in t2: self.t2_workers.setValue(t2["workers"])
         if "patience" in t2: self.t2_patience.setValue(t2["patience"])
-        if "seed" in t2: self.t2_seed.setValue(t2["seed"])
         if "folds" in t2: self.t2_folds.setValue(t2["folds"])
         if "test_split" in t2: self.t2_test_split.setValue(t2["test_split"])
         if "lcls" in t2: self.t2_lcls.setValue(t2["lcls"])
         if "lbox" in t2: self.t2_lbox.setValue(t2["lbox"])
         if "ldfl" in t2: self.t2_ldfl.setValue(t2["ldfl"])
+        if "tune_iterations" in t2: self.t2_tune_iterations.setValue(t2["tune_iterations"])
         if "ah" in t2: self.t2_ah.setValue(t2["ah"])
         if "as" in t2: self.t2_as.setValue(t2["as"])
         if "av" in t2: self.t2_av.setValue(t2["av"])
@@ -2625,7 +2950,7 @@ class MainWindow(QMainWindow):
         self.training_process = multiprocessing.Process(target=worker_func, args=(args, self.train_queue))
         self.training_process.start()
         
-        self.monitor_thread = ProcessMonitorThread(self.train_queue, self.training_process)
+        self.monitor_thread = ProcessMonitorThread(self.train_queue, self.training_process, self.stop_event)
         self.monitor_thread.finished_ok.connect(self.on_training_finished)
         self.monitor_thread.error.connect(self.on_training_fatal_error)
         self.monitor_thread.start()
@@ -2664,12 +2989,10 @@ class MainWindow(QMainWindow):
         
         task_name = str(res.get('task', 'UNKNOWN')).upper()
         
-        # 사용자가 안전 종료 버튼을 눌렀는지 확인
         is_stopped_early = hasattr(self, 'stop_event') and self.stop_event.is_set()
 
         if res.get("success"):
             if is_stopped_early:
-                # 안전 종료 시의 웹훅 전송 (주황색)
                 if self.webhook_url and self.noti_flags.get("task"):
                     send_discord_webhook(
                         webhook_url=self.webhook_url,
@@ -2678,7 +3001,6 @@ class MainWindow(QMainWindow):
                         color=0xf39c12
                     )
             else:
-                # 일반적인 완료 시의 웹훅 전송 (초록색)
                 if self.webhook_url and self.noti_flags.get("task"):
                     send_discord_webhook(
                         webhook_url=self.webhook_url,
@@ -2732,16 +3054,13 @@ class MainWindow(QMainWindow):
                 if res.get("model_path"): 
                     self.t4_eval_model_display.setText(res["model_path"]); self.t4_btn_eval.setEnabled(True); self.statusBar().showMessage(f"✅ 재학습 모델 준비 완료: {Path(res['model_path']).name}")
         else: 
-            # 에러 또는 취소 처리 로직 분기
             error_msg = res.get("error", "알 수 없는 오류")
             
-            # 1. 사용자가 의도적으로 중단/취소한 경우 (에러가 아님)
             if "사용자에 의해" in error_msg or "취소" in error_msg:
                 if self.webhook_url and self.noti_flags.get("task"):
                     send_discord_webhook(self.webhook_url, f"🛑 [작업 취소] {task_name}", "사용자의 요청으로 작업이 안전하게 취소/중단되었습니다.", color=0xf39c12)
                 QMessageBox.information(self, "작업 취소 안내", error_msg)
                 
-            # 2. 진짜 에러가 발생한 경우
             else:
                 if self.webhook_url and self.noti_flags.get("task"):
                     send_discord_webhook(self.webhook_url, f"⚠️ [작업 실패] {task_name}", f"작업이 비정상 종료되었습니다.\n상세: {error_msg}", color=0xe74c3c)
@@ -2934,13 +3253,12 @@ class MainWindow(QMainWindow):
         if parent_dir.exists():
             self.w_base_ds.line_edit.setText(str(parent_dir)); self.w_proc_ds.line_edit.setText(str(parent_dir / "processed_dataset")); self.tabs.setCurrentIndex(1); self.statusBar().showMessage("➡️ 라벨링 완료!", 5000)
 
-    def browse_tab4_eval_model(self):
-        path, _ = QFileDialog.getOpenFileName(self, "평가할 YOLO 모델 선택", str(Path(self.w_work_ds.get_path()) / "runs" / "retrain_train"), "PyTorch Model (*.pt);;All Files (*)")
-        if path: self.t4_eval_model_display.setText(path); self.t4_btn_eval.setEnabled(True); self.t4_btn_auto_thr.setEnabled(True); self.statusBar().showMessage(f"📂 모델 로드됨: {Path(path).name}", 3000)
-
     def export_project_dialog(self):
         logger.info("프로젝트 압축(내보내기) 실행")
-        t3_model = self.t3_model.get_path(); t4_model = self.t4_eval_model_display.text(); has_base = t3_model and Path(t3_model).exists(); has_retrained = t4_model and Path(t4_model).exists()
+        t3_model = self.t3_model.get_path() if hasattr(self, 't3_model') else ""
+        t4_model = self.t4_eval_model_display.text() if hasattr(self, 't4_eval_model_display') else ""
+        has_base = bool(t3_model and Path(t3_model).exists())
+        has_retrained = bool(t4_model and Path(t4_model).exists())
         if not has_base and not has_retrained: QMessageBox.warning(self, "경고", "내보낼 모델이 없습니다."); return
         proj_name = Path(self.w_proj_root.get_path()).name; save_path, _ = QFileDialog.getSaveFileName(self, "프로젝트 내보내기 (Zip)", f"{proj_name}.zip", "Zip Files (*.zip)")
         if not save_path: return
@@ -2972,44 +3290,7 @@ class MainWindow(QMainWindow):
                 resolved_target = Path(target_dir).resolve()
                 for member in zf.infolist():
                     member_path = Path(target_dir / member.filename).resolve()
-                    if not member_path.is_relative_to(resolved_target):
-                        raise PermissionError(f"보안 경고: 압축 파일이 지정된 경로를 벗어나려고 합니다! ({member.filename})")
-                zf.extractall(target_dir)
-
-            config_file = target_dir / "config.json"; config_data = {}
-            if config_file.exists():
-                with open(config_file, 'r', encoding='utf-8') as f: config_data = json.load(f).get("config", {})
-            self.w_proj_root.line_edit.setText(str(new_proj_path)); self.apply_loaded_config(config_data)
-            legacy_model, base_model, retrained_model = target_dir / "model.pt", target_dir / "base_model.pt", target_dir / "retrained_model.pt"
-            if base_model.exists() or legacy_model.exists():
-                model_path_str = str((base_model if base_model.exists() else legacy_model).resolve()); self.t3_model.line_edit.setText(model_path_str); self.t4_base.line_edit.setText(model_path_str); self.t5_model.line_edit.setText(model_path_str)
-            if retrained_model.exists(): retrained_path_str = str(retrained_model.resolve()); self.t4_eval_model_display.setText(retrained_path_str); self.t4_btn_eval.setEnabled(True); self.t4_btn_auto_thr.setEnabled(True); self.t5_model.line_edit.setText(retrained_path_str)
-            self.config_manager.update_workspace_path(str(new_proj_path / "workspace"))
-            QApplication.restoreOverrideCursor()
-            logger.info(f"프로젝트 불러오기 완료: {new_proj_path}")
-            if is_renamed: 
-                QMessageBox.warning(self, "⚠️ 이름 변경", f"기존에 '{original_name}' 폴더가 존재하여 이름이 변경되었습니다!\n새 폴더명: {new_proj_path.name}"); self.statusBar().showMessage(f"⚠️ 폴더 이름 변경됨: {new_proj_path.name} 로 복구 완료", 7000)
-            else: 
-                QMessageBox.information(self, "✅ 불러오기 완료", f"루트: {new_proj_path.name}\n모든 경로가 연동되었습니다."); self.statusBar().showMessage(f"✅ 프로젝트 불러오기 완료: {new_proj_path.name}", 5000)
-        except Exception as e: 
-            logger.error(f"프로젝트 불러오기 중 에러: {e}", exc_info=True)
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "❌ 오류", f"오류 발생:\n{e}"); self.statusBar().clearMessage()
-            
-    def import_project_dialog(self):
-        logger.info("프로젝트 복구(불러오기) 실행")
-        load_path, _ = QFileDialog.getOpenFileName(self, "프로젝트 불러오기 (Zip)", "", "Zip Files (*.zip)")
-        if not load_path: return
-        import_name = Path(load_path).stem; current_root_parent = Path(self.w_proj_root.get_path()).parent; new_proj_path = current_root_parent / import_name; is_renamed = False; original_name = new_proj_path.name; counter = 1
-        while new_proj_path.exists(): is_renamed = True; new_proj_path = current_root_parent / f"{import_name}_{counter}"; counter += 1
-        new_proj_path.mkdir(parents=True, exist_ok=True); target_dir = new_proj_path / "workspace" / f"Imported_{import_name}"; target_dir.mkdir(parents=True, exist_ok=True)
-        self.statusBar().showMessage(f"📥 '{new_proj_path.name}' 프로젝트를 구성하는 중..."); QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            with zipfile.ZipFile(load_path, 'r') as zf:
-                resolved_target = Path(target_dir).resolve()
-                for member in zf.infolist():
-                    member_path = Path(target_dir / member.filename).resolve()
-                    if not member_path.is_relative_to(resolved_target):
+                    if not str(member_path).startswith(str(resolved_target)):
                         raise PermissionError(f"보안 경고: 압축 파일이 지정된 경로를 벗어나려고 합니다! ({member.filename})")
                 zf.extractall(target_dir)
 
@@ -3052,9 +3333,9 @@ class MainWindow(QMainWindow):
         self.t1_btn_run = QPushButton("🚀 전처리 시작"); self.t1_btn_run.clicked.connect(self.run_tab1); self.t1_progress = QProgressBar(); self.t1_log = QTextEdit(); self.t1_log.setReadOnly(True); self.t1_img_grid = ImageGridWidget(max_display=100)
         split = QSplitter(Qt.Horizontal); left_w = QWidget(); left_l = QVBoxLayout(left_w); left_l.addWidget(self._create_scroll(form))
         
-        h_t1_btns = QHBoxLayout(); h_t1_btns.addWidget(self.t1_btn_run)
         self.t1_btn_reset = QPushButton("🔄 이 탭 초기화"); self.t1_btn_reset.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 5px; border-radius: 4px;")
-        self.t1_btn_reset.clicked.connect(lambda _, w=left_w: self.reset_tab_defaults(w, "데이터 전처리")); h_t1_btns.addWidget(self.t1_btn_reset)
+        self.t1_btn_reset.clicked.connect(lambda _, w=left_w: self.reset_tab_defaults(w, "데이터 전처리"))
+        h_t1_btns = QHBoxLayout(); h_t1_btns.addWidget(self.t1_btn_run); h_t1_btns.addWidget(self.t1_btn_reset)
         left_l.addLayout(h_t1_btns); left_l.addWidget(self.t1_progress); left_l.addWidget(self.t1_log)
         
         right_w = QWidget(); right_l = QVBoxLayout(right_w); right_l.addWidget(QLabel("<b>전처리 결과 이미지 미리보기</b>")); right_l.addWidget(self.t1_img_grid)
@@ -3100,10 +3381,8 @@ class MainWindow(QMainWindow):
         self.t2_batch = QSpinBox(); self.t2_batch.setRange(1, 256); self.t2_batch.setValue(d['batch'])
         self.t2_workers = QSpinBox(); self.t2_workers.setRange(0, 32); self.t2_workers.setValue(d['workers'])
         self.t2_patience = QSpinBox(); self.t2_patience.setRange(0, 10000); self.t2_patience.setValue(d['patience'])
-        self.t2_seed = QSpinBox(); self.t2_seed.setRange(0, 999999); self.t2_seed.setValue(d['seed'])
         self.t2_folds = QSpinBox(); self.t2_folds.setRange(1, 10); self.t2_folds.setValue(d['folds'])
         self.t2_test_split = QDoubleSpinBox(); self.t2_test_split.setRange(0.05, 0.6); self.t2_test_split.setValue(d['test_split']); self.t2_test_split.setSingleStep(0.05)
-        
         self.t2_lcls = QDoubleSpinBox(); self.t2_lcls.setRange(0.1, 10.0); self.t2_lcls.setValue(d['lcls']); self.t2_lcls.setSingleStep(0.1)
         self.t2_lbox = QDoubleSpinBox(); self.t2_lbox.setRange(0.1, 20.0); self.t2_lbox.setValue(d['lbox']); self.t2_lbox.setSingleStep(0.5)
         self.t2_ldfl = QDoubleSpinBox(); self.t2_ldfl.setRange(0.1, 10.0); self.t2_ldfl.setValue(d['ldfl']); self.t2_ldfl.setSingleStep(0.1)
@@ -3120,7 +3399,7 @@ class MainWindow(QMainWindow):
         h_form = QHBoxLayout(); f_left = QFormLayout(); f_right = QFormLayout()
 
         f_left.addRow(QLabel("<b>[기본 파라미터]</b>"))
-        self.add_param(f_left, "Epochs", self.t2_epochs, d['epochs']); self.add_param(f_left, "Batch", self.t2_batch, d['batch']); self.add_param(f_left, "Workers", self.t2_workers, d['workers']); self.add_param(f_left, "Patience (조기 종료)", self.t2_patience, d['patience']); self.add_param(f_left, "Random Seed", self.t2_seed, d['seed']); self.add_param(f_left, "Fold 수", self.t2_folds, d['folds']); self.add_param(f_left, "Test 분리 비율", self.t2_test_split, d['test_split'])
+        self.add_param(f_left, "Epochs", self.t2_epochs, d['epochs']); self.add_param(f_left, "Batch", self.t2_batch, d['batch']); self.add_param(f_left, "Workers", self.t2_workers, d['workers']); self.add_param(f_left, "Patience (조기 종료)", self.t2_patience, d['patience']); self.add_param(f_left, "Fold 수", self.t2_folds, d['folds']); self.add_param(f_left, "Test 분리 비율", self.t2_test_split, d['test_split'])
         f_left.addRow(QLabel("<br><b>[Loss 가중치]</b>"))
         self.add_param(f_left, "cls", self.t2_lcls, d['lcls']); self.add_param(f_left, "box", self.t2_lbox, d['lbox']); self.add_param(f_left, "dfl", self.t2_ldfl, d['ldfl'])
         f_left.addRow(QLabel("<br><b>[Auto ML 최적화]</b>"))
@@ -3139,10 +3418,12 @@ class MainWindow(QMainWindow):
         self.btn_show_tune_history = QPushButton("📈 AutoML 튜닝 기록 그래프 보기")
         self.btn_show_tune_history.setStyleSheet("background-color: #fce7f3; border: 1px solid #fbcfe8; padding: 8px; font-weight: bold; color: #9d174d;")
         self.btn_show_tune_history.clicked.connect(self.show_tune_history)
-        
+        self.t2_btn_check_integrity = QPushButton("🚨 데이터셋 무결성 검사")
+        self.t2_btn_check_integrity.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 8px; font-weight: bold; color: #991b1b;")
+        self.t2_btn_check_integrity.clicked.connect(self.run_integrity_check)
         h_tune.addWidget(self.t2_btn_tune)
         h_tune.addWidget(self.btn_show_tune_history)
-        
+        h_tune.addWidget(self.t2_btn_check_integrity)
         self.t2_btn_run = QPushButton("🚀 K-Fold 학습 시작"); self.t2_btn_run.clicked.connect(self.run_tab2)
         
         self.t2_btn_stop = QPushButton("🛑 안전 종료(Graceful Stop)"); self.t2_btn_stop.clicked.connect(self.stop_training); self.t2_btn_stop.setEnabled(False)
@@ -3156,7 +3437,75 @@ class MainWindow(QMainWindow):
         h = QHBoxLayout(); h.addWidget(self.t2_btn_run); h.addWidget(self.t2_btn_stop); h.addWidget(self.t2_btn_reset); l.addLayout(h)
         
         tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "🏋️ K-Fold 학습")
+    def run_integrity_check(self):
+        logger.info("데이터셋 무결성 검사 실행")
+        proc_dir = Path(self.w_proc_ds.get_path())
+        is_valid, err = self.validate_paths(처리된_데이터_dir=proc_dir, 이미지_dir=proc_dir/"images", 라벨_dir=proc_dir/"labels")
+        if not is_valid: 
+            QMessageBox.warning(self, "경로 오류", err)
+            return
+            
+        success, cmap_or_error = self.parse_and_validate_class_map(self.t1_class_map.toPlainText())
+        if not success: 
+            QMessageBox.warning(self, "클래스 매핑 오류", cmap_or_error)
+            return
 
+        self.t2_btn_check_integrity.setEnabled(False)
+        self.statusBar().showMessage("🔍 데이터셋 무결성을 검사하는 중입니다...")
+        
+        from PyQt5.QtWidgets import QProgressDialog
+        self.integrity_progress = QProgressDialog("무결성 검사 진행 중...", "취소", 0, 100, self)
+        self.integrity_progress.setWindowTitle("Integrity Check")
+        self.integrity_progress.setWindowModality(Qt.WindowModal)
+        self.integrity_progress.setAutoClose(True)
+        
+        self.integrity_thread = IntegrityThread(img_dir=proc_dir/"images", lbl_dir=proc_dir/"labels", num_classes=len(cmap_or_error))
+        self.integrity_thread.progress.connect(lambda val, msg: (self.integrity_progress.setValue(val), self.integrity_progress.setLabelText(msg)))
+        self.integrity_thread.finished_ok.connect(self.on_integrity_finished)
+        self.integrity_thread.error.connect(lambda e: self.on_thread_error("무결성 검사", e))
+        self.integrity_thread.finished.connect(lambda: self.t2_btn_check_integrity.setEnabled(True))
+        
+        self.integrity_progress.canceled.connect(self.integrity_thread.terminate)
+        self.integrity_thread.start()
+
+    def on_integrity_finished(self, issues):
+        self.statusBar().clearMessage()
+        if not issues:
+            QMessageBox.information(self, "검사 통과", "🎉 발견된 문제가 없습니다! 데이터가 완벽하게 준비되었습니다.")
+            return
+            
+        dialog = IntegrityReportDialog(issues, self)
+        dialog.request_fix.connect(self.navigate_to_labeling_for_fix)
+        dialog.exec_()
+
+    def load_labeling_images_programmatic(self, img_dir_path):
+        """다이얼로그 없이 코드로 특정 경로의 이미지를 Tab6 리스트에 강제 로드"""
+        target_dir = Path(img_dir_path)
+        valid_exts = {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}
+        self.t6_list.clear()
+        if target_dir.exists():
+            for f in sorted(target_dir.iterdir()):
+                if f.suffix.lower() in valid_exts:
+                    self.t6_list.addItem(f.name)
+
+    def navigate_to_labeling_for_fix(self, file_name):
+        logger.info(f"오류 수정을 위해 라벨링 툴로 자동 이동 요청됨: {file_name}")
+        target_stem = Path(file_name).stem
+        self.tabs.setCurrentIndex(0)
+        proc_dir = Path(self.w_proc_ds.get_path())
+        self.t6_img_dir.line_edit.setText(str(proc_dir / "images"))
+        self.t6_lbl_dir.line_edit.setText(str(proc_dir / "labels"))
+        self.load_labeling_images_programmatic(proc_dir / "images")
+        items = self.t6_list.findItems(file_name, Qt.MatchExactly)
+        if not items:
+            items = self.t6_list.findItems(target_stem, Qt.MatchContains)
+            
+        if items:
+            self.t6_list.setCurrentItem(items[0])
+            self.on_label_image_selected(items[0])
+            self.statusBar().showMessage(f"🛠️ '{file_name}' 데이터를 수정할 준비가 되었습니다.", 5000)
+        else:
+            QMessageBox.warning(self, "파일 탐색 실패", f"라벨링 목록에서 '{file_name}' 이미지를 찾을 수 없습니다.")
     def show_tune_history(self):
         history_path = Path(self.w_work_ds.get_path()) / "runs" / "tune_custom" / "tune_history.csv"
         if not history_path.exists():
@@ -3181,7 +3530,7 @@ class MainWindow(QMainWindow):
             "model_name": self.g_model.currentText(), "epochs": self.t2_epochs.value(), 
             "iterations": self.t2_tune_iterations.value(), "batch": self.t2_batch.value(), 
             "workers": self.t2_workers.value(), "class_names": list(cmap_or_error.keys()), 
-            "initial_params": initial_params, "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value(), 
+            "initial_params": initial_params, "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value() if hasattr(self, 't3_match_iou') else 0.5, 
             "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags(),
             "tune_epochs": 30, "tune_patience": 5
         }
@@ -3197,7 +3546,7 @@ class MainWindow(QMainWindow):
             if QMessageBox.question(self, '확인', 'Fold 수가 1입니다. 단일 분할 학습으로 진행하시겠습니까?', QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.No: return
         success, cmap_or_error = self.parse_and_validate_class_map(self.t1_class_map.toPlainText())
         if not success: QMessageBox.warning(self, "클래스 매핑 오류", cmap_or_error); return
-        args = {"processed_dir": self.w_proc_ds.get_path(), "workspace_dir": self.w_work_ds.get_path(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags(), "model_name": self.g_model.currentText(), "imgsz": int(self.g_imgsz.currentText()), "epochs": self.t2_epochs.value(), "batch": self.t2_batch.value(), "workers": self.t2_workers.value(), "patience": self.t2_patience.value(), "random_seed": self.t2_seed.value(), "deterministic": False, "num_folds": self.t2_folds.value(), "test_split": self.t2_test_split.value(), "best_metric": "metrics/mAP50-95(B)", "second_metric": "metrics/mAP50(B)", "class_names": list(cmap_or_error.keys()), "aug": {"hsv_h": self.t2_ah.value(), "hsv_s": self.t2_as.value(), "hsv_v": self.t2_av.value(), "degrees": self.t2_adeg.value(), "translate": self.t2_atrans.value(), "scale": self.t2_ascale.value(), "shear": self.t2_ashear.value(), "flipud": self.t2_afud.value(), "fliplr": self.t2_aflr.value(), "mosaic": self.t2_amos.value(), "mixup": self.t2_amix.value(), "copy_paste": self.t2_acp.value()}, "loss": {"cls": self.t2_lcls.value(), "box": self.t2_lbox.value(), "dfl": self.t2_ldfl.value()}, "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value()}
+        args = {"processed_dir": self.w_proc_ds.get_path(), "workspace_dir": self.w_work_ds.get_path(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags(), "model_name": self.g_model.currentText(), "imgsz": int(self.g_imgsz.currentText()), "epochs": self.t2_epochs.value(), "batch": self.t2_batch.value(), "workers": self.t2_workers.value(), "patience": self.t2_patience.value(), "deterministic": False, "num_folds": self.t2_folds.value(), "test_split": self.t2_test_split.value(), "best_metric": "metrics/mAP50-95(B)", "second_metric": "metrics/mAP50(B)", "class_names": list(cmap_or_error.keys()), "aug": {"hsv_h": self.t2_ah.value(), "hsv_s": self.t2_as.value(), "hsv_v": self.t2_av.value(), "degrees": self.t2_adeg.value(), "translate": self.t2_atrans.value(), "scale": self.t2_ascale.value(), "shear": self.t2_ashear.value(), "flipud": self.t2_afud.value(), "fliplr": self.t2_aflr.value(), "mosaic": self.t2_amos.value(), "mixup": self.t2_amix.value(), "copy_paste": self.t2_acp.value()}, "loss": {"cls": self.t2_lcls.value(), "box": self.t2_lbox.value(), "dfl": self.t2_ldfl.value()}, "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value() if hasattr(self, 't3_match_iou') else 0.5}
         self.start_training_process(_kfold_train_worker, args)
 
     def setup_tab3(self):
@@ -3351,7 +3700,7 @@ class MainWindow(QMainWindow):
         eval_layout.addLayout(h_eval_btns)
         
         self.btn_send_t4_to_t5 = QPushButton("➡️ 이 모델과 설정으로 거리 측정"); self.btn_send_t4_to_t5.setStyleSheet("background-color: #dbeafe; font-weight: bold; color: #1e3a8a;"); self.btn_send_t4_to_t5.clicked.connect(lambda: self.send_to_measure_tab(self.t4_eval_model_display.text(), self.t3_img.get_path(), self.t4_conf.value(), self.t4_iou.value(), self.t4_max_det.value(), self.t4_agnostic.isChecked())); eval_layout.addWidget(self.btn_send_t4_to_t5); st2_layout.addWidget(eval_group)
-        self.t4_table = QTableWidget(0, 5); self.t4_table.setHorizontalHeaderLabels(["파일명", "상태", "예 예측 수", "정답 수", "사유"]); self._apply_table_style(self.t4_table); header = self.t4_table.horizontalHeader()
+        self.t4_table = QTableWidget(0, 5); self.t4_table.setHorizontalHeaderLabels(["파일명", "상태", "예측 수", "정답 수", "사유"]); self._apply_table_style(self.t4_table); header = self.t4_table.horizontalHeader()
         for i in range(self.t4_table.columnCount()): header.setSectionResizeMode(i, QHeaderView.Stretch)
         self.t4_table.setSortingEnabled(True); self.t4_table.itemDoubleClicked.connect(self.on_t4_table_double_clicked); st2_layout.addWidget(QLabel("<b>전체 데이터 최종 평가 결과</b>")); st2_layout.addWidget(self.t4_table)
         sub_tabs.addTab(sub_tab1, "⚙️ 1. 재학습 설정 및 실행"); sub_tabs.addTab(sub_tab2, "📊 2. 재학습 모델 최종 평가"); main_split.addWidget(left_widget)
@@ -3359,7 +3708,24 @@ class MainWindow(QMainWindow):
         right_widget = QWidget(); right_layout = QVBoxLayout(right_widget); right_layout.setContentsMargins(10, 0, 0, 0); self.t4_chk_show_all = QCheckBox("전체 평가 이미지 보기"); self.t4_chk_show_all.setEnabled(False); self.t4_chk_show_all.stateChanged.connect(self.update_tab4_visualization)
         r_header = QHBoxLayout(); r_header.addWidget(QLabel("<b>최종 예측 결과 시각화</b>")); r_header.addStretch(1); r_header.addWidget(self.t4_chk_show_all); self.t4_img_grid = ImageGridWidget(max_display=100); right_layout.addLayout(r_header); right_layout.addWidget(self.t4_img_grid)
         main_split.addWidget(right_widget); main_split.setSizes([600, 800]); tab_layout = QVBoxLayout(); tab_layout.addWidget(main_split); tab = QWidget(); tab.setLayout(tab_layout); self.tabs.addTab(tab, "🔁 재학습")
-
+    def browse_tab4_eval_model(self):
+        """Tab 4에서 평가할 재학습 모델(.pt)을 선택하는 탐색창을 엽니다."""
+        # 기본 탐색 경로는 워크스페이스(workspace) 폴더로 설정
+        default_dir = str(Path(self.w_work_ds.get_path()))
+        
+        path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "평가 대상 모델 선택", 
+            default_dir, 
+            "PyTorch Model (*.pt);;All Files (*)"
+        )
+        
+        if path:
+            self.t4_eval_model_display.setText(path)
+            # 모델이 선택되었으므로 평가 관련 버튼들 활성화
+            self.t4_btn_eval.setEnabled(True)
+            self.t4_btn_auto_thr.setEnabled(True)
+            self.statusBar().showMessage(f"✅ 평가할 재학습 모델이 선택되었습니다: {Path(path).name}", 5000)
     def run_tab4_auto_threshold(self):
         logger.info("재학습 모델 최적 스레숄드 자동 탐색 실행 시작")
         if self.training_process and self.training_process.is_alive(): 
@@ -3380,7 +3746,7 @@ class MainWindow(QMainWindow):
                '- 방식: 1차 넓은 범위 탐색 후 최적점 근처 2차 정밀 탐색\n\n'
                '주의: 평가용 데이터셋이 너무 적으면 오버피팅될 수 있으므로 주의하세요.\n\n'
                '진행하시겠습니까?')
-               
+                
         if QMessageBox.question(self, '스레숄드 탐색', msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
         
         args = {"model_path": model_path, "img_dir": self.t3_img.get_path(), "lbl_dir": self.t3_lbl.get_path(), "match_iou": self.t4_match_iou.value(), "agnostic": self.t4_agnostic.isChecked(), "max_det": self.t4_max_det.value()}
@@ -3393,7 +3759,7 @@ class MainWindow(QMainWindow):
         if not is_valid: QMessageBox.warning(self, "경로 오류", err); return
         success, cmap_or_error = self.parse_and_validate_class_map(self.t1_class_map.toPlainText())
         if not success: QMessageBox.warning(self, "오류", cmap_or_error); return
-        args = {"rt_hard_dir": self.t4_hard.get_path(), "rt_orig_labels": self.t4_orig.get_path(), "rt_base_model": self.t4_base.get_path(), "workspace_dir": self.w_work_ds.get_path(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags(), "imgsz": int(self.g_imgsz.currentText()), "class_names": list(cmap_or_error.keys()), "rt_epochs": self.t4_epochs.value(), "rt_batch": self.t4_batch.value(), "rt_run_name": self.t4_run.text(), "rt_cls": self.t4_lcls.value(), "rt_box": self.t4_lbox.value(), "rt_flipud": self.t4_afud.value(), "rt_fliplr": self.t4_aflr.value(), "rt_mosaic": self.t4_amos.value(), "rt_h": self.t4_ah.value(), "rt_s": self.t4_as.value(), "rt_v": self.t4_av.value(), "rt_mix": self.t4_amix.value(), "rt_cp": self.t4_acp.value(), "eval_img_dir": self.t3_img.get_path(), "eval_lbl_dir": self.t3_lbl.get_path(), "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value()}
+        args = {"rt_hard_dir": self.t4_hard.get_path(), "rt_orig_labels": self.t4_orig.get_path(), "rt_base_model": self.t4_base.get_path(), "workspace_dir": self.w_work_ds.get_path(), "webhook_url": self.webhook_url, "noti_flags": self.get_noti_flags(), "imgsz": int(self.g_imgsz.currentText()), "class_names": list(cmap_or_error.keys()), "rt_epochs": self.t4_epochs.value(), "rt_batch": self.t4_batch.value(), "rt_run_name": self.t4_run.text(), "rt_cls": self.t4_lcls.value(), "rt_box": self.t4_lbox.value(), "rt_flipud": self.t4_afud.value(), "rt_fliplr": self.t4_aflr.value(), "rt_mosaic": self.t4_amos.value(), "rt_h": self.t4_ah.value(), "rt_s": self.t4_as.value(), "rt_v": self.t4_av.value(), "rt_mix": self.t4_amix.value(), "rt_cp": self.t4_acp.value(), "eval_img_dir": self.t3_img.get_path(), "eval_lbl_dir": self.t3_lbl.get_path(), "match_iou": getattr(self, 't3_match_iou', QDoubleSpinBox()).value() if hasattr(self, 't3_match_iou') else 0.5}
         self.t4_btn_eval.setEnabled(False); self.start_training_process(_retrain_worker, args)
 
     def run_tab4_eval(self):
@@ -3436,7 +3802,7 @@ class MainWindow(QMainWindow):
     def on_tab4_eval_finished(self, df, wrong_imgs, all_imgs, stats, pr_curve):
         self.t4_last_wrong_imgs = wrong_imgs; self.t4_last_all_imgs = all_imgs; self.t4_table.setSortingEnabled(False); self.t4_table.setRowCount(len(df))     
         for i, row in df.iterrows():
-            self.t4_table.setItem(i, 0, QTableWidgetItem(str(row["파일명"]))); self.t4_table.setItem(i, 1, QTableWidgetItem(str(row["상태"]))); self.t4_table.setItem(i, 2, QTableWidgetItem(str(row["예 예측 수"]))); self.t4_table.setItem(i, 3, QTableWidgetItem(str(row["정답 수"]))); self.t4_table.setItem(i, 4, QTableWidgetItem(str(row["사유"])))
+            self.t4_table.setItem(i, 0, QTableWidgetItem(str(row["파일명"]))); self.t4_table.setItem(i, 1, QTableWidgetItem(str(row["상태"]))); self.t4_table.setItem(i, 2, QTableWidgetItem(str(row["예측 수"]))); self.t4_table.setItem(i, 3, QTableWidgetItem(str(row["정답 수"]))); self.t4_table.setItem(i, 4, QTableWidgetItem(str(row["사유"])))
             for col in range(5): self.t4_table.item(i, col).setTextAlignment(Qt.AlignCenter)
         self.t4_table.setSortingEnabled(True); self.t4_chk_show_all.setEnabled(True); self.t4_chk_show_all.blockSignals(True); self.t4_chk_show_all.setChecked(False); self.t4_chk_show_all.blockSignals(False); self.update_tab4_visualization()
         
@@ -3558,6 +3924,7 @@ class MainWindow(QMainWindow):
                 outlier_files = set(self.t5_last_df_outliers["파일명"].tolist())
                 self.t5_img_grid.update_images([item["_img_path"] for item in self.t5_last_image_pairs if item["파일명"] in outlier_files])
         else: self.t5_img_grid.update_images([item["_img_path"] for item in self.t5_last_image_pairs])
+
 if __name__ == '__main__':
     multiprocessing.freeze_support()
     try:

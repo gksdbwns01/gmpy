@@ -69,9 +69,15 @@ refactor: 파이프라인 코어 안정성 대폭 개선 및 메모리/프로세
 -안전 종료 시 psutil을 활용해 좀비 자식 프로세스까지 추적하여 OS 레벨에서 완벽 사살(kill)
 -LogDatabase에 큐(Queue) 기반 단일 쓰기 전용 스레드를 도입하여 SQLite 'database is locked' 에러 원천 차단
 -설정 파일 로드 시 재귀적 타입 검사(validate_and_fix)를 수행하여 JSON 훼손 시 런타임 에러 방지
+데이터셋 무결성 검사 기능 추가
+
+프로젝트 루트 폴더를 지연생성 하면?->폴더가 바로 생성안됨
+-에러 발견 시점의 지연
+-코드 및 예외 처리의 복잡성 증가
+-동시성 이슈
+
 
 https://chatgpt.com/share/6a0ab080-6c5c-83a3-9031-dbd929e020f1
-automl도 안전종료 시 빠르게 하는방법 있?
 -Closing dataloader mosaic 이후 딜레이 있음
 ui/ux 개선 - 라벨링 마우스 키 다름, 디스코드 임베드 ui
 

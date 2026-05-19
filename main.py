@@ -2394,7 +2394,151 @@ class TuneHistoryDialog(QDialog):
         except Exception as e:
             layout.addWidget(QLabel(f"기록을 불러오는 중 오류 발생:\n{traceback.format_exc()}"))
 
+class IntegrityThread(QThread):
+    progress = pyqtSignal(int, str)
+    finished_ok = pyqtSignal(list)
+    error = pyqtSignal(str)
 
+    def __init__(self, img_dir, lbl_dir, num_classes):
+        super().__init__()
+        self.img_dir = Path(img_dir)
+        self.lbl_dir = Path(lbl_dir)
+        self.num_classes = num_classes
+
+    def run(self):
+        issues = []
+        try:
+            valid_exts = {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}
+            img_files = [f for f in self.img_dir.iterdir() if f.suffix.lower() in valid_exts]
+            lbl_files = [f for f in self.lbl_dir.iterdir() if f.suffix.lower() == ".txt"]
+
+            img_stems = {f.stem: f for f in img_files}
+            lbl_stems = {f.stem: f for f in lbl_files}
+
+            all_stems = set(img_stems.keys()).union(set(lbl_stems.keys()))
+            total = len(all_stems)
+            hashes = {}
+
+            for i, stem in enumerate(all_stems):
+                if total > 0:
+                    self.progress.emit(int((i / total) * 100), f"무결성 검사 중... ({i}/{total})")
+
+                # 1. 미스매치 검사
+                if stem not in img_stems:
+                    issues.append({"file": lbl_stems[stem].name, "type": "이미지 누락", "desc": "라벨은 있지만 짝이 되는 이미지 파일이 없습니다."})
+                    continue
+                if stem not in lbl_stems:
+                    issues.append({"file": img_stems[stem].name, "type": "라벨 누락", "desc": "이미지는 있지만 짝이 되는 라벨(.txt) 파일이 없습니다."})
+                    continue
+
+                img_path = img_stems[stem]
+                lbl_path = lbl_stems[stem]
+
+                # 2. 이미지 손상 및 중복(Hash) 검사
+                img = cv2.imread(str(img_path))
+                if img is None:
+                    issues.append({"file": img_path.name, "type": "이미지 손상", "desc": "이미지 파일을 읽을 수 없거나 깨졌습니다."})
+                    continue
+                else:
+                    # 초고속 dHash 생성 (8x8)
+                    resized = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (9, 8))
+                    diff = resized[:, 1:] > resized[:, :-1]
+                    dhash = sum([2 ** idx for (idx, v) in enumerate(diff.flatten()) if v])
+                    
+                    if dhash in hashes:
+                        issues.append({"file": img_path.name, "type": "이미지 중복", "desc": f"'{hashes[dhash]}' 파일과 이미지가 완벽히 동일합니다. (Data Leakage 위험)"})
+                    else:
+                        hashes[dhash] = img_path.name
+
+                # 3. 빈 라벨 검사
+                if lbl_path.stat().st_size == 0:
+                    issues.append({"file": lbl_path.name, "type": "빈 라벨", "desc": "라벨 파일이 0 바이트로 비어있습니다. (객체 없음)"})
+                    continue
+
+                lines = lbl_path.read_text(encoding="utf-8").strip().splitlines()
+                if not lines:
+                    issues.append({"file": lbl_path.name, "type": "빈 라벨", "desc": "라벨 파일 내부에 내용이 없습니다."})
+                    continue
+
+                # 4. Class ID 및 BBox 유효성 검사
+                for line_idx, line in enumerate(lines):
+                    parts = line.strip().split()
+                    if len(parts) != 5:
+                        issues.append({"file": lbl_path.name, "type": "포맷 오류", "desc": f"{line_idx+1}번째 줄: YOLO 포맷(값 5개)이 아닙니다."})
+                        continue
+
+                    try:
+                        cls_id = int(parts[0])
+                        x, y, w, h = map(float, parts[1:])
+
+                        if cls_id < 0 or cls_id >= self.num_classes:
+                            issues.append({"file": lbl_path.name, "type": "Class ID 범위 오류", "desc": f"{line_idx+1}번째 줄: ID({cls_id})가 설정된 클래스 범위를 벗어납니다."})
+
+                        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+                            issues.append({"file": lbl_path.name, "type": "범위 이탈 (Out-of-bounds)", "desc": f"{line_idx+1}번째 줄: 중심 좌표(x,y)가 0~1 범위를 벗어납니다."})
+
+                        if w <= 0.001 or h <= 0.001:
+                            issues.append({"file": lbl_path.name, "type": "극단적 BBox (Extreme)", "desc": f"{line_idx+1}번째 줄: BBox 너비나 높이가 너무 작습니다 (0.001 이하)."})
+                        elif w > 1.05 or h > 1.05:
+                            issues.append({"file": lbl_path.name, "type": "범위 이탈 (Out-of-bounds)", "desc": f"{line_idx+1}번째 줄: BBox 크기가 이미지 크기를 과도하게 벗어납니다."})
+
+                    except ValueError:
+                        issues.append({"file": lbl_path.name, "type": "값 오류", "desc": f"{line_idx+1}번째 줄: 문자가 섞여 있거나 숫자로 변환할 수 없습니다."})
+
+            self.progress.emit(100, "검사 완료")
+            self.finished_ok.emit(issues)
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+class IntegrityReportDialog(QDialog):
+    request_fix = pyqtSignal(str) # 이미지 수정을 위한 시그널
+
+    def __init__(self, issues, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🚨 데이터셋 무결성 검사 리포트")
+        self.resize(800, 500)
+        
+        layout = QVBoxLayout(self)
+        
+        lbl_info = QLabel(f"<b>총 {len(issues)}개의 잠재적 문제</b>가 발견되었습니다.<br>"
+                          "<span style='color: #d97706;'>💡 항목을 <b>더블클릭</b>하면 라벨링 툴로 자동 이동하여 바로 수정할 수 있습니다.</span>")
+        layout.addWidget(lbl_info)
+        
+        self.table = QTableWidget(len(issues), 3)
+        self.table.setHorizontalHeaderLabels(["파일명", "오류 유형", "상세 설명"])
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        
+        for i, issue in enumerate(issues):
+            self.table.setItem(i, 0, QTableWidgetItem(issue["file"]))
+            
+            type_item = QTableWidgetItem(issue["type"])
+            type_item.setForeground(QColor("#dc2626") if "오류" in issue["type"] or "누락" in issue["type"] or "손상" in issue["type"] else QColor("#b45309"))
+            type_item.setFont(QFont("Arial", 10, QFont.Bold))
+            self.table.setItem(i, 1, type_item)
+            
+            self.table.setItem(i, 2, QTableWidgetItem(issue["desc"]))
+            
+        self.table.itemDoubleClicked.connect(self.on_double_click)
+        layout.addWidget(self.table)
+        
+        btn_close = QPushButton("닫기")
+        btn_close.clicked.connect(self.accept)
+        btn_close.setMinimumHeight(40)
+        layout.addWidget(btn_close)
+
+    def on_double_click(self, item):
+        row = item.row()
+        file_name = self.table.item(row, 0).text()
+        self.request_fix.emit(file_name)
+        self.accept()
 # ==========================================
 # Main App
 # ==========================================
@@ -3274,10 +3418,12 @@ class MainWindow(QMainWindow):
         self.btn_show_tune_history = QPushButton("📈 AutoML 튜닝 기록 그래프 보기")
         self.btn_show_tune_history.setStyleSheet("background-color: #fce7f3; border: 1px solid #fbcfe8; padding: 8px; font-weight: bold; color: #9d174d;")
         self.btn_show_tune_history.clicked.connect(self.show_tune_history)
-        
+        self.t2_btn_check_integrity = QPushButton("🚨 데이터셋 무결성 검사")
+        self.t2_btn_check_integrity.setStyleSheet("background-color: #fee2e2; border: 1px solid #fca5a5; padding: 8px; font-weight: bold; color: #991b1b;")
+        self.t2_btn_check_integrity.clicked.connect(self.run_integrity_check)
         h_tune.addWidget(self.t2_btn_tune)
         h_tune.addWidget(self.btn_show_tune_history)
-        
+        h_tune.addWidget(self.t2_btn_check_integrity)
         self.t2_btn_run = QPushButton("🚀 K-Fold 학습 시작"); self.t2_btn_run.clicked.connect(self.run_tab2)
         
         self.t2_btn_stop = QPushButton("🛑 안전 종료(Graceful Stop)"); self.t2_btn_stop.clicked.connect(self.stop_training); self.t2_btn_stop.setEnabled(False)
@@ -3291,7 +3437,75 @@ class MainWindow(QMainWindow):
         h = QHBoxLayout(); h.addWidget(self.t2_btn_run); h.addWidget(self.t2_btn_stop); h.addWidget(self.t2_btn_reset); l.addLayout(h)
         
         tab = QWidget(); tab.setLayout(l); self.tabs.addTab(tab, "🏋️ K-Fold 학습")
+    def run_integrity_check(self):
+        logger.info("데이터셋 무결성 검사 실행")
+        proc_dir = Path(self.w_proc_ds.get_path())
+        is_valid, err = self.validate_paths(처리된_데이터_dir=proc_dir, 이미지_dir=proc_dir/"images", 라벨_dir=proc_dir/"labels")
+        if not is_valid: 
+            QMessageBox.warning(self, "경로 오류", err)
+            return
+            
+        success, cmap_or_error = self.parse_and_validate_class_map(self.t1_class_map.toPlainText())
+        if not success: 
+            QMessageBox.warning(self, "클래스 매핑 오류", cmap_or_error)
+            return
 
+        self.t2_btn_check_integrity.setEnabled(False)
+        self.statusBar().showMessage("🔍 데이터셋 무결성을 검사하는 중입니다...")
+        
+        from PyQt5.QtWidgets import QProgressDialog
+        self.integrity_progress = QProgressDialog("무결성 검사 진행 중...", "취소", 0, 100, self)
+        self.integrity_progress.setWindowTitle("Integrity Check")
+        self.integrity_progress.setWindowModality(Qt.WindowModal)
+        self.integrity_progress.setAutoClose(True)
+        
+        self.integrity_thread = IntegrityThread(img_dir=proc_dir/"images", lbl_dir=proc_dir/"labels", num_classes=len(cmap_or_error))
+        self.integrity_thread.progress.connect(lambda val, msg: (self.integrity_progress.setValue(val), self.integrity_progress.setLabelText(msg)))
+        self.integrity_thread.finished_ok.connect(self.on_integrity_finished)
+        self.integrity_thread.error.connect(lambda e: self.on_thread_error("무결성 검사", e))
+        self.integrity_thread.finished.connect(lambda: self.t2_btn_check_integrity.setEnabled(True))
+        
+        self.integrity_progress.canceled.connect(self.integrity_thread.terminate)
+        self.integrity_thread.start()
+
+    def on_integrity_finished(self, issues):
+        self.statusBar().clearMessage()
+        if not issues:
+            QMessageBox.information(self, "검사 통과", "🎉 발견된 문제가 없습니다! 데이터가 완벽하게 준비되었습니다.")
+            return
+            
+        dialog = IntegrityReportDialog(issues, self)
+        dialog.request_fix.connect(self.navigate_to_labeling_for_fix)
+        dialog.exec_()
+
+    def load_labeling_images_programmatic(self, img_dir_path):
+        """다이얼로그 없이 코드로 특정 경로의 이미지를 Tab6 리스트에 강제 로드"""
+        target_dir = Path(img_dir_path)
+        valid_exts = {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}
+        self.t6_list.clear()
+        if target_dir.exists():
+            for f in sorted(target_dir.iterdir()):
+                if f.suffix.lower() in valid_exts:
+                    self.t6_list.addItem(f.name)
+
+    def navigate_to_labeling_for_fix(self, file_name):
+        logger.info(f"오류 수정을 위해 라벨링 툴로 자동 이동 요청됨: {file_name}")
+        target_stem = Path(file_name).stem
+        self.tabs.setCurrentIndex(0)
+        proc_dir = Path(self.w_proc_ds.get_path())
+        self.t6_img_dir.line_edit.setText(str(proc_dir / "images"))
+        self.t6_lbl_dir.line_edit.setText(str(proc_dir / "labels"))
+        self.load_labeling_images_programmatic(proc_dir / "images")
+        items = self.t6_list.findItems(file_name, Qt.MatchExactly)
+        if not items:
+            items = self.t6_list.findItems(target_stem, Qt.MatchContains)
+            
+        if items:
+            self.t6_list.setCurrentItem(items[0])
+            self.on_label_image_selected(items[0])
+            self.statusBar().showMessage(f"🛠️ '{file_name}' 데이터를 수정할 준비가 되었습니다.", 5000)
+        else:
+            QMessageBox.warning(self, "파일 탐색 실패", f"라벨링 목록에서 '{file_name}' 이미지를 찾을 수 없습니다.")
     def show_tune_history(self):
         history_path = Path(self.w_work_ds.get_path()) / "runs" / "tune_custom" / "tune_history.csv"
         if not history_path.exists():
@@ -3494,7 +3708,24 @@ class MainWindow(QMainWindow):
         right_widget = QWidget(); right_layout = QVBoxLayout(right_widget); right_layout.setContentsMargins(10, 0, 0, 0); self.t4_chk_show_all = QCheckBox("전체 평가 이미지 보기"); self.t4_chk_show_all.setEnabled(False); self.t4_chk_show_all.stateChanged.connect(self.update_tab4_visualization)
         r_header = QHBoxLayout(); r_header.addWidget(QLabel("<b>최종 예측 결과 시각화</b>")); r_header.addStretch(1); r_header.addWidget(self.t4_chk_show_all); self.t4_img_grid = ImageGridWidget(max_display=100); right_layout.addLayout(r_header); right_layout.addWidget(self.t4_img_grid)
         main_split.addWidget(right_widget); main_split.setSizes([600, 800]); tab_layout = QVBoxLayout(); tab_layout.addWidget(main_split); tab = QWidget(); tab.setLayout(tab_layout); self.tabs.addTab(tab, "🔁 재학습")
-
+    def browse_tab4_eval_model(self):
+        """Tab 4에서 평가할 재학습 모델(.pt)을 선택하는 탐색창을 엽니다."""
+        # 기본 탐색 경로는 워크스페이스(workspace) 폴더로 설정
+        default_dir = str(Path(self.w_work_ds.get_path()))
+        
+        path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "평가 대상 모델 선택", 
+            default_dir, 
+            "PyTorch Model (*.pt);;All Files (*)"
+        )
+        
+        if path:
+            self.t4_eval_model_display.setText(path)
+            # 모델이 선택되었으므로 평가 관련 버튼들 활성화
+            self.t4_btn_eval.setEnabled(True)
+            self.t4_btn_auto_thr.setEnabled(True)
+            self.statusBar().showMessage(f"✅ 평가할 재학습 모델이 선택되었습니다: {Path(path).name}", 5000)
     def run_tab4_auto_threshold(self):
         logger.info("재학습 모델 최적 스레숄드 자동 탐색 실행 시작")
         if self.training_process and self.training_process.is_alive(): 
