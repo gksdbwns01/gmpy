@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
     QProgressBar, QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QFormLayout, 
     QScrollArea, QGridLayout, QSplitter, QDialog, QInputDialog, QGraphicsView, QGraphicsScene, 
     QGraphicsRectItem, QGraphicsPixmapItem, QListWidget, QListWidgetItem, QGraphicsLineItem,
-    QDateEdit)
+    QDateEdit, QProgressDialog)
 from PyQt5.QtGui import QPixmap, QImage, QFont, QIcon, QColor, QPainter, QPen
 
 if hasattr(Qt, 'AA_EnableHighDpiScaling'): QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
