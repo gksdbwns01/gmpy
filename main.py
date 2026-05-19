@@ -2952,6 +2952,9 @@ class MainWindow(QMainWindow):
                 self.log_db.close(timeout=5.0)
             
             logger.info("애플리케이션 정상 종료 중... 로깅 종료.")
+            for handler in logger.handlers:
+                handler.flush()
+                handler.close()
             logging.shutdown()
             event.accept()
 
