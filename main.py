@@ -1404,7 +1404,7 @@ class ProcessMonitorThread(QThread):
         while self.process.is_alive():
             if self.stop_event and self.stop_event.is_set():
                 if not is_stopping:
-                    logger.warning("UI 쓰레드 중지 신호 감지. 워커의 안전 종료를 대기합니다 (최대 300초).")
+                    logger.warning("UI 쓰레드 중지 신호 감지. 워커의 안전 종료를 대기합니다")
                     is_stopping = True
                     kill_deadline = time.time() + 300.0
                 
@@ -3322,11 +3322,11 @@ class MainWindow(QMainWindow):
                 self.show_kfold_metrics_dialog(res["metrics_summary"], res["msg"], res.get("best_fold", ""))
                 avg_map = next((summary.get("mAP50-95", 0.0) for summary in res["metrics_summary"] if summary["Fold"] == "Average"), 0.0)
                 original_path = res.get("original_model_path", res.get("best_model", "경로 없음"))
-                self.log_db.insert_log(task_type="K-Fold Train", model_name=self.g_model.currentText(), epochs=self.t2_epochs.value(), batch=self.t2_batch.value(), best_map=avg_map, save_dir=original_path, config_data=current_config)
+                self.log_db.insert_log(project_path=self.w_proj_root.get_path(), task_type="K-Fold Train", model_name=self.g_model.currentText(), epochs=self.t2_epochs.value(), batch=self.t2_batch.value(), best_map=avg_map, save_dir=original_path, config_data=current_config)
                 if res.get("best_model"): self.t3_model.line_edit.setText(res["best_model"])
             elif task == "retrain":
                 QMessageBox.information(self, "완료", res["msg"])
-                self.log_db.insert_log(task_type="Hard Retrain", model_name=Path(self.t4_base.get_path()).name, epochs=self.t4_epochs.value(), batch=self.t4_batch.value(), best_map=-1.0, save_dir=res.get("model_path", "경로 없음"), config_data=current_config)
+                self.log_db.insert_log(project_path=self.w_proj_root.get_path(), task_type="Hard Retrain", model_name=Path(self.t4_base.get_path()).name, epochs=self.t4_epochs.value(), batch=self.t4_batch.value(), best_map=-1.0, save_dir=res.get("model_path", "경로 없음"), config_data=current_config)
                 if res.get("model_path"): 
                     self.t4_eval_model_display.setText(res["model_path"]); self.t4_btn_eval.setEnabled(True); self.statusBar().showMessage(f"✅ 재학습 모델 준비 완료: {Path(res['model_path']).name}")
         else: 
@@ -3983,7 +3983,7 @@ class MainWindow(QMainWindow):
             source_txt = Path(eval_path).parent / "best_model_source.txt"
             if source_txt.exists(): display_name += f" (원본: {source_txt.read_text(encoding='utf-8').strip()})"
         model_name_with_path = f"{display_name}  |  {eval_path}"
-        self.log_db.insert_eval_log(task_type="Tab 3 Eval", model_name=model_name_with_path, total=stats['total'], wrong=stats['wrong'], accuracy=stats['acc'], wrong_imgs_list=wrong_imgs, config_data=self.config_builder.build(self))
+        self.log_db.insert_eval_log(project_path=self.w_proj_root.get_path(), task_type="Tab 3 Eval", model_name=model_name_with_path, total=stats['total'], wrong=stats['wrong'], accuracy=stats['acc'], wrong_imgs_list=wrong_imgs, config_data=self.config_builder.build(self))
         
         if self.webhook_url and self.noti_flags.get("task"):
             send_discord_webhook(
@@ -4169,7 +4169,7 @@ class MainWindow(QMainWindow):
                 display_name += f" (원본: {source_txt.read_text(encoding='utf-8').strip()})"
                 
         model_name_with_path = f"{display_name}  |  {eval_path}"
-        self.log_db.insert_eval_log(task_type="Tab 4 Final Eval", model_name=model_name_with_path, total=stats['total'], wrong=stats['wrong'], accuracy=stats['acc'], wrong_imgs_list=wrong_imgs, config_data=self.config_builder.build(self))
+        self.log_db.insert_eval_log(project_path=self.w_proj_root.get_path(), task_type="Tab 4 Final Eval", model_name=model_name_with_path, total=stats['total'], wrong=stats['wrong'], accuracy=stats['acc'], wrong_imgs_list=wrong_imgs, config_data=self.config_builder.build(self))
         
         if self.webhook_url and self.noti_flags.get("task"):
             send_discord_webhook(
