@@ -2753,7 +2753,7 @@ class IntegrityReportDialog(QDialog):
 # ==========================================
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle("YOLO Training Pipeline (PyQt5) - AutoML + Graceful Stop + Embed Webhooks + VRAM Isolation"); self.resize(1400, 900)
+        super().__init__(); self.setWindowTitle("YOLO Training Pipeline"); self.resize(1400, 900)
         logger.info(f"YOLO Training Pipeline 애플리케이션 시작 (OS: {platform.system()}, GPU: {torch.cuda.is_available()})")
         self.base_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
         self.settings = QSettings("MyVisionProject", "YoloTrainerApp")
@@ -3045,7 +3045,7 @@ class MainWindow(QMainWindow):
         self.w_proj_root = PathInputWidget("🌟 프로젝트 루트", True, str(self.base_dir / "MyProject")); self.w_proj_root.line_edit.setStyleSheet("background-color: #fffbeb; font-weight: bold; color: #92400e;")
         default_proj = Path(self.w_proj_root.get_path()); self.w_base_ds = PathInputWidget("원본 데이터(dataset)", True, str(default_proj / "dataset")); self.w_proc_ds = PathInputWidget("처리 폴더(processed)", True, str(default_proj / "processed_dataset")); self.w_work_ds = PathInputWidget("워크스페이스(workspace)", True, str(default_proj / "workspace"))
         
-        self.settings = QSettings("MyVisionProject", "YoloTrainerApp")
+        self.settings = QSettings("gksdbwns", "YoloTrainerApp")
         self.webhook_url = self.settings.value("webhook_url", "")
         self.noti_flags = {"error": True, "start": True, "early_stop": True, "fold": True, "tune": True, "epoch": True, "epoch_interval": 100, "task": True}
         
