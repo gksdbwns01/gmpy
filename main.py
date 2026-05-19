@@ -80,19 +80,37 @@ class ConfigDefaults:
 # ==========================================
 # [개선 2] Subprocess Watchdog (프로세스 트리 강제 종료)
 # ==========================================
-def kill_process_tree(pid):
-    """지정된 PID와 그 자식 프로세스들까지 OS 레벨에서 확실하게 사살합니다"""
+def kill_process_tree(pid, timeout=5.0):
+    """지정된 PID와 자식 프로세스를 terminate 후 남은 것만 kill합니다."""
     try:
         parent = psutil.Process(pid)
-        children = parent.children(recursive=True)
-        for child in children:
-            child.kill()
-        parent.kill()
-        logger.info(f"프로세스 트리(PID: {pid}) 및 하위 프로세스 강제 종료 완료.")
     except psutil.NoSuchProcess:
-        pass
+        return
     except Exception as e:
-        logger.error(f"프로세스 트리 강제 종료 중 예외 발생: {e}")
+        logger.error(f"프로세스 트리 조회 중 예외 발생: {e}")
+        return
+
+    try:
+        processes = parent.children(recursive=True) + [parent]
+        for proc in processes:
+            try:
+                proc.terminate()
+            except psutil.NoSuchProcess:
+                pass
+
+        _, alive = psutil.wait_procs(processes, timeout=timeout)
+        for proc in alive:
+            try:
+                proc.kill()
+            except psutil.NoSuchProcess:
+                pass
+
+        if alive:
+            psutil.wait_procs(alive, timeout=timeout)
+
+        logger.info(f"프로세스 트리(PID: {pid}) 종료 완료. 강제 종료 대상: {len(alive)}개")
+    except Exception as e:
+        logger.error(f"프로세스 트리 종료 중 예외 발생: {e}")
 
 # ==========================================
 # 로깅(Logging) 설정
@@ -269,13 +287,26 @@ class LogDatabase:
 
     def _db_writer_loop(self):
         conn = self._get_connection()
-        while True:
-            task = self.log_queue.get()
-            if task is None: break
-            try:
-                task(conn)
-            except Exception as e:
-                logger.error(f"DB 쓰기 에러 발생: {e}", exc_info=True)
+        try:
+            while True:
+                task = self.log_queue.get()
+                if task is None: break
+                try:
+                    task(conn)
+                except Exception as e:
+                    logger.error(f"DB 쓰기 에러 발생: {e}", exc_info=True)
+        finally:
+            conn.close()
+            logger.debug("DB writer thread 종료 및 연결 닫힘")
+
+    def close(self, timeout=5.0):
+        try:
+            self.log_queue.put(None)
+            self.writer_thread.join(timeout=timeout)
+            if self.writer_thread.is_alive():
+                logger.warning("DB writer thread가 제한 시간 안에 종료되지 않았습니다.")
+        except Exception as e:
+            logger.error(f"DB writer 종료 처리 중 예외 발생: {e}", exc_info=True)
 
     def insert_log(self, project_path, task_type, model_name, epochs, batch, best_map, save_dir, config_data):
         params = (
@@ -1190,8 +1221,9 @@ def _eval_worker(args, queue):
         if c["save_relabel"]:
             if relabel_dir.exists(): shutil.rmtree(relabel_dir)
             relabel_dir.mkdir(parents=True, exist_ok=True)
+        if stop_event and stop_event.is_set(): raise Exception("사용자 취소됨")
         model = YOLO(str(c["eval_model_path"]))
-        res = model.predict(source=str(c["eval_source"]), save=True, conf=c["eval_conf"], iou=c["eval_iou"], max_det=c["max_det"], project=str(eval_project_dir), name=c["eval_run_name"], agnostic_nms=c["agnostic_nms"], exist_ok=True)
+        res = model.predict(source=str(c["eval_source"]), save=True, conf=c["eval_conf"], iou=c["eval_iou"], max_det=c["max_det"], project=str(eval_project_dir), name=c["eval_run_name"], agnostic_nms=c["agnostic_nms"], exist_ok=True, stream=True)
         
         def calc_iou(b1, b2):
             ax1,ay1,ax2,ay2 = b1[0]-b1[2]/2, b1[1]-b1[3]/2, b1[0]+b1[2]/2, b1[1]+b1[3]/2
@@ -1241,7 +1273,10 @@ def _tab4_eval_worker(args, queue):
     try:
         from ultralytics import YOLO
         c = args; model = YOLO(str(c["retrained_model"]))
+        stop_event = c.get("stop_event")
+        if stop_event and stop_event.is_set(): raise Exception("사용자 취소됨")
         val_metrics = model.val(data=str(c["yaml_path"]), conf=c["eval_conf"], iou=c["eval_iou"], max_det=c["max_det"], project=str(Path(c["workspace_dir"]) / "runs" / "eval"), name=c["eval_run_name"] + "_val")
+        if stop_event and stop_event.is_set(): raise Exception("사용자 취소됨")
         pr_curve = str(Path(val_metrics.save_dir) / "PR_curve.png")
         
         eval_config = c.copy(); eval_config["eval_model_path"] = c["retrained_model"]; eval_config["eval_run_name"] = c["eval_run_name"] + "_final_eval"; eval_config["save_relabel"] = False
@@ -1279,6 +1314,7 @@ def _measure_worker(args, queue):
         while (base_dir / f"{dist_run_name}_{folder_idx:02d}").exists(): folder_idx += 1
         final_save_dir = base_dir / f"{dist_run_name}_{folder_idx:02d}"; final_save_dir.mkdir()
         
+        if stop_event and stop_event.is_set(): raise Exception("사용자 취소됨")
         model = YOLO(str(c["dist_model_path"]))
         img_files = [f for f in dist_source.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png")]; total_imgs = len(img_files)
         results = model.predict(source=str(dist_source), save=False, conf=c["dist_conf"], iou=c["dist_iou"], max_det=c["dist_max_det"], agnostic_nms=c["dist_agnostic"], stream=True)
@@ -1390,62 +1426,126 @@ class ProcessMonitorThread(QThread):
         if result: self.finished_ok.emit(result)
         else: self.error.emit(f"프로세스 비정상 종료 (Exit Code: {self.process.exitcode})")
 
-class EvalThread(QThread):
+class StoppableProcessThread(QThread):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.stop_event = self.config.get("stop_event")
+        if self.stop_event is None:
+            self.stop_event = multiprocessing.Event()
+            self.config["stop_event"] = self.stop_event
+        self.process = None
+        self.stop_grace_seconds = float(self.config.get("stop_grace_seconds", 30.0))
+
+    def request_stop(self):
+        if self.stop_event:
+            self.stop_event.set()
+        if self.process and self.process.is_alive():
+            logger.warning(f"[{self.__class__.__name__}] 중단 요청 전달. 워커 자연 종료 대기 중...")
+
+    def force_stop_process(self):
+        if self.process and self.process.is_alive():
+            logger.warning(f"[{self.__class__.__name__}] 워커가 응답하지 않아 프로세스 트리를 강제 종료합니다.")
+            kill_process_tree(self.process.pid)
+
+    def _run_worker_process(self, worker_func, run_queue, progress_handler=None):
+        self.process = multiprocessing.Process(target=worker_func, args=(self.config, run_queue))
+        self.process.start()
+        res = None
+        stop_deadline = None
+        try:
+            while self.process.is_alive():
+                if self.stop_event and self.stop_event.is_set():
+                    if stop_deadline is None:
+                        stop_deadline = time.time() + self.stop_grace_seconds
+                        logger.warning(f"[{self.__class__.__name__}] 안전 종료 대기 시작 (최대 {self.stop_grace_seconds:.0f}초).")
+                    elif time.time() > stop_deadline:
+                        self.force_stop_process()
+                        break
+
+                try:
+                    msg = run_queue.get(timeout=0.5)
+                    if progress_handler and isinstance(msg, dict) and msg.get("type") == "progress":
+                        progress_handler(msg)
+                        continue
+                    res = msg
+                    break
+                except qlib.Empty:
+                    continue
+
+            self.process.join(timeout=2)
+            if self.process.is_alive():
+                self.force_stop_process()
+                self.process.join(timeout=2)
+
+            while res is None:
+                try:
+                    msg = run_queue.get_nowait()
+                except qlib.Empty:
+                    break
+                if progress_handler and isinstance(msg, dict) and msg.get("type") == "progress":
+                    progress_handler(msg)
+                    continue
+                res = msg
+
+            if res is None and self.stop_event and self.stop_event.is_set():
+                res = {"success": False, "error": "사용자 취소됨"}
+            return res
+        finally:
+            try:
+                run_queue.close()
+                run_queue.join_thread()
+            except Exception:
+                pass
+
+class EvalThread(StoppableProcessThread):
     finished_ok = pyqtSignal(pd.DataFrame, list, list, dict); error = pyqtSignal(str)
-    def __init__(self, config): super().__init__(); self.config = config
+    def __init__(self, config): super().__init__(config)
     def run(self):
         logger.info(f"[Eval Thread] QThread 시작 (Process 분리). 대상 모델: {self.config['eval_model_path']}")
-        run_queue = multiprocessing.Queue(); p = multiprocessing.Process(target=_eval_worker, args=(self.config, run_queue)); p.start()
-        res = None; stop_event = self.config.get("stop_event")
-        while p.is_alive():
-            if stop_event and stop_event.is_set(): kill_process_tree(p.pid); break
-            try: res = run_queue.get(timeout=0.5); break
-            except qlib.Empty: continue
-        p.join(timeout=2)
-        if not res and not run_queue.empty(): res = run_queue.get()
+        run_queue = multiprocessing.Queue()
+        res = self._run_worker_process(_eval_worker, run_queue)
         if res and res.get("success"): self.finished_ok.emit(pd.DataFrame(res["rows"]).sort_values("상태"), res["wrong_imgs"], res["all_imgs"], res["stats"])
-        else: self.error.emit(res.get("error") if res else "프로세스 강제 종료됨")
+        else: self.error.emit(str(res.get("error") or "프로세스 강제 종료됨") if res else "프로세스 강제 종료됨")
 
-class Tab4FinalEvalThread(QThread):
+class Tab4FinalEvalThread(StoppableProcessThread):
     finished_ok = pyqtSignal(pd.DataFrame, list, list, dict, str); error = pyqtSignal(str)
-    def __init__(self, config): super().__init__(); self.config = config
+    def __init__(self, config): super().__init__(config)
     def run(self):
         logger.info("[Tab4FinalEval Thread] QThread 시작 (Process 분리)")
-        run_queue = multiprocessing.Queue(); p = multiprocessing.Process(target=_tab4_eval_worker, args=(self.config, run_queue)); p.start()
-        res = None; stop_event = self.config.get("stop_event")
-        while p.is_alive():
-            if stop_event and stop_event.is_set(): kill_process_tree(p.pid); break
-            try: res = run_queue.get(timeout=0.5); break
-            except qlib.Empty: continue
-        p.join(timeout=2)
-        if not res and not run_queue.empty(): res = run_queue.get()
+        run_queue = multiprocessing.Queue()
+        res = self._run_worker_process(_tab4_eval_worker, run_queue)
         if res and res.get("success"): self.finished_ok.emit(pd.DataFrame(res["rows"]).sort_values("상태"), res["wrong_imgs"], res["all_imgs"], res["stats"], res["pr_curve"])
-        else: self.error.emit(res.get("error") if res else "프로세스 강제 종료됨")
+        else: self.error.emit(str(res.get("error") or "프로세스 강제 종료됨") if res else "프로세스 강제 종료됨")
 
-class MeasureThread(QThread):
+class MeasureThread(StoppableProcessThread):
     progress = pyqtSignal(int); finished_ok = pyqtSignal(pd.DataFrame, pd.DataFrame, pd.DataFrame, list); error = pyqtSignal(str)
-    def __init__(self, config): super().__init__(); self.config = config
+    def __init__(self, config): super().__init__(config)
     def run(self):
         logger.info("[Measure Thread] QThread 시작 (Process 분리)")
-        run_queue = multiprocessing.Queue(); p = multiprocessing.Process(target=_measure_worker, args=(self.config, run_queue)); p.start()
-        res = None; stop_event = self.config.get("stop_event")
-        while p.is_alive():
-            if stop_event and stop_event.is_set(): kill_process_tree(p.pid); break
-            try:
-                msg = run_queue.get(timeout=0.5)
-                if msg.get("type") == "progress": self.progress.emit(msg["val"])
-                elif msg.get("type") == "result": res = msg; break
-            except qlib.Empty: continue
-        p.join(timeout=2)
-        if not res and not run_queue.empty():
-            msg = run_queue.get()
-            if msg.get("type") == "result": res = msg
+        run_queue = multiprocessing.Queue()
+        res = self._run_worker_process(_measure_worker, run_queue, lambda msg: self.progress.emit(msg["val"]))
         if res and res.get("success"): self.finished_ok.emit(pd.DataFrame(res["df_export"]), pd.DataFrame(res["df_parsed"]), pd.DataFrame(res["df_outliers"]), res["image_pairs"])
-        else: self.error.emit(res.get("error") if res else "프로세스 강제 종료됨")
+        else: self.error.emit(str(res.get("error") or "프로세스 강제 종료됨") if res else "프로세스 강제 종료됨")
 
 class PreprocessThread(QThread):
     progress = pyqtSignal(int); log_msg = pyqtSignal(str); finished_ok = pyqtSignal(int); error = pyqtSignal(str)
-    def __init__(self, config): super().__init__(); self.config = config
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self._stop_requested = threading.Event()
+
+    def request_stop(self):
+        self._stop_requested.set()
+        logger.warning("[Preprocess Thread] 중단 요청 수신")
+
+    def _should_stop(self, context=""):
+        if self._stop_requested.is_set():
+            logger.info(f"[Preprocess Thread] 사용자 취소됨: {context}")
+            self.log_msg.emit("🛑 사용자 요청으로 전처리를 중단합니다.")
+            return True
+        return False
+
     def run(self):
         logger.info("[Preprocess Thread] 데이터 전처리 쓰레드 시작")
         try:
@@ -1462,6 +1562,8 @@ class PreprocessThread(QThread):
                 logger.debug("오토 크롭 설정 적용됨, 좌표 계산 중...")
                 min_x = min_y = float("inf"); max_x = max_y = 0.0
                 for lf in label_files:
+                    if self._should_stop("자동 크롭 좌표 계산"):
+                        return
                     if lf.suffix == ".json":
                         for item in json.loads(lf.read_text(encoding="utf-8")).get("area", []):
                             if isinstance(item, dict) and len(item) == 1 and len(list(item.values())[0]) == 4:
@@ -1493,6 +1595,8 @@ class PreprocessThread(QThread):
             out_img.mkdir(parents=True, exist_ok=True); out_lbl.mkdir(parents=True, exist_ok=True); out_preview.mkdir(parents=True, exist_ok=True)
             ok_count = 0
             for i, lf in enumerate(label_files):
+                if self._should_stop("이미지 처리"):
+                    return
                 img_id = None; boxes_abs = []
                 if lf.suffix == ".json":
                     ann = json.loads(lf.read_text(encoding="utf-8")); img_id = ann.get("id")
@@ -2481,6 +2585,11 @@ class IntegrityThread(QThread):
         self.img_dir = Path(img_dir)
         self.lbl_dir = Path(lbl_dir)
         self.num_classes = num_classes
+        self._stop_requested = threading.Event()
+
+    def request_stop(self):
+        self._stop_requested.set()
+        logger.warning("[Integrity Thread] 중단 요청 수신")
 
     def run(self):
         issues = []
@@ -2497,6 +2606,10 @@ class IntegrityThread(QThread):
             hashes = {}
 
             for i, stem in enumerate(all_stems):
+                if self._stop_requested.is_set():
+                    self.progress.emit(int((i / max(total, 1)) * 100), "검사 취소됨")
+                    logger.info("[Integrity Thread] 사용자 요청으로 검사 취소")
+                    return
                 if total > 0:
                     self.progress.emit(int((i / total) * 100), f"무결성 검사 중... ({i}/{total})")
 
@@ -2649,6 +2762,7 @@ class MainWindow(QMainWindow):
         self.config_builder = ConfigBuilder()
         self.log_db = LogDatabase(self.base_dir / "logs" / "training_history.db")
         self.training_process = None
+        self._shutting_down = False
         self.init_ui()
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.update_status_animation)
@@ -2698,12 +2812,79 @@ class MainWindow(QMainWindow):
                     
         return True, None
 
+    def _active_background_tasks(self):
+        tasks = []
+        if self.training_process and self.training_process.is_alive():
+            tasks.append(("학습/튜닝/재학습", "training_process"))
+
+        for attr, label in [
+            ("t1_thread", "데이터 전처리"),
+            ("t3_thread", "모델 평가"),
+            ("t4_thread", "재학습 모델 평가"),
+            ("t5_thread", "거리 측정"),
+            ("integrity_thread", "무결성 검사"),
+        ]:
+            th = getattr(self, attr, None)
+            if th and th.isRunning():
+                tasks.append((label, attr))
+        return tasks
+
+    def _disconnect_thread_result_signals(self, th):
+        for signal_name in ("finished_ok", "error"):
+            if hasattr(th, signal_name):
+                try:
+                    getattr(th, signal_name).disconnect()
+                except Exception:
+                    pass
+
+    def _request_aux_thread_stop(self, attr):
+        th = getattr(self, attr, None)
+        if not th or not th.isRunning():
+            return
+        self._disconnect_thread_result_signals(th)
+        if hasattr(th, "request_stop"):
+            th.request_stop()
+        else:
+            th.quit()
+
+    def _wait_aux_thread_stop(self, attr, timeout_ms=30000):
+        th = getattr(self, attr, None)
+        if not th or not th.isRunning():
+            return
+        if th.wait(timeout_ms):
+            return
+        logger.warning(f"{attr}가 제한 시간 안에 종료되지 않았습니다.")
+        if hasattr(th, "force_stop_process"):
+            th.force_stop_process()
+            th.wait(5000)
+
+    def _shutdown_active_tasks(self):
+        for attr in ["t1_thread", "t3_thread", "t4_thread", "t5_thread", "integrity_thread"]:
+            self._request_aux_thread_stop(attr)
+
+        if self.training_process and self.training_process.is_alive():
+            self.stop_training()
+            self.training_process.join(timeout=30)
+            if self.training_process.is_alive():
+                logger.warning("워커 프로세스가 안전 종료 제한 시간을 넘겨 강제 종료합니다.")
+                kill_process_tree(self.training_process.pid)
+                self.training_process.join(timeout=5)
+
+        for attr in ["t1_thread", "t3_thread", "t4_thread", "t5_thread", "integrity_thread"]:
+            self._wait_aux_thread_stop(attr)
+
+        monitor = getattr(self, "monitor_thread", None)
+        if monitor and monitor.isRunning():
+            monitor.wait(5000)
+
     def closeEvent(self, event):
-        is_busy = (self.training_process and self.training_process.is_alive())
+        active_tasks = self._active_background_tasks()
+        is_busy = bool(active_tasks)
         if is_busy:
+            task_text = "\n".join(f"- {label}" for label, _ in active_tasks)
             reply = QMessageBox.warning(
                 self, "종료 경고", 
-                "현재 모델 학습 등 중요 작업이 진행 중입니다.\n지금 프로그램을 강제 종료하면 가중치 파일(.pt)이나 로그 데이터가 영구적으로 손상될 수 있습니다.\n\n먼저 [안전 종료] 버튼을 눌러 작업을 정상적으로 마친 후 창을 닫아주세요.\n\n그래도 무시하고 강제로 종료하시겠습니까?", 
+                f"현재 작업이 진행 중입니다.\n\n{task_text}\n\n종료를 계속하면 먼저 안전 종료 신호를 보내고 최대 30초 동안 정리를 기다립니다.\n그래도 응답하지 않는 프로세스는 마지막 수단으로 강제 종료합니다.\n\n계속 종료하시겠습니까?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No
             )
             if reply == QMessageBox.No:
@@ -2711,6 +2892,7 @@ class MainWindow(QMainWindow):
                 return
 
         logger.info("애플리케이션 종료 프로세스 시작")
+        self._shutting_down = True
         
         if hasattr(self, 'monitor_thread') and self.monitor_thread:
             try:
@@ -2721,17 +2903,11 @@ class MainWindow(QMainWindow):
                 pass
 
         if is_busy and self.webhook_url and self.noti_flags.get("task"):
-            task_name = "TASK"
-            if not self.t2_btn_run.isEnabled(): task_name = "K-FOLD TRAIN / AUTO ML"
-            elif not self.t4_btn_retrain.isEnabled(): task_name = "HARD RETRAIN"
-            elif not self.t1_btn_run.isEnabled(): task_name = "DATA PREPROCESS"
-            elif not self.t3_btn_run.isEnabled(): task_name = "EVALUATION"
-            elif not self.t5_btn_run.isEnabled(): task_name = "DISTANCE MEASURE"
-
+            task_name = ", ".join(label for label, _ in active_tasks)
             send_discord_webhook(
                 webhook_url=self.webhook_url,
                 title=f"🛑 [작업 중단] {task_name}",
-                description="사용자가 프로그램을 종료하여 진행 중인 작업이 즉시 중단되었습니다.",
+                description="프로그램 종료 요청으로 진행 중인 작업에 안전 종료 신호를 보냈습니다.",
                 color=0xf39c12, 
                 sync=True 
             )
@@ -2747,18 +2923,11 @@ class MainWindow(QMainWindow):
             )
 
         if is_busy:
-            self.stop_training()
-            self.training_process.join(timeout=1.5)
-            if self.training_process.is_alive():
-                logger.warning("워커 프로세스가 응답하지 않아 강제 종료(Terminate)합니다.")
-                kill_process_tree(self.training_process.pid)
+            self.statusBar().showMessage("🛑 진행 중인 작업을 안전하게 종료하는 중입니다...")
+            self._shutdown_active_tasks()
 
-        for t_name in ["t1_thread", "t3_thread", "t4_thread", "t5_thread"]:
-            if hasattr(self, t_name):
-                th = getattr(self, t_name)
-                if th and th.isRunning():
-                    th.quit()
-                    th.wait(1000)
+        if hasattr(self, "log_db") and self.log_db:
+            self.log_db.close()
 
         self.settings.setValue("webhook_url", self.webhook_url)
         logger.info("애플리케이션 종료 완료")
@@ -3087,6 +3256,9 @@ class MainWindow(QMainWindow):
 
     def on_training_finished(self, res):
         logger.info(f"워커 프로세스 완료. 결과: Success={res.get('success')}, Task={res.get('task')}")
+        if getattr(self, "_shutting_down", False):
+            self.training_process = None
+            return
         self._restore_training_ui()
         
         self.stop_dynamic_status("✅ 프로세스 완료")
@@ -3174,6 +3346,9 @@ class MainWindow(QMainWindow):
 
     def on_training_fatal_error(self, error_msg):
         logger.error(f"프로세스 비정상 종료 콜백 수신. 원인: {error_msg}")
+        if getattr(self, "_shutting_down", False):
+            self.training_process = None
+            return
         if self.training_process is None: return
         webhook_url = self.webhook_url
         if webhook_url and self.noti_flags.get("error"): 
@@ -3190,6 +3365,8 @@ class MainWindow(QMainWindow):
 
     def on_thread_error(self, task_name, error_msg):
         logger.error(f"[{task_name}] QThread 스레드 내부 예외 발생. 원인: {error_msg}")
+        if getattr(self, "_shutting_down", False):
+            return
         if self.webhook_url and self.noti_flags.get("error"):
             send_discord_webhook(
                 webhook_url=self.webhook_url,
@@ -3478,6 +3655,8 @@ class MainWindow(QMainWindow):
         self.t1_thread.finished.connect(lambda: [self.t1_btn_run.setEnabled(True), QApplication.restoreOverrideCursor(), self.statusBar().showMessage("✅ 전처리 완료", 5000)]); self.t1_thread.start()
 
     def on_tab1_finished(self, ok_count):
+        if getattr(self, "_shutting_down", False):
+            return
         if self.webhook_url and self.noti_flags.get("task"):
             send_discord_webhook(
                 webhook_url=self.webhook_url,
@@ -3580,10 +3759,12 @@ class MainWindow(QMainWindow):
         self.integrity_thread.error.connect(lambda e: self.on_thread_error("무결성 검사", e))
         self.integrity_thread.finished.connect(lambda: self.t2_btn_check_integrity.setEnabled(True))
         
-        self.integrity_progress.canceled.connect(self.integrity_thread.terminate)
+        self.integrity_progress.canceled.connect(self.integrity_thread.request_stop)
         self.integrity_thread.start()
 
     def on_integrity_finished(self, issues):
+        if getattr(self, "_shutting_down", False):
+            return
         self.statusBar().clearMessage()
         if not issues:
             QMessageBox.information(self, "검사 통과", "🎉 발견된 문제가 없습니다! 데이터가 완벽하게 준비되었습니다.")
@@ -3789,6 +3970,8 @@ class MainWindow(QMainWindow):
         self.t3_thread = EvalThread(config); self.t3_thread.finished_ok.connect(self.on_tab3_finished); self.t3_thread.error.connect(lambda e: self.on_thread_error("모델 평가", e)); self.t3_thread.finished.connect(lambda: [self.t3_btn_run.setEnabled(True), QApplication.restoreOverrideCursor(), self.statusBar().clearMessage()]); self.t3_thread.start()
 
     def on_tab3_finished(self, df, wrong_imgs, all_imgs, stats):
+        if getattr(self, "_shutting_down", False):
+            return
         self.t3_last_wrong_imgs = wrong_imgs; self.t3_last_all_imgs = all_imgs; self.t3_table.setSortingEnabled(False); self.t3_table.setRowCount(len(df))     
         for i, row in df.iterrows():
             self.t3_table.setItem(i, 0, QTableWidgetItem(str(row["파일명"]))); self.t3_table.setItem(i, 1, QTableWidgetItem(str(row["상태"]))); self.t3_table.setItem(i, 2, QTableWidgetItem(str(row["예측 수"]))); self.t3_table.setItem(i, 3, QTableWidgetItem(str(row["정답 수"]))); self.t3_table.setItem(i, 4, QTableWidgetItem(str(row["사유"])))
@@ -3970,6 +4153,8 @@ class MainWindow(QMainWindow):
         self.t4_thread.start()
 
     def on_tab4_eval_finished(self, df, wrong_imgs, all_imgs, stats, pr_curve):
+        if getattr(self, "_shutting_down", False):
+            return
         self.t4_last_wrong_imgs = wrong_imgs; self.t4_last_all_imgs = all_imgs; self.t4_table.setSortingEnabled(False); self.t4_table.setRowCount(len(df))     
         for i, row in df.iterrows():
             self.t4_table.setItem(i, 0, QTableWidgetItem(str(row["파일명"]))); self.t4_table.setItem(i, 1, QTableWidgetItem(str(row["상태"]))); self.t4_table.setItem(i, 2, QTableWidgetItem(str(row["예측 수"]))); self.t4_table.setItem(i, 3, QTableWidgetItem(str(row["정답 수"]))); self.t4_table.setItem(i, 4, QTableWidgetItem(str(row["사유"])))
@@ -4065,6 +4250,8 @@ class MainWindow(QMainWindow):
         self.t5_thread.finished.connect(lambda: [self.t5_btn_run.setEnabled(True), QApplication.restoreOverrideCursor(), self.statusBar().clearMessage()]); self.t5_thread.start()
 
     def on_tab5_finished(self, df_export, df_parsed, df_outliers, image_pairs):
+        if getattr(self, "_shutting_down", False):
+            return
         msg = f"완료! (총 {len(df_export)}건)\n\n📂 저장 목록:\n - results.csv\n - statistics.csv\n"
         if not df_outliers.empty: msg += f" - outliers.csv (🚨 {len(df_outliers)}건)\n"
         
