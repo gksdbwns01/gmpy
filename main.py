@@ -3205,9 +3205,20 @@ class MainWindow(QMainWindow):
             for f in files_to_copy:
                 target_file = target_dir / f.name
                 if not target_file.exists(): shutil.copy2(f, target_file); copy_count += 1
+                
             self.t6_list.clear()
+            lbl_dir = Path(self.t6_lbl_dir.get_path()) # 라벨 디렉토리 참조
+            
             for f in sorted(target_dir.iterdir()):
-                if f.suffix.lower() in valid_exts: self.t6_list.addItem(f.name)
+                if f.suffix.lower() in valid_exts:
+                    item = QListWidgetItem(f.name)
+                    txt_path = lbl_dir / f.with_suffix(".txt").name
+                    
+                    # 여기서도 하이라이트 검사
+                    if txt_path.exists() and txt_path.stat().st_size > 0:
+                        item.setBackground(QColor("#dcfce7"))
+                        
+                    self.t6_list.addItem(item)
         finally: QApplication.restoreOverrideCursor()
         msg = f"작업 폴더로 {copy_count}장의 사진을 복사했습니다. (현재 목록: 총 {self.t6_list.count()}장)"
         self.statusBar().showMessage(msg, 5000); QMessageBox.information(self, "가져오기 완료", msg)
@@ -3552,12 +3563,21 @@ class MainWindow(QMainWindow):
     def load_labeling_images_programmatic(self, img_dir_path):
         """다이얼로그 없이 코드로 특정 경로의 이미지를 Tab6 리스트에 강제 로드"""
         target_dir = Path(img_dir_path)
+        lbl_dir = Path(self.t6_lbl_dir.get_path()) # 라벨 디렉토리 참조
         valid_exts = {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}
         self.t6_list.clear()
+        
         if target_dir.exists():
             for f in sorted(target_dir.iterdir()):
                 if f.suffix.lower() in valid_exts:
-                    self.t6_list.addItem(f.name)
+                    item = QListWidgetItem(f.name)
+                    txt_path = lbl_dir / f.with_suffix(".txt").name
+                    
+                    # 라벨 파일이 존재하고, 내용이 비어있지 않다면 배경색 적용
+                    if txt_path.exists() and txt_path.stat().st_size > 0:
+                        item.setBackground(QColor("#dcfce7"))
+                        
+                    self.t6_list.addItem(item)
 
     def navigate_to_labeling_for_fix(self, file_name):
         logger.info(f"오류 수정을 위해 라벨링 툴로 자동 이동 요청됨: {file_name}")
@@ -3567,13 +3587,22 @@ class MainWindow(QMainWindow):
         self.t6_img_dir.line_edit.setText(str(proc_dir / "images"))
         self.t6_lbl_dir.line_edit.setText(str(proc_dir / "labels"))
         self.load_labeling_images_programmatic(proc_dir / "images")
+        
         items = self.t6_list.findItems(file_name, Qt.MatchExactly)
         if not items:
             items = self.t6_list.findItems(target_stem, Qt.MatchContains)
             
         if items:
+            # 1. 목록에서 해당 아이템을 선택 및 활성화
             self.t6_list.setCurrentItem(items[0])
+            # 2. 🌟 목록 스크롤바가 타겟 위치로 자동 추적하도록 설정
+            self.t6_list.scrollToItem(items[0], QListWidget.EnsureVisible) 
+            
+            # 3. 🌟 [핵심] 실제 이미지와 라벨링 하이라이트 박스들을 즉시 그리도록 직접 호출
             self.on_label_image_selected(items[0])
+            
+            # 4. 키보드 단축키(A, D, S, W) 조작이 즉시 가능하도록 뷰어 포커스 지정
+            self.t6_view.setFocus()
             self.statusBar().showMessage(f"🛠️ '{file_name}' 데이터를 수정할 준비가 되었습니다.", 5000)
         else:
             QMessageBox.warning(self, "파일 탐색 실패", f"라벨링 목록에서 '{file_name}' 이미지를 찾을 수 없습니다.")
@@ -3588,19 +3617,27 @@ class MainWindow(QMainWindow):
         self.t6_list.clear()
         valid_exts = {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}
         target_dir = proc_dir / "images"
+        lbl_dir = proc_dir / "labels" # 라벨 디렉토리 참조
         
-        # 파일명에서 확장자를 제외한 이름(stem)만 추출하여 셋(set)으로 만듦
         target_stems = {Path(name).stem for name in file_names}
         
         if target_dir.exists():
             for f in sorted(target_dir.iterdir()):
-                # 오류 목록에 있는 이름(stem)과 일치하는 이미지만 리스트에 추가
                 if f.suffix.lower() in valid_exts and f.stem in target_stems:
-                    self.t6_list.addItem(f.name)
+                    item = QListWidgetItem(f.name)
+                    txt_path = lbl_dir / f.with_suffix(".txt").name
+                    
+                    # 라벨 파일이 존재하고, 내용이 비어있지 않다면 배경색 적용
+                    if txt_path.exists() and txt_path.stat().st_size > 0:
+                        item.setBackground(QColor("#dcfce7"))
+                        
+                    self.t6_list.addItem(item)
         
         if self.t6_list.count() > 0:
             self.t6_list.setCurrentRow(0)
-            self.on_label_image_selected(self.t6_list.currentItem())
+            first_item = self.t6_list.item(0)
+            self.on_label_image_selected(first_item)
+            self.t6_view.setFocus()
             self.statusBar().showMessage(f"🛠️ {self.t6_list.count()}개의 문제 이미지를 라벨링 툴에 로드했습니다. (순차적으로 라벨링을 진행하세요)", 6000)
         else:
             QMessageBox.warning(self, "파일 탐색 실패", "지정된 오류 이미지들을 찾을 수 없습니다. (이미 삭제되었을 수 있습니다)")
