@@ -2907,47 +2907,53 @@ class MainWindow(QMainWindow):
         except:
             pass # 종료 시에는 실패해도 프로그램 종료를 막지 않음
     def closeEvent(self, event):
-        active_tasks = self._active_background_tasks()
+        # 🟢 종료 시작을 알리는 플래그 설정 (다른 UI 클릭 방지용)
+        self._shutting_down = True
         
-        if active_tasks:
-            # 종료 전 안전 확인
-            reply = QMessageBox.warning(
-                self, "종료 경고", 
-                "현재 진행 중인 작업이 있습니다.\n확인을 누르면 30초간 안전하게 종료를 시도합니다.",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-            )
-            if reply == QMessageBox.No:
-                event.ignore()
-                return
-
-            # 🟢 UX 개선: 작업이 진행 중임을 알리는 진행창
-            progress = QProgressDialog("진행 중인 작업을 안전하게 종료 중...", "강제 종료", 0, 30, self)
-            progress.setWindowModality(Qt.WindowModal)
-            progress.show()
-
-            # 1. 종료 신호 전송
-            if hasattr(self, 'stop_event'): self.stop_event.set()
+        try:
+            active_tasks = self._active_background_tasks()
             
-            # 2. 30초 동안 대기하면서 UI 처리 유지
-            start_time = time.time()
-            while self._active_background_tasks() and (time.time() - start_time) < 30:
-                QApplication.processEvents() # 🟢 UI 멈춤 방지
-                time.sleep(0.5)
-                progress.setValue(int(time.time() - start_time))
-                if progress.wasCanceled(): break
+            if active_tasks:
+                reply = QMessageBox.warning(
+                    self, "종료 경고", 
+                    "현재 진행 중인 작업이 있습니다.\n확인을 누르면 30초간 안전하게 종료를 시도합니다.",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    self._shutting_down = False # 취소 시 플래그 해제
+                    event.ignore()
+                    return
+
+                # UX 개선: 작업 진행창
+                progress = QProgressDialog("진행 중인 작업을 안전하게 종료 중...", "강제 종료", 0, 30, self)
+                progress.setWindowModality(Qt.WindowModal)
+                progress.show()
+
+                # 종료 신호 전송
+                if hasattr(self, 'stop_event'): self.stop_event.set()
+                
+                # 30초 대기 루프
+                start_time = time.time()
+                while self._active_background_tasks() and (time.time() - start_time) < 30:
+                    QApplication.processEvents()
+                    time.sleep(0.5)
+                    progress.setValue(int(time.time() - start_time))
+                    if progress.wasCanceled(): break
+                
+                progress.close()
+
+                # 타임아웃 시 강제 종료
+                if self._active_background_tasks():
+                    self._shutdown_active_tasks()
+
+        finally:
+            # 🟢 리소스 정리는 finally에서 수행하여 어떤 에러가 나도 반드시 실행되게 함
+            if hasattr(self, "log_db") and self.log_db:
+                self.log_db.close(timeout=5.0)
             
-            progress.close()
-
-            # 3. 그래도 남아있으면 강제 종료
-            if self._active_background_tasks():
-                self._shutdown_active_tasks()
-
-        # DB 종료
-        if hasattr(self, "log_db") and self.log_db:
-            self.log_db.close(timeout=5.0)
-        logger.info("애플리케이션 정상 종료 중... 로깅 종료.")
-        logging.shutdown()
-        event.accept()
+            logger.info("애플리케이션 정상 종료 중... 로깅 종료.")
+            logging.shutdown()
+            event.accept()
 
     def sync_base_paths(self, new_path):
         if hasattr(self, 't6_img_dir'): self.t6_img_dir.line_edit.setText(str(Path(new_path) / "image"))
