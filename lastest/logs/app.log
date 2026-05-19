@@ -1,0 +1,40 @@
+[INFO] 2026-05-19 13:57:28,487 - [PID:18224|MainThread] - __init__ - YOLO Training Pipeline 애플리케이션 시작 (OS: Windows, GPU: False)
+[DEBUG] 2026-05-19 13:57:28,487 - [PID:18224|MainThread] - __init__ - ConfigManager 초기화됨. base_dir: C:\Users\gksdbwns\yolo01\gmpy\lastest
+[DEBUG] 2026-05-19 13:57:28,487 - [PID:18224|MainThread] - __init__ - LogDatabase 초기화. 경로: C:\Users\gksdbwns\yolo01\gmpy\lastest\logs\training_history.db
+[INFO] 2026-05-19 13:57:29,841 - [PID:18224|MainThread] - closeEvent - 애플리케이션 종료 프로세스 시작
+[INFO] 2026-05-19 13:57:29,841 - [PID:18224|MainThread] - closeEvent - 애플리케이션 종료 완료
+[INFO] 2026-05-19 13:58:36,343 - [PID:19164|MainThread] - __init__ - YOLO Training Pipeline 애플리케이션 시작 (OS: Windows, GPU: False)
+[DEBUG] 2026-05-19 13:58:36,350 - [PID:19164|MainThread] - __init__ - ConfigManager 초기화됨. base_dir: C:\Users\gksdbwns\yolo01\gmpy\lastest
+[DEBUG] 2026-05-19 13:58:36,351 - [PID:19164|MainThread] - __init__ - LogDatabase 초기화. 경로: C:\Users\gksdbwns\yolo01\gmpy\lastest\logs\training_history.db
+[INFO] 2026-05-19 13:58:37,879 - [PID:19164|MainThread] - closeEvent - 애플리케이션 종료 프로세스 시작
+[INFO] 2026-05-19 13:58:37,887 - [PID:19164|MainThread] - closeEvent - 애플리케이션 종료 완료
+[INFO] 2026-05-19 14:09:02,376 - [PID:4900|MainThread] - __init__ - YOLO Training Pipeline 애플리케이션 시작 (OS: Windows, GPU: False)
+[DEBUG] 2026-05-19 14:09:02,379 - [PID:4900|MainThread] - __init__ - ConfigManager 초기화됨. base_dir: C:\Users\gksdbwns\yolo01\gmpy\lastest
+[DEBUG] 2026-05-19 14:09:02,379 - [PID:4900|MainThread] - __init__ - LogDatabase 초기화. 경로: C:\Users\gksdbwns\yolo01\gmpy\lastest\logs\training_history.db
+[INFO] 2026-05-19 14:09:03,800 - [PID:4900|MainThread] - closeEvent - 애플리케이션 종료 프로세스 시작
+[INFO] 2026-05-19 14:09:03,800 - [PID:4900|MainThread] - closeEvent - 애플리케이션 종료 완료
+[INFO] 2026-05-19 14:11:30,530 - [PID:16924|MainThread] - __init__ - YOLO Training Pipeline 애플리케이션 시작 (OS: Windows, GPU: False)
+[DEBUG] 2026-05-19 14:11:30,530 - [PID:16924|MainThread] - __init__ - ConfigManager 초기화됨. base_dir: C:\Users\gksdbwns\yolo01\gmpy\lastest
+[DEBUG] 2026-05-19 14:11:30,530 - [PID:16924|MainThread] - __init__ - LogDatabase 초기화. 경로: C:\Users\gksdbwns\yolo01\gmpy\lastest\logs\training_history.db
+[INFO] 2026-05-19 14:11:31,649 - [PID:16924|MainThread] - closeEvent - 애플리케이션 종료 프로세스 시작
+[INFO] 2026-05-19 14:11:31,649 - [PID:16924|MainThread] - closeEvent - 애플리케이션 종료 완료
+[INFO] 2026-05-19 14:12:26,833 - [PID:21360|MainThread] - __init__ - YOLO Training Pipeline 애플리케이션 시작 (OS: Windows, GPU: False)
+[DEBUG] 2026-05-19 14:12:26,838 - [PID:21360|MainThread] - __init__ - ConfigManager 초기화됨. base_dir: C:\Users\gksdbwns\yolo01\gmpy\lastest
+[DEBUG] 2026-05-19 14:12:26,838 - [PID:21360|MainThread] - __init__ - LogDatabase 초기화. 경로: C:\Users\gksdbwns\yolo01\gmpy\lastest\logs\training_history.db
+[INFO] 2026-05-19 14:12:28,064 - [PID:21360|MainThread] - closeEvent - 애플리케이션 종료 프로세스 시작
+[INFO] 2026-05-19 14:12:28,066 - [PID:21360|MainThread] - closeEvent - 애플리케이션 종료 완료
+[INFO] 2026-05-19 14:15:44,767 - [PID:9232|MainThread] - __init__ - YOLO Training Pipeline 애플리케이션 시작 (OS: Windows, GPU: False)
+[DEBUG] 2026-05-19 14:15:44,774 - [PID:9232|MainThread] - __init__ - ConfigManager 초기화됨. base_dir: C:\Users\gksdbwns\yolo01\gmpy\test02
+[DEBUG] 2026-05-19 14:15:44,774 - [PID:9232|MainThread] - __init__ - LogDatabase 초기화. 경로: C:\Users\gksdbwns\yolo01\gmpy\lastest\logs\training_history.db
+[DEBUG] 2026-05-19 14:15:57,709 - [PID:9232|MainThread] - show_webhook_settings - 웹훅 설정 다이얼로그 오픈
+[INFO] 2026-05-19 14:17:13,667 - [PID:9232|MainThread] - closeEvent - 애플리케이션 종료 프로세스 시작
+[DEBUG] 2026-05-19 14:17:13,816 - [PID:9232|MainThread] - _send_task - Discord 임베드 웹훅 전송 시도. (시도 1/3)
+[DEBUG] 2026-05-19 14:17:14,971 - [PID:9232|MainThread] - _send_task - 웹훅 전송 성공
+[INFO] 2026-05-19 14:17:14,974 - [PID:9232|MainThread] - closeEvent - 애플리케이션 종료 완료
+[INFO] 2026-05-19 14:17:31,401 - [PID:7700|MainThread] - __init__ - YOLO Training Pipeline 애플리케이션 시작 (OS: Windows, GPU: True)
+[DEBUG] 2026-05-19 14:17:31,401 - [PID:7700|MainThread] - __init__ - ConfigManager 초기화됨. base_dir: C:\Users\gksdbwns\yolo01\gmpy\test02
+[DEBUG] 2026-05-19 14:17:31,401 - [PID:7700|MainThread] - __init__ - LogDatabase 초기화. 경로: C:\Users\gksdbwns\yolo01\gmpy\lastest\logs\training_history.db
+[INFO] 2026-05-19 14:17:43,612 - [PID:7700|MainThread] - closeEvent - 애플리케이션 종료 프로세스 시작
+[DEBUG] 2026-05-19 14:17:43,691 - [PID:7700|MainThread] - _send_task - Discord 임베드 웹훅 전송 시도. (시도 1/3)
+[DEBUG] 2026-05-19 14:17:44,206 - [PID:7700|MainThread] - _send_task - 웹훅 전송 성공
+[INFO] 2026-05-19 14:17:44,206 - [PID:7700|MainThread] - closeEvent - 애플리케이션 종료 완료
