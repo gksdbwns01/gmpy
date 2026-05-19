@@ -76,7 +76,6 @@ db로그 폴더 수정. 전체 로그보기 가능. 라벨링 툴 목록에서 �
 automl 개선작업 시작 전 백업
 -개선은 main.py에서 작업
 -automl 실시간으로 그래프를 볼 수 있으면 좋을듯 - 오래걸리니깐 수동 얼리스타핑?
-안전종료 안됨
 
 https://chatgpt.com/share/6a0ab080-6c5c-83a3-9031-dbd929e020f1
 -Closing dataloader mosaic 이후 딜레이 있음

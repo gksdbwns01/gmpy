@@ -3,7 +3,7 @@ import queue as qlib
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import zipfile, cv2, numpy as np, pandas as pd, psutil, torch, yaml
 import threading
 
@@ -423,7 +423,7 @@ def send_discord_webhook(webhook_url, title, description, color=0x3498db, fields
             "title": title,
             "description": description,
             "color": color,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
         
         if fields:
