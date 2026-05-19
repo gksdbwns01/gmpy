@@ -772,7 +772,11 @@ def _tune_worker(args, queue):
     except Exception: 
         result["error"] = traceback.format_exc(); worker_logger.error(f"[AutoML Worker] Exception: {result['error']}")
     finally: 
-        clear_vram(); queue.put(result)
+        clear_vram()
+        try:
+            queue.put(result, timeout=3.0)
+        except Exception as e:
+            worker_logger.debug(f"메인 큐 연결 끊김 (데드락 방지): {e}")
 
 def _auto_threshold_worker(args, queue):
     worker_logger = setup_logger()
@@ -1001,9 +1005,12 @@ def _auto_threshold_worker(args, queue):
     except Exception:
         result["error"] = traceback.format_exc()
         worker_logger.error(f"[AutoThreshold Worker] Exception: {result['error']}")
-    finally:
+    finally: 
         clear_vram()
-        queue.put(result)
+        try:
+            queue.put(result, timeout=3.0)
+        except Exception as e:
+            worker_logger.debug(f"메인 큐 연결 끊김 (데드락 방지): {e}")
 
 def _single_fold_run(args, queue):
     worker_logger = setup_logger()
@@ -1157,7 +1164,12 @@ def _kfold_train_worker(args, queue):
             else: result["error"] = "가중치 파일이 없습니다."; worker_logger.error("Best 가중치 파일 탐색 실패")
         else: result["error"] = "학습 실패"; worker_logger.error("fold_metrics가 비어있음")
     except Exception: result["error"] = traceback.format_exc(); worker_logger.error(f"[K-Fold Worker] Exception: {result['error']}")
-    finally: clear_vram(); queue.put(result)
+    finally: 
+        clear_vram()
+        try:
+            queue.put(result, timeout=3.0)
+        except Exception as e:
+            worker_logger.debug(f"메인 큐 연결 끊김 (데드락 방지): {e}")
 
 def _retrain_worker(args, queue):
     worker_logger = setup_logger()
@@ -1205,7 +1217,12 @@ def _retrain_worker(args, queue):
         result["success"] = True; result["msg"] = f"✅ 재학습 완료!\n저장: {res.save_dir}"; result["save_dir"] = str(res.save_dir); result["model_path"] = str(trained_model_path)
         worker_logger.info("[Retrain Worker] 하드 재학습 모두 완료됨")
     except Exception: result["error"] = traceback.format_exc(); worker_logger.error(f"[Retrain Worker] Exception: {result['error']}")
-    finally: clear_vram(); queue.put(result)
+    finally: 
+        clear_vram()
+        try:
+            queue.put(result, timeout=3.0)
+        except Exception as e:
+            worker_logger.debug(f"메인 큐 연결 끊김 (데드락 방지): {e}")
 
 # =========================================================
 # [개선 3] 완벽한 VRAM 격리를 위한 Eval / Measure Worker 분리
@@ -1267,7 +1284,12 @@ def _eval_worker(args, queue):
         
         result.update({"success": True, "rows": rows, "wrong_imgs": wrong_imgs, "all_imgs": all_imgs, "stats": stats})
     except Exception: result["error"] = traceback.format_exc(); worker_logger.error("[Eval Worker] 에러 발생", exc_info=True)
-    finally: clear_vram(); queue.put(result)
+    finally: 
+        clear_vram()
+        try:
+            queue.put(result, timeout=3.0)
+        except Exception as e:
+            worker_logger.debug(f"메인 큐 연결 끊김 (데드락 방지): {e}")
 
 def _tab4_eval_worker(args, queue):
     worker_logger = setup_logger()
@@ -1388,7 +1410,12 @@ def _measure_worker(args, queue):
         worker_logger.info(f"[Measure Worker] 측정 완료. 결과 건수: {len(df_export)}, 이상치: {len(outliers_list)}")
         result.update({"success": True, "type": "result", "df_export": df_export.to_dict(), "df_parsed": df_parsed.to_dict(), "df_outliers": df_outliers_dict, "image_pairs": image_pairs})
     except Exception: result["error"] = traceback.format_exc(); worker_logger.error("[Measure Worker] 에러 발생", exc_info=True)
-    finally: clear_vram(); queue.put(result)
+    finally: 
+        clear_vram()
+        try:
+            queue.put(result, timeout=3.0)
+        except Exception as e:
+            worker_logger.debug(f"메인 큐 연결 끊김 (데드락 방지): {e}")
 
 # =========================================================
 # QThread Wrappers (UI와 통신하기 위해 Process를 관장)
@@ -1451,6 +1478,7 @@ class StoppableProcessThread(QThread):
         결과를 안전하게 수집합니다.
         """
         self.process = multiprocessing.Process(target=worker_func, args=(self.config, run_queue))
+        self.process.daemon = True
         self.process.start()
         
         res = None
@@ -2907,7 +2935,10 @@ class MainWindow(QMainWindow):
         except:
             pass # 종료 시에는 실패해도 프로그램 종료를 막지 않음
     def closeEvent(self, event):
-        # 🟢 종료 시작을 알리는 플래그 설정 (다른 UI 클릭 방지용)
+        if getattr(self, "_is_closing_in_progress", False):
+            event.ignore()
+            return
+        self._is_closing_in_progress = True
         self._shutting_down = True
         
         try:
