@@ -247,7 +247,6 @@ class LogDatabase:
         logger.debug(f"LogDatabase 초기화. 경로: {self.db_path}")
         self._ensure_db()
         self.log_queue = qlib.Queue()
-        # 단일 쓰기 전용 데몬 스레드 생성
         self.writer_thread = threading.Thread(target=self._db_writer_loop, daemon=True)
         self.writer_thread.start()
 
@@ -262,11 +261,10 @@ class LogDatabase:
     def _ensure_db(self):
         if not self.db_path.parent.exists(): 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            logger.info(f"DB 상위 폴더 생성됨: {self.db_path.parent}")
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('CREATE TABLE IF NOT EXISTS training_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, task_type TEXT, model_name TEXT, epochs INTEGER, batch_size INTEGER, best_map REAL, save_dir TEXT, config_json TEXT)')
-            cursor.execute('CREATE TABLE IF NOT EXISTS evaluation_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, task_type TEXT, model_name TEXT, total_imgs INTEGER, wrong_count INTEGER, accuracy REAL, wrong_images TEXT, config_json TEXT)')
+            cursor.execute('CREATE TABLE IF NOT EXISTS training_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, project_path TEXT, task_type TEXT, model_name TEXT, epochs INTEGER, batch_size INTEGER, best_map REAL, save_dir TEXT, config_json TEXT)')
+            cursor.execute('CREATE TABLE IF NOT EXISTS evaluation_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, project_path TEXT, task_type TEXT, model_name TEXT, total_imgs INTEGER, wrong_count INTEGER, accuracy REAL, wrong_images TEXT, config_json TEXT)')
             conn.commit()
 
     def _db_writer_loop(self):
@@ -275,24 +273,55 @@ class LogDatabase:
             task = self.log_queue.get()
             if task is None: break
             try:
-                task(conn) # 큐에서 함수 객체를 꺼내어 커넥션을 주입하고 실행
+                task(conn)
             except Exception as e:
                 logger.error(f"DB 쓰기 에러 발생: {e}", exc_info=True)
 
-    def insert_log(self, task_type, model_name, epochs, batch, best_map, save_dir, config_data):
-        params = (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), task_type, model_name, epochs, batch, best_map, save_dir, json.dumps(config_data, ensure_ascii=False))
+    def insert_log(self, project_path, task_type, model_name, epochs, batch, best_map, save_dir, config_data):
+        params = (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+            project_path,
+            task_type, 
+            model_name, 
+            epochs, 
+            batch, 
+            best_map, 
+            save_dir, 
+            json.dumps(config_data, ensure_ascii=False)
+        )
         def _task(conn):
-            conn.execute('INSERT INTO training_logs (timestamp, task_type, model_name, epochs, batch_size, best_map, save_dir, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', params)
+            conn.execute('''
+                INSERT INTO training_logs 
+                (timestamp, project_path, task_type, model_name, epochs, batch_size, best_map, save_dir, config_json) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', params)
             conn.commit()
-            logger.info(f"학습 로그 DB 삽입 완료. Task: {task_type}, Best mAP: {best_map:.4f}")
+            from pathlib import Path
+            logger.info(f"학습 로그 DB 삽입 완료. Project: {Path(project_path).name}, Task: {task_type}, Best mAP: {best_map:.4f}")
+            
         self.log_queue.put(_task)
 
-    def insert_eval_log(self, task_type, model_name, total, wrong, accuracy, wrong_imgs_list, config_data):
-        params = (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), task_type, model_name, total, wrong, accuracy, json.dumps([Path(p).name for p in wrong_imgs_list], ensure_ascii=False), json.dumps(config_data, ensure_ascii=False))
+    def insert_eval_log(self, project_path, task_type, model_name, total, wrong, accuracy, wrong_imgs_list, config_data):
+        params = (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+            project_path,
+            task_type, 
+            model_name, 
+            total, 
+            wrong, 
+            accuracy, 
+            json.dumps([Path(p).name for p in wrong_imgs_list], ensure_ascii=False), 
+            json.dumps(config_data, ensure_ascii=False)
+        )
         def _task(conn):
-            conn.execute('INSERT INTO evaluation_logs (timestamp, task_type, model_name, total_imgs, wrong_count, accuracy, wrong_images, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', params)
+            conn.execute('''
+                INSERT INTO evaluation_logs 
+                (timestamp, project_path, task_type, model_name, total_imgs, wrong_count, accuracy, wrong_images, config_json) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', params)
             conn.commit()
-            logger.info(f"평가 로그 DB 삽입 완료. Task: {task_type}, Acc: {accuracy:.2f}%")
+            from pathlib import Path
+            logger.info(f"평가 로그 DB 삽입 완료. Project: {Path(project_path).name}, Task: {task_type}, Acc: {accuracy:.2f}%")
         self.log_queue.put(_task)
 
     def delete_logs(self, table_type, ids):
@@ -308,10 +337,13 @@ class LogDatabase:
         evt.wait() # UI 쓰레드가 삭제 완료를 대기함
         logger.info(f"DB 레코드 삭제 완료. Table: {table_name}, IDs: {ids}")
 
-    def fetch_logs(self, table_type, search_kw="", date_from=None, date_to=None, filter_ng=False, offset=0, limit=100, sort_col="id", sort_order="DESC"):
+    def fetch_logs(self, table_type, current_proj_path="", search_kw="", date_from=None, date_to=None, filter_ng=False, offset=0, limit=100, sort_col="id", sort_order="DESC"):
         table_name = 'training_logs' if table_type == 'train' else 'evaluation_logs'
         query = f"SELECT * FROM {table_name} WHERE 1=1"
         params = []
+        if current_proj_path:
+            query += " AND project_path = ?"
+            params.append(current_proj_path)
         if search_kw:
             query += " AND (task_type LIKE ? OR model_name LIKE ?)"
             params.extend([f"%{search_kw}%", f"%{search_kw}%"])
@@ -1919,7 +1951,9 @@ class LogTabWidget(QWidget):
         
         self.chk_ng_only = QCheckBox("NG(오답) 항목만 보기")
         self.chk_ng_only.setVisible(self.tab_type == 'eval')
-        
+        self.chk_current_proj_only = QCheckBox("현재 프로젝트 기록만 보기")
+        self.chk_current_proj_only.setChecked(True) # 기본값은 현재 프로젝트만 매끄럽게 보여주기
+        self.chk_current_proj_only.stateChanged.connect(self.on_search)
         btn_search = QPushButton("🔍 조회/새로고침")
         btn_search.clicked.connect(self.on_search)
         
@@ -1935,6 +1969,7 @@ class LogTabWidget(QWidget):
         filter_layout.addWidget(self.dt_to)
         filter_layout.addSpacing(10)
         filter_layout.addWidget(self.search_input)
+        filter_layout.addWidget(self.chk_current_proj_only)
         if self.tab_type == 'eval':
             filter_layout.addWidget(self.chk_ng_only)
         filter_layout.addWidget(btn_search)
@@ -2084,18 +2119,20 @@ class LogTabWidget(QWidget):
         d_from = self.dt_from.date().toString("yyyy-MM-dd")
         d_to = self.dt_to.date().toString("yyyy-MM-dd")
         filter_ng = self.chk_ng_only.isChecked() if self.tab_type == 'eval' else False
-        
+        current_proj_path = ""
+        if self.chk_current_proj_only.isChecked():
+            main_window = self.window()
+            if hasattr(main_window, 'w_proj_root'):
+                current_proj_path = main_window.w_proj_root.get_path()
         offset = (self.current_page - 1) * self.page_size
-        
         rows, total_count = self.db_manager.fetch_logs(
-            table_type=self.tab_type, search_kw=kw, date_from=d_from, date_to=d_to,
+            table_type=self.tab_type, current_proj_path=current_proj_path, 
+            search_kw=kw, date_from=d_from, date_to=d_to,
             filter_ng=filter_ng, offset=offset, limit=self.page_size,
             sort_col=self.sort_col, sort_order=self.sort_order
         )
-        
         self.current_rows = rows
         self.table.setRowCount(len(rows))
-        
         for r_idx, row in enumerate(rows):
             chk_item = QTableWidgetItem()
             chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
@@ -2154,9 +2191,14 @@ class LogTabWidget(QWidget):
         d_from = self.dt_from.date().toString("yyyy-MM-dd")
         d_to = self.dt_to.date().toString("yyyy-MM-dd")
         filter_ng = self.chk_ng_only.isChecked() if self.tab_type == 'eval' else False
-        
+        current_proj_path = ""
+        if self.chk_current_proj_only.isChecked():
+            main_window = self.window()
+            if hasattr(main_window, 'w_proj_root'):
+                current_proj_path = main_window.w_proj_root.get_path()
         rows, _ = self.db_manager.fetch_logs(
-            table_type=self.tab_type, search_kw=kw, date_from=d_from, date_to=d_to,
+            table_type=self.tab_type, current_proj_path=current_proj_path,
+            search_kw=kw, date_from=d_from, date_to=d_to,
             filter_ng=filter_ng, offset=0, limit=-1, sort_col=self.sort_col, sort_order=self.sort_order
         )
         
@@ -2492,17 +2534,19 @@ class IntegrityThread(QThread):
             self.error.emit(traceback.format_exc())
 
 class IntegrityReportDialog(QDialog):
-    request_fix = pyqtSignal(str) # 이미지 수정을 위한 시그널
+    request_fix = pyqtSignal(str) # 기존 단일 이동 시그널
+    request_fix_multi = pyqtSignal(list) # 🌟 [추가] 다중 이동을 위한 새로운 시그널
 
     def __init__(self, issues, parent=None):
         super().__init__(parent)
         self.setWindowTitle("🚨 데이터셋 무결성 검사 리포트")
         self.resize(800, 500)
+        self.issues = issues # 🌟 [추가] issues 데이터를 클래스 변수로 저장
         
         layout = QVBoxLayout(self)
         
         lbl_info = QLabel(f"<b>총 {len(issues)}개의 잠재적 문제</b>가 발견되었습니다.<br>"
-                          "<span style='color: #d97706;'>💡 항목을 <b>더블클릭</b>하면 라벨링 툴로 자동 이동하여 바로 수정할 수 있습니다.</span>")
+                          "<span style='color: #d97706;'>💡 항목을 <b>더블클릭</b>하면 해당 이미지만 라벨링 툴에서 엽니다.</span>")
         layout.addWidget(lbl_info)
         
         self.table = QTableWidget(len(issues), 3)
@@ -2529,15 +2573,32 @@ class IntegrityReportDialog(QDialog):
         self.table.itemDoubleClicked.connect(self.on_double_click)
         layout.addWidget(self.table)
         
+        # 🌟 [추가] 하단 버튼 레이아웃 분리 및 다중 열기 버튼 추가
+        btn_layout = QHBoxLayout()
+        
+        btn_fix_all = QPushButton("🛠️ 문제 있는 이미지만 모아서 라벨링 툴 열기")
+        btn_fix_all.setStyleSheet("background-color: #fef08a; font-weight: bold; color: #854d0e;")
+        btn_fix_all.setMinimumHeight(40)
+        btn_fix_all.clicked.connect(self.on_fix_all_clicked)
+        
         btn_close = QPushButton("닫기")
         btn_close.clicked.connect(self.accept)
         btn_close.setMinimumHeight(40)
-        layout.addWidget(btn_close)
+        
+        btn_layout.addWidget(btn_fix_all)
+        btn_layout.addWidget(btn_close)
+        layout.addLayout(btn_layout)
 
     def on_double_click(self, item):
         row = item.row()
         file_name = self.table.item(row, 0).text()
         self.request_fix.emit(file_name)
+        self.accept()
+
+    # 🌟 [추가] 다중 열기 버튼 클릭 이벤트
+    def on_fix_all_clicked(self):
+        file_names = list(set([issue["file"] for issue in self.issues if "file" in issue]))
+        self.request_fix_multi.emit(file_names)
         self.accept()
 # ==========================================
 # Main App
@@ -2547,9 +2608,13 @@ class MainWindow(QMainWindow):
         super().__init__(); self.setWindowTitle("YOLO Training Pipeline (PyQt5) - AutoML + Graceful Stop + Embed Webhooks + VRAM Isolation"); self.resize(1400, 900)
         logger.info(f"YOLO Training Pipeline 애플리케이션 시작 (OS: {platform.system()}, GPU: {torch.cuda.is_available()})")
         self.base_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
-        default_proj_path = self.base_dir / "MyProject"; self.config_manager = ConfigManager(str(default_proj_path)); self.config_builder = ConfigBuilder()
-        self.log_db = LogDatabase(self.base_dir / "MyProject" / "workspace" / "training_history.db"); self.training_process = None; self.init_ui()
-
+        self.settings = QSettings("MyVisionProject", "YoloTrainerApp")
+        last_proj = self.settings.value("last_project_path", str(self.base_dir))
+        self.config_manager = ConfigManager(last_proj)
+        self.config_builder = ConfigBuilder()
+        self.log_db = LogDatabase(self.base_dir / "logs" / "training_history.db")
+        self.training_process = None
+        self.init_ui()
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.update_status_animation)
         self.status_animation_frame = 0
@@ -2675,8 +2740,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, 't5_img'): self.t5_img.line_edit.setText(str(Path(new_path) / "images"))
 
     def sync_project_root(self, new_path):
-        proj_dir = Path(new_path); self.w_base_ds.line_edit.setText(str(proj_dir / "dataset")); self.w_proc_ds.line_edit.setText(str(proj_dir / "processed_dataset")); self.w_work_ds.line_edit.setText(str(proj_dir / "workspace"))
-        self.config_manager.update_workspace_path(str(proj_dir / "workspace")); self.log_db = LogDatabase(proj_dir / "workspace" / "training_history.db")
+        proj_dir = Path(new_path)
+        self.w_base_ds.line_edit.setText(str(proj_dir / "dataset"))
+        self.w_proc_ds.line_edit.setText(str(proj_dir / "processed_dataset"))
+        self.w_work_ds.line_edit.setText(str(proj_dir / "workspace"))
+        self.config_manager.update_workspace_path(str(proj_dir / "workspace"))
+        self.settings.setValue("last_project_path", new_path)
         logger.debug(f"프로젝트 루트 동기화 완료: {new_path}")
 
     def sync_work_paths(self, new_path):
@@ -3476,6 +3545,8 @@ class MainWindow(QMainWindow):
             
         dialog = IntegrityReportDialog(issues, self)
         dialog.request_fix.connect(self.navigate_to_labeling_for_fix)
+        # 🌟 [추가] 새로운 시그널 연결
+        dialog.request_fix_multi.connect(self.navigate_to_labeling_for_fix_multi)
         dialog.exec_()
 
     def load_labeling_images_programmatic(self, img_dir_path):
@@ -3506,6 +3577,33 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"🛠️ '{file_name}' 데이터를 수정할 준비가 되었습니다.", 5000)
         else:
             QMessageBox.warning(self, "파일 탐색 실패", f"라벨링 목록에서 '{file_name}' 이미지를 찾을 수 없습니다.")
+    def navigate_to_labeling_for_fix_multi(self, file_names):
+        """다수의 오류 이미지를 라벨링 탭 리스트에 한 번에 로드합니다."""
+        logger.info(f"오류 수정을 위해 라벨링 툴로 다중 이동 요청됨: {len(file_names)}건")
+        self.tabs.setCurrentIndex(0)
+        proc_dir = Path(self.w_proc_ds.get_path())
+        self.t6_img_dir.line_edit.setText(str(proc_dir / "images"))
+        self.t6_lbl_dir.line_edit.setText(str(proc_dir / "labels"))
+        
+        self.t6_list.clear()
+        valid_exts = {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}
+        target_dir = proc_dir / "images"
+        
+        # 파일명에서 확장자를 제외한 이름(stem)만 추출하여 셋(set)으로 만듦
+        target_stems = {Path(name).stem for name in file_names}
+        
+        if target_dir.exists():
+            for f in sorted(target_dir.iterdir()):
+                # 오류 목록에 있는 이름(stem)과 일치하는 이미지만 리스트에 추가
+                if f.suffix.lower() in valid_exts and f.stem in target_stems:
+                    self.t6_list.addItem(f.name)
+        
+        if self.t6_list.count() > 0:
+            self.t6_list.setCurrentRow(0)
+            self.on_label_image_selected(self.t6_list.currentItem())
+            self.statusBar().showMessage(f"🛠️ {self.t6_list.count()}개의 문제 이미지를 라벨링 툴에 로드했습니다. (순차적으로 라벨링을 진행하세요)", 6000)
+        else:
+            QMessageBox.warning(self, "파일 탐색 실패", "지정된 오류 이미지들을 찾을 수 없습니다. (이미 삭제되었을 수 있습니다)")
     def show_tune_history(self):
         history_path = Path(self.w_work_ds.get_path()) / "runs" / "tune_custom" / "tune_history.csv"
         if not history_path.exists():

@@ -2534,17 +2534,19 @@ class IntegrityThread(QThread):
             self.error.emit(traceback.format_exc())
 
 class IntegrityReportDialog(QDialog):
-    request_fix = pyqtSignal(str) # 이미지 수정을 위한 시그널
+    request_fix = pyqtSignal(str) # 기존 단일 이동 시그널
+    request_fix_multi = pyqtSignal(list) # 🌟 [추가] 다중 이동을 위한 새로운 시그널
 
     def __init__(self, issues, parent=None):
         super().__init__(parent)
         self.setWindowTitle("🚨 데이터셋 무결성 검사 리포트")
         self.resize(800, 500)
+        self.issues = issues # 🌟 [추가] issues 데이터를 클래스 변수로 저장
         
         layout = QVBoxLayout(self)
         
         lbl_info = QLabel(f"<b>총 {len(issues)}개의 잠재적 문제</b>가 발견되었습니다.<br>"
-                          "<span style='color: #d97706;'>💡 항목을 <b>더블클릭</b>하면 라벨링 툴로 자동 이동하여 바로 수정할 수 있습니다.</span>")
+                          "<span style='color: #d97706;'>💡 항목을 <b>더블클릭</b>하면 해당 이미지만 라벨링 툴에서 엽니다.</span>")
         layout.addWidget(lbl_info)
         
         self.table = QTableWidget(len(issues), 3)
@@ -2571,15 +2573,32 @@ class IntegrityReportDialog(QDialog):
         self.table.itemDoubleClicked.connect(self.on_double_click)
         layout.addWidget(self.table)
         
+        # 🌟 [추가] 하단 버튼 레이아웃 분리 및 다중 열기 버튼 추가
+        btn_layout = QHBoxLayout()
+        
+        btn_fix_all = QPushButton("🛠️ 문제 있는 이미지만 모아서 라벨링 툴 열기")
+        btn_fix_all.setStyleSheet("background-color: #fef08a; font-weight: bold; color: #854d0e;")
+        btn_fix_all.setMinimumHeight(40)
+        btn_fix_all.clicked.connect(self.on_fix_all_clicked)
+        
         btn_close = QPushButton("닫기")
         btn_close.clicked.connect(self.accept)
         btn_close.setMinimumHeight(40)
-        layout.addWidget(btn_close)
+        
+        btn_layout.addWidget(btn_fix_all)
+        btn_layout.addWidget(btn_close)
+        layout.addLayout(btn_layout)
 
     def on_double_click(self, item):
         row = item.row()
         file_name = self.table.item(row, 0).text()
         self.request_fix.emit(file_name)
+        self.accept()
+
+    # 🌟 [추가] 다중 열기 버튼 클릭 이벤트
+    def on_fix_all_clicked(self):
+        file_names = list(set([issue["file"] for issue in self.issues if "file" in issue]))
+        self.request_fix_multi.emit(file_names)
         self.accept()
 # ==========================================
 # Main App
@@ -3526,6 +3545,8 @@ class MainWindow(QMainWindow):
             
         dialog = IntegrityReportDialog(issues, self)
         dialog.request_fix.connect(self.navigate_to_labeling_for_fix)
+        # 🌟 [추가] 새로운 시그널 연결
+        dialog.request_fix_multi.connect(self.navigate_to_labeling_for_fix_multi)
         dialog.exec_()
 
     def load_labeling_images_programmatic(self, img_dir_path):
@@ -3556,6 +3577,33 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"🛠️ '{file_name}' 데이터를 수정할 준비가 되었습니다.", 5000)
         else:
             QMessageBox.warning(self, "파일 탐색 실패", f"라벨링 목록에서 '{file_name}' 이미지를 찾을 수 없습니다.")
+    def navigate_to_labeling_for_fix_multi(self, file_names):
+        """다수의 오류 이미지를 라벨링 탭 리스트에 한 번에 로드합니다."""
+        logger.info(f"오류 수정을 위해 라벨링 툴로 다중 이동 요청됨: {len(file_names)}건")
+        self.tabs.setCurrentIndex(0)
+        proc_dir = Path(self.w_proc_ds.get_path())
+        self.t6_img_dir.line_edit.setText(str(proc_dir / "images"))
+        self.t6_lbl_dir.line_edit.setText(str(proc_dir / "labels"))
+        
+        self.t6_list.clear()
+        valid_exts = {".jpg", ".jpeg", ".png", ".JPG", ".PNG"}
+        target_dir = proc_dir / "images"
+        
+        # 파일명에서 확장자를 제외한 이름(stem)만 추출하여 셋(set)으로 만듦
+        target_stems = {Path(name).stem for name in file_names}
+        
+        if target_dir.exists():
+            for f in sorted(target_dir.iterdir()):
+                # 오류 목록에 있는 이름(stem)과 일치하는 이미지만 리스트에 추가
+                if f.suffix.lower() in valid_exts and f.stem in target_stems:
+                    self.t6_list.addItem(f.name)
+        
+        if self.t6_list.count() > 0:
+            self.t6_list.setCurrentRow(0)
+            self.on_label_image_selected(self.t6_list.currentItem())
+            self.statusBar().showMessage(f"🛠️ {self.t6_list.count()}개의 문제 이미지를 라벨링 툴에 로드했습니다. (순차적으로 라벨링을 진행하세요)", 6000)
+        else:
+            QMessageBox.warning(self, "파일 탐색 실패", "지정된 오류 이미지들을 찾을 수 없습니다. (이미 삭제되었을 수 있습니다)")
     def show_tune_history(self):
         history_path = Path(self.w_work_ds.get_path()) / "runs" / "tune_custom" / "tune_history.csv"
         if not history_path.exists():
