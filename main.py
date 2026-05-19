@@ -508,12 +508,13 @@ def create_heartbeat_callback(webhook_url, total_epochs, interval):
 
 def create_stop_callback(stop_event):
     def check_stop(trainer):
-        if stop_event is not None and stop_event.is_set():
-            logger.info("🛑 사용자의 중지 요청 감지. 작업을 안전하게 조기 종료합니다.")
+        if stop_event and stop_event.is_set():
             trainer.stop = True
+            
     return {
         "on_train_epoch_end": check_stop,
-        "on_train_batch_end": check_stop
+        "on_train_batch_end": check_stop,
+        "on_train_batch_start": check_stop # 🟢 추가: 배치 시작 직전에도 체크
     }
 
 class WebhookSettingsDialog(QDialog):
@@ -1398,33 +1399,29 @@ class ProcessMonitorThread(QThread):
     def run(self):
         logger.debug(f"[Monitor Thread] 모니터링 시작 (PID: {self.process.pid})")
         result = None
-        kill_deadline = 0
-        is_stopping = False
+        stop_deadline = None # 🟢 1회 설정을 위한 변수
 
         while self.process.is_alive():
             if self.stop_event and self.stop_event.is_set():
-                if not is_stopping:
-                    logger.warning("UI 쓰레드 중지 신호 감지. 워커의 안전 종료를 대기합니다")
-                    is_stopping = True
-                    kill_deadline = time.time() + 300.0
-                
-                # 유예 기간이 지났는데도 살아있다면 그때 강제 사살
-                if time.time() > kill_deadline:
-                    logger.error("워커가 응답하지 않아 강제 종료(Kill)합니다.")
+                if stop_deadline is None:  # 🟢 최초 1회만 설정
+                    stop_deadline = time.time() + 300.0
+                    logger.warning("중단 신호 감지. 300초 후 강제 종료 대기.")
+                elif time.time() > stop_deadline:
+                    logger.error("시간 초과. 프로세스 트리 강제 종료.")
                     kill_process_tree(self.process.pid)
-                    break
-
+                    break  # 🟢 강제 종료 후 루프 탈출
+            
             try: 
                 result = self.queue.get(timeout=0.5)
                 break
             except qlib.Empty: 
                 continue
+                
         self.process.join(timeout=2)
-        if result is None:
-            try: result = self.queue.get(timeout=0.5)
-            except qlib.Empty: pass
+        # 🟢 process가 강제 종료되었다면 큐 수집 과정을 건너뜁니다.
         if result: self.finished_ok.emit(result)
-        else: self.error.emit(f"프로세스 비정상 종료 (Exit Code: {self.process.exitcode})")
+        elif self.process.exitcode is not None and self.process.exitcode != 0:
+            self.error.emit(f"프로세스 비정상 종료 (Exit Code: {self.process.exitcode})")
 
 class StoppableProcessThread(QThread):
     def __init__(self, config):
@@ -1449,54 +1446,78 @@ class StoppableProcessThread(QThread):
             kill_process_tree(self.process.pid)
 
     def _run_worker_process(self, worker_func, run_queue, progress_handler=None):
+        """
+        워커 프로세스를 실행하고, 안전 종료(Graceful Stop)와 강제 종료를 처리하며
+        결과를 안전하게 수집합니다.
+        """
         self.process = multiprocessing.Process(target=worker_func, args=(self.config, run_queue))
         self.process.start()
+        
         res = None
-        stop_deadline = None
+        stop_deadline = None  # 🟢 [개선] 1회 설정을 위한 변수 초기화
+        
         try:
+            # 프로세스가 살아있는 동안 루프
             while self.process.is_alive():
+                # 1. 종료 신호 감지 및 강제 종료 카운트다운
                 if self.stop_event and self.stop_event.is_set():
                     if stop_deadline is None:
+                        # 🟢 [개선] 최초 1회만 데드라인 설정
                         stop_deadline = time.time() + self.stop_grace_seconds
-                        logger.warning(f"[{self.__class__.__name__}] 안전 종료 대기 시작 (최대 {self.stop_grace_seconds:.0f}초).")
+                        logger.warning(f"[{self.__class__.__name__}] 안전 종료 대기 중... ({self.stop_grace_seconds:.0f}초)")
                     elif time.time() > stop_deadline:
+                        # 🟢 [개선] 데드라인 초과 시 즉시 강제 종료하고 루프 탈출
                         self.force_stop_process()
                         break
 
+                # 2. 큐 수집 (Non-blocking 처리를 위해 타임아웃 사용)
                 try:
                     msg = run_queue.get(timeout=0.5)
+                    # 프로그레스 핸들러가 있다면 진행 상황 업데이트
                     if progress_handler and isinstance(msg, dict) and msg.get("type") == "progress":
                         progress_handler(msg)
                         continue
                     res = msg
-                    break
+                    break # 결과를 받았으면 루프 종료
                 except qlib.Empty:
                     continue
 
+            # 3. 프로세스 정리 (자연 종료 대기)
             self.process.join(timeout=2)
             if self.process.is_alive():
                 self.force_stop_process()
                 self.process.join(timeout=2)
 
+            # 🟢 [개선] 프로세스가 정상 종료되지 않았다면 결과 수집 스킵
+            # exitcode가 0이 아니면 에러로 간주하거나 프로세스가 kill 된 것임
+            if self.process.exitcode != 0:
+                logger.warning(f"워커 프로세스 비정상 종료 (ExitCode: {self.process.exitcode})")
+                return {"success": False, "error": f"프로세스가 비정상적으로 종료되었습니다. (Exit Code: {self.process.exitcode})"}
+
+            # 강제 종료된 것이 아니라면 남아있는 큐 데이터 확인
             while res is None:
                 try:
                     msg = run_queue.get_nowait()
+                    if progress_handler and isinstance(msg, dict) and msg.get("type") == "progress":
+                        progress_handler(msg)
+                        continue
+                    res = msg
                 except qlib.Empty:
                     break
-                if progress_handler and isinstance(msg, dict) and msg.get("type") == "progress":
-                    progress_handler(msg)
-                    continue
-                res = msg
 
+            # 최종 사용자 취소 확인
             if res is None and self.stop_event and self.stop_event.is_set():
                 res = {"success": False, "error": "사용자 취소됨"}
+            
             return res
+
         finally:
+            # 4. 큐 리소스 정리 (에러 발생 시에도 무조건 실행)
             try:
                 run_queue.close()
                 run_queue.join_thread()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"큐 정리 중 예외 발생: {e}")
 
 class EvalThread(StoppableProcessThread):
     finished_ok = pyqtSignal(pd.DataFrame, list, list, dict); error = pyqtSignal(str)
@@ -2877,60 +2898,55 @@ class MainWindow(QMainWindow):
         if monitor and monitor.isRunning():
             monitor.wait(5000)
 
+    def send_critical_webhook(webhook_url, title, description):
+        """종료 시 필수 웹훅 (타임아웃 10초, 실패 시 무시)"""
+        try:
+            import requests
+            payload = {"embeds": [{"title": title, "description": description, "color": 0x992d22}]}
+            requests.post(webhook_url, json=payload, timeout=10)
+        except:
+            pass # 종료 시에는 실패해도 프로그램 종료를 막지 않음
     def closeEvent(self, event):
         active_tasks = self._active_background_tasks()
-        is_busy = bool(active_tasks)
-        if is_busy:
-            task_text = "\n".join(f"- {label}" for label, _ in active_tasks)
+        
+        if active_tasks:
+            # 종료 전 안전 확인
             reply = QMessageBox.warning(
                 self, "종료 경고", 
-                f"현재 작업이 진행 중입니다.\n\n{task_text}\n\n종료를 계속하면 먼저 안전 종료 신호를 보내고 최대 30초 동안 정리를 기다립니다.\n그래도 응답하지 않는 프로세스는 마지막 수단으로 강제 종료합니다.\n\n계속 종료하시겠습니까?",
+                "현재 진행 중인 작업이 있습니다.\n확인을 누르면 30초간 안전하게 종료를 시도합니다.",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No
             )
             if reply == QMessageBox.No:
                 event.ignore()
                 return
 
-        logger.info("애플리케이션 종료 프로세스 시작")
-        self._shutting_down = True
-        
-        if hasattr(self, 'monitor_thread') and self.monitor_thread:
-            try:
-                self.monitor_thread.finished_ok.disconnect()
-                self.monitor_thread.error.disconnect()
-                logger.debug("모니터링 스레드 시그널 연결 해제 (중복 알림 방지)")
-            except:
-                pass
+            # 🟢 UX 개선: 작업이 진행 중임을 알리는 진행창
+            progress = QProgressDialog("진행 중인 작업을 안전하게 종료 중...", "강제 종료", 0, 30, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
 
-        if is_busy and self.webhook_url and self.noti_flags.get("task"):
-            task_name = ", ".join(label for label, _ in active_tasks)
-            send_discord_webhook(
-                webhook_url=self.webhook_url,
-                title=f"🛑 [작업 중단] {task_name}",
-                description="프로그램 종료 요청으로 진행 중인 작업에 안전 종료 신호를 보냈습니다.",
-                color=0xf39c12, 
-                sync=True 
-            )
+            # 1. 종료 신호 전송
+            if hasattr(self, 'stop_event'): self.stop_event.set()
+            
+            # 2. 30초 동안 대기하면서 UI 처리 유지
+            start_time = time.time()
+            while self._active_background_tasks() and (time.time() - start_time) < 30:
+                QApplication.processEvents() # 🟢 UI 멈춤 방지
+                time.sleep(0.5)
+                progress.setValue(int(time.time() - start_time))
+                if progress.wasCanceled(): break
+            
+            progress.close()
 
-        if self.webhook_url:
-            status_text = " (작업 중 종료)" if is_busy else " (정상 종료)"
-            send_discord_webhook(
-                webhook_url=self.webhook_url,
-                title="⏹️ [프로그램 종료]",
-                description=f"YOLO 파이프라인 관리 도구가 종료되었습니다.{status_text}",
-                color=0x2c3e50,
-                sync=True
-            )
+            # 3. 그래도 남아있으면 강제 종료
+            if self._active_background_tasks():
+                self._shutdown_active_tasks()
 
-        if is_busy:
-            self.statusBar().showMessage("🛑 진행 중인 작업을 안전하게 종료하는 중입니다...")
-            self._shutdown_active_tasks()
-
+        # DB 종료
         if hasattr(self, "log_db") and self.log_db:
-            self.log_db.close()
-
-        self.settings.setValue("webhook_url", self.webhook_url)
-        logger.info("애플리케이션 종료 완료")
+            self.log_db.close(timeout=5.0)
+        logger.info("애플리케이션 정상 종료 중... 로깅 종료.")
+        logging.shutdown()
         event.accept()
 
     def sync_base_paths(self, new_path):
