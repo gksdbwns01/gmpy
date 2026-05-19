@@ -34,7 +34,7 @@ class ConfigDefaults:
     
     TAB2 = {
         "epochs": 400, "batch": 16, "workers": 8, "patience": 100, "folds": 5, "test_split": 0.2,
-        "lcls": 0.5, "lbox": 7.5, "ldfl": 1.5, "tune_iterations": 30,
+        "lcls": 0.5, "lbox": 7.5, "ldfl": 1.5, "tune_iterations": 100,
         "ah": 0.015, "as": 0.7, "av": 0.4, "adeg": 0.0, "atrans": 0.1, "ascale": 0.5,
         "ashear": 0.0, "afud": 0.0, "aflr": 0.5, "amos": 1.0, "amix": 0.0, "acp": 0.0
     }
@@ -604,28 +604,27 @@ def _tune_worker(args, queue):
                 trial.study.stop()
                 raise optuna.exceptions.TrialPruned()
 
+            # 💡 [개선 1] 제조 공정(OK/NG)에 맞춘 탐색 공간 축소 및 lr0(학습률) 추가
+            # 형태 왜곡이 심한 shear, flipud, fliplr, mixup, copy_paste 등은 탐색에서 제외합니다.
             current_params = {
-                'box': round(trial.suggest_float('box', 0.1, 20.0), 4),
-                'cls': round(trial.suggest_float('cls', 0.1, 10.0), 4),
-                'dfl': round(trial.suggest_float('dfl', 0.1, 10.0), 4),
-                'hsv_h': round(trial.suggest_float('hsv_h', 0.0, 0.1), 4),
-                'hsv_s': round(trial.suggest_float('hsv_s', 0.0, 1.0), 4),
-                'hsv_v': round(trial.suggest_float('hsv_v', 0.0, 1.0), 4),
-                'degrees': round(trial.suggest_float('degrees', 0.0, 45.0), 4),
-                'translate': round(trial.suggest_float('translate', 0.0, 0.5), 4),
-                'scale': round(trial.suggest_float('scale', 0.0, 1.0), 4),
-                'shear': round(trial.suggest_float('shear', 0.0, 30.0), 4),
-                'flipud': round(trial.suggest_float('flipud', 0.0, 1.0), 4),
-                'fliplr': round(trial.suggest_float('fliplr', 0.0, 1.0), 4),
-                'mosaic': round(trial.suggest_float('mosaic', 0.0, 1.0), 4),
-                'mixup': round(trial.suggest_float('mixup', 0.0, 1.0), 4),
-                'copy_paste': round(trial.suggest_float('copy_paste', 0.0, 1.0), 4)
+                'lr0': round(trial.suggest_float('lr0', 1e-4, 1e-2, log=True), 5),
+                'box': round(trial.suggest_float('box', 0.5, 10.0), 4),
+                'cls': round(trial.suggest_float('cls', 0.1, 5.0), 4),
+                'dfl': round(trial.suggest_float('dfl', 0.5, 5.0), 4),
+                'hsv_h': round(trial.suggest_float('hsv_h', 0.0, 0.05), 4),
+                'hsv_s': round(trial.suggest_float('hsv_s', 0.0, 0.5), 4),
+                'hsv_v': round(trial.suggest_float('hsv_v', 0.0, 0.5), 4),
+                'degrees': round(trial.suggest_float('degrees', 0.0, 10.0), 4),
+                'translate': round(trial.suggest_float('translate', 0.0, 0.2), 4),
+                'scale': round(trial.suggest_float('scale', 0.0, 0.3), 4),
+                'mosaic': round(trial.suggest_float('mosaic', 0.0, 1.0), 4)
             }
             
             gen = trial.number
             worker_logger.debug(f"--- 튜닝 세대 {gen+1}/{iterations} --- 시작")
             
-            adaptive_epochs = max(10, int((tune_epochs // 2) + (tune_epochs - tune_epochs // 2) * (gen / max(1, iterations - 1))))
+            # 💡 [개선 2] 가변 에포크를 제거하고 모든 세대가 동일한 고정 에포크로 공정하게 시험을 치르도록 수정
+            adaptive_epochs = tune_epochs 
             
             run_args = {
                 "model_name": model_name, "data_yaml": data_yaml, "adaptive_epochs": adaptive_epochs,
@@ -640,7 +639,6 @@ def _tune_worker(args, queue):
             p.start()
             
             run_res = None
-            # [개선 1, 2] 데드락 방지 및 Subprocess 강제 종료
             while p.is_alive():
                 if stop_event and stop_event.is_set():
                     worker_logger.warning("중지 요청 감지. 단일 튜닝 워커 강제 종료 시도.")
@@ -653,7 +651,6 @@ def _tune_worker(args, queue):
                     continue
             p.join(timeout=2)
             
-            # 큐에 남은 게 있을 수 있으니 한번 더 확인
             if run_res is None and not run_queue.empty():
                 run_res = run_queue.get()
             
@@ -670,7 +667,7 @@ def _tune_worker(args, queue):
                     title="🛑 [조기 종료 발동]",
                     description=f"Auto ML {gen+1}세대 - **{actual_epochs} Epoch**에서 학습이 조기 종료되었습니다.",
                     color=0xe74c3c,
-                    sync=True # 동기식으로 확실하게 전송
+                    sync=True
                 )
 
             search_history.append({
@@ -686,7 +683,11 @@ def _tune_worker(args, queue):
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         study = optuna.create_study(direction="maximize")
-        study.enqueue_trial(args["initial_params"])
+        
+        # 💡 [개선 3] 1세대에 들어갈 기본(초기) 파라미터 필터링 및 lr0 초기값 세팅
+        filtered_initial_params = {k: v for k, v in args["initial_params"].items() if k in ['box', 'cls', 'dfl', 'hsv_h', 'hsv_s', 'hsv_v', 'degrees', 'translate', 'scale', 'mosaic']}
+        filtered_initial_params['lr0'] = 0.01  # YOLO 기본 학습률
+        study.enqueue_trial(filtered_initial_params)
         
         try:
             study.optimize(objective, n_trials=iterations)
@@ -718,7 +719,7 @@ def _tune_worker(args, queue):
                 description="최적의 파라미터 조합 탐색이 완료되었습니다.",
                 color=0x2ecc71,
                 fields=fields,
-                sync=True # 동기식으로 확실하게 전송
+                sync=True
             )   
         result["best_params"] = best_params
         result["success"] = True
