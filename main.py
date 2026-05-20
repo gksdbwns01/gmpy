@@ -730,9 +730,19 @@ def _tune_worker(args, queue):
         filtered_initial_params = {k: v for k, v in args["initial_params"].items() if k in ['box', 'cls', 'dfl', 'hsv_h', 'hsv_s', 'hsv_v', 'degrees', 'translate', 'scale', 'mosaic']}
         filtered_initial_params['lr0'] = 0.01  # YOLO 기본 학습률
         study.enqueue_trial(filtered_initial_params)
-        
+        def optuna_callback(study, trial):
+            try:
+                queue.put({
+                    "type": "tune_progress",
+                    "generation": trial.number + 1,
+                    "fitness": trial.value,
+                    "best_fitness": study.best_value,
+                    "params": trial.params
+                })
+            except Exception as e:
+                worker_logger.warning(f"진행 상황 큐 전송 실패: {e}")
         try:
-            study.optimize(objective, n_trials=iterations)
+            study.optimize(objective, n_trials=iterations, callbacks=[optuna_callback])
         except optuna.exceptions.TrialPruned:
             worker_logger.info("탐색이 안전하게 조기 종료되었습니다. 지금까지의 결과를 반환합니다.")
         except Exception as e:
@@ -1422,30 +1432,34 @@ def _measure_worker(args, queue):
 # =========================================================
 class ProcessMonitorThread(QThread):
     finished_ok = pyqtSignal(dict); error = pyqtSignal(str)
+    progress_update = pyqtSignal(dict)
     def __init__(self, queue, process, stop_event=None): super().__init__(); self.queue = queue; self.process = process; self.stop_event = stop_event
     def run(self):
         logger.debug(f"[Monitor Thread] 모니터링 시작 (PID: {self.process.pid})")
         result = None
-        stop_deadline = None # 🟢 1회 설정을 위한 변수
+        stop_deadline = None
 
         while self.process.is_alive():
             if self.stop_event and self.stop_event.is_set():
-                if stop_deadline is None:  # 🟢 최초 1회만 설정
+                if stop_deadline is None:
                     stop_deadline = time.time() + 300.0
                     logger.warning("중단 신호 감지. 300초 후 강제 종료 대기.")
                 elif time.time() > stop_deadline:
                     logger.error("시간 초과. 프로세스 트리 강제 종료.")
                     kill_process_tree(self.process.pid)
-                    break  # 🟢 강제 종료 후 루프 탈출
+                    break
             
-            try: 
-                result = self.queue.get(timeout=0.5)
+            try:
+                msg = self.queue.get(timeout=0.5)
+                if isinstance(msg, dict) and msg.get("type") in ["tune_progress", "progress"]:
+                    self.progress_update.emit(msg)
+                    continue
+                result = msg 
                 break
             except qlib.Empty: 
                 continue
                 
         self.process.join(timeout=2)
-        # 🟢 process가 강제 종료되었다면 큐 수집 과정을 건너뜁니다.
         if result: self.finished_ok.emit(result)
         elif self.process.exitcode is not None and self.process.exitcode != 0:
             self.error.emit(f"프로세스 비정상 종료 (Exit Code: {self.process.exitcode})")
@@ -2564,65 +2578,87 @@ class LogViewerDialog(QDialog):
         layout.addWidget(btn_close)
 
 class TuneHistoryDialog(QDialog):
-    def __init__(self, history_csv_path, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("📈 Auto ML 하이퍼파라미터 튜닝 기록")
+        self.setWindowTitle("📈 Auto ML 실시간 튜닝 모니터링")
         self.resize(1000, 700)
-        layout = QVBoxLayout(self)
+        self.layout = QVBoxLayout(self)
+        
+        self.df_list = [] # 실시간 데이터를 쌓을 리스트
+        
+        # 그래프 세팅
+        self.canvas = FigureCanvas(plt.Figure(figsize=(8, 4)))
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        self.layout.addWidget(self.toolbar)
+        self.layout.addWidget(self.canvas)
+        self.ax = self.canvas.figure.add_subplot(111)
+        
+        self.layout.addWidget(QLabel("<b>🏆 상위 5개 세대 파라미터 조합 (Top 5)</b>"))
+        self.table = QTableWidget()
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.layout.addWidget(self.table)
+        
+        btn_close = QPushButton("닫기")
+        btn_close.setMinimumHeight(40)
+        btn_close.clicked.connect(self.accept)
+        self.layout.addWidget(btn_close)
 
+    def load_from_csv(self, history_csv_path):
+        """기존 저장된 CSV 파일 불러오기"""
         try:
             df = pd.read_csv(history_csv_path)
-            
-            self.canvas = FigureCanvas(plt.Figure(figsize=(8, 4)))
-            self.toolbar = NavigationToolbar(self.canvas, self)
-            layout.addWidget(self.toolbar)
-            layout.addWidget(self.canvas)
-            
-            ax = self.canvas.figure.add_subplot(111)
-            sns.lineplot(data=df, x='generation', y='fitness', marker='o', ax=ax, label='Fitness (잠재력 점수)', color='#e11d48', linewidth=2)
-            
-            best_row = df.loc[df['fitness'].idxmax()]
-            ax.annotate(f"Best: {best_row['fitness']:.2f}", 
-                        xy=(best_row['generation'], best_row['fitness']), 
-                        xytext=(best_row['generation'], best_row['fitness'] + 1.5),
-                        arrowprops=dict(facecolor='#111827', shrink=0.05, width=1.5, headwidth=6),
-                        fontsize=10, fontweight='bold')
-            
-            ax.set_title("세대별 하이퍼파라미터 잠재력(Fitness) 진화 추이", fontdict={'weight': 'bold', 'size': 12})
-            ax.set_xlabel("세대 (Generation)")
-            ax.set_ylabel("Fitness Score")
-            ax.grid(True, linestyle='--', alpha=0.7)
-            self.canvas.draw()
-            
-            layout.addWidget(QLabel("<b>🏆 상위 5개 세대 파라미터 조합 (Top 5)</b>"))
-            table = QTableWidget()
-            top_df = df.sort_values(by='fitness', ascending=False).head(5)
-            
-            table.setRowCount(len(top_df))
-            table.setColumnCount(len(df.columns))
-            table.setHorizontalHeaderLabels(df.columns)
-            table.setAlternatingRowColors(True)
-            table.setEditTriggers(QTableWidget.NoEditTriggers)
-            table.setSelectionBehavior(QTableWidget.SelectRows)
-            
-            for r_idx, (_, row) in enumerate(top_df.iterrows()):
-                for c_idx, col_name in enumerate(df.columns):
-                    val = row[col_name]
-                    if isinstance(val, float): val = f"{val:.4f}"
-                    item = QTableWidgetItem(str(val))
-                    item.setTextAlignment(Qt.AlignCenter)
-                    table.setItem(r_idx, c_idx, item)
-            
-            table.resizeColumnsToContents()
-            layout.addWidget(table)
-            
-            btn_close = QPushButton("닫기")
-            btn_close.setMinimumHeight(40)
-            btn_close.clicked.connect(self.accept)
-            layout.addWidget(btn_close)
-            
+            self.df_list = df.to_dict('records')
+            self.update_plot()
         except Exception as e:
-            layout.addWidget(QLabel(f"기록을 불러오는 중 오류 발생:\n{traceback.format_exc()}"))
+            QMessageBox.warning(self, "오류", f"기록을 불러오는 중 오류 발생:\n{e}")
+
+    def add_live_data(self, data_dict):
+        """실시간 데이터 1줄 추가 및 화면 갱신"""
+        row = {
+            "generation": data_dict["generation"],
+            "fitness": data_dict["fitness"]
+        }
+        row.update(data_dict["params"])
+        self.df_list.append(row)
+        self.update_plot()
+
+    def update_plot(self):
+        """데이터를 바탕으로 차트와 표를 다시 그립니다."""
+        if not self.df_list: return
+        df = pd.DataFrame(self.df_list)
+        
+        self.ax.clear()
+        sns.lineplot(data=df, x='generation', y='fitness', marker='o', ax=self.ax, label='Fitness', color='#e11d48', linewidth=2)
+        
+        best_row = df.loc[df['fitness'].idxmax()]
+        self.ax.annotate(f"Best: {best_row['fitness']:.2f}", 
+                         xy=(best_row['generation'], best_row['fitness']), 
+                         xytext=(best_row['generation'], best_row['fitness'] + 1.5),
+                         arrowprops=dict(facecolor='#111827', shrink=0.05, width=1.5, headwidth=6),
+                         fontsize=10, fontweight='bold')
+        
+        self.ax.set_title("세대별 하이퍼파라미터 잠재력(Fitness) 진화 추이", fontdict={'weight': 'bold', 'size': 12})
+        self.ax.set_xlabel("세대 (Generation)")
+        self.ax.set_ylabel("Fitness Score")
+        self.ax.grid(True, linestyle='--', alpha=0.7)
+        self.canvas.draw_idle() # UI가 멈추지 않도록 idle 시점에 다시 그리기
+        
+        # 테이블 업데이트
+        top_df = df.sort_values(by='fitness', ascending=False).head(5)
+        self.table.setRowCount(len(top_df))
+        self.table.setColumnCount(len(df.columns))
+        self.table.setHorizontalHeaderLabels(df.columns)
+        
+        for r_idx, (_, row) in enumerate(top_df.iterrows()):
+            for c_idx, col_name in enumerate(df.columns):
+                val = row[col_name]
+                if isinstance(val, float): val = f"{val:.4f}"
+                item = QTableWidgetItem(str(val))
+                item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(r_idx, c_idx, item)
+        self.table.resizeColumnsToContents()
 
 class IntegrityThread(QThread):
     progress = pyqtSignal(int, str)
@@ -3282,6 +3318,7 @@ class MainWindow(QMainWindow):
         self.monitor_thread = ProcessMonitorThread(self.train_queue, self.training_process, self.stop_event)
         self.monitor_thread.finished_ok.connect(self.on_training_finished)
         self.monitor_thread.error.connect(self.on_training_fatal_error)
+        self.monitor_thread.progress_update.connect(self.on_training_progress)
         self.monitor_thread.start()
         
         webhook_url = self.webhook_url
@@ -3300,7 +3337,17 @@ class MainWindow(QMainWindow):
         self.t2_btn_stop.setEnabled(True)
         
         self.start_dynamic_status("백그라운드 작업 진행 중")
-
+    def on_training_progress(self, data):
+        if data.get("type") == "tune_progress":
+            if hasattr(self, 'live_tune_dialog') and self.live_tune_dialog.isVisible():
+                self.live_tune_dialog.add_live_data(data)
+            else:
+                if not hasattr(self, 'tune_live_cache'):
+                    self.tune_live_cache = []
+                self.tune_live_cache.append(data)
+        
+        elif data.get("type") == "progress" and hasattr(self, 't5_progress'):
+            self.t5_progress.setValue(data.get("val", 0))
     def stop_training(self):
         logger.warning("사용자에 의한 안전한 프로세스 종료(Graceful Stop) 요청")
         if self.training_process and self.training_process.is_alive():
@@ -3898,8 +3945,6 @@ class MainWindow(QMainWindow):
                 if f.suffix.lower() in valid_exts and f.stem in target_stems:
                     item = QListWidgetItem(f.name)
                     txt_path = lbl_dir / f.with_suffix(".txt").name
-                    
-                    # 라벨 파일이 존재하고, 내용이 비어있지 않다면 배경색 적용
                     if txt_path.exists() and txt_path.stat().st_size > 0:
                         item.setBackground(QColor("#dcfce7"))
                         
@@ -3914,12 +3959,25 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "파일 탐색 실패", "지정된 오류 이미지들을 찾을 수 없습니다. (이미 삭제되었을 수 있습니다)")
     def show_tune_history(self):
-        history_path = Path(self.w_work_ds.get_path()) / "runs" / "tune_custom" / "tune_history.csv"
-        if not history_path.exists():
-            QMessageBox.warning(self, "기록 없음", "저장된 튜닝 기록(tune_history.csv)이 없습니다.\n먼저 Auto ML 탐색을 실행해주세요.")
-            return
-        dialog = TuneHistoryDialog(history_path, self)
-        dialog.exec_()
+        if self.training_process and self.training_process.is_alive():
+            if not hasattr(self, 'live_tune_dialog'):
+                self.live_tune_dialog = TuneHistoryDialog(self)
+                if hasattr(self, 'tune_live_cache'):
+                    for data in self.tune_live_cache:
+                        self.live_tune_dialog.add_live_data(data)
+                    self.tune_live_cache = []
+            self.live_tune_dialog.show()
+            self.live_tune_dialog.raise_()
+            self.live_tune_dialog.activateWindow()
+        else:
+            history_path = Path(self.w_work_ds.get_path()) / "runs" / "tune_custom" / "tune_history.csv"
+            if not history_path.exists():
+                QMessageBox.warning(self, "기록 없음", "저장된 튜닝 기록(tune_history.csv)이 없습니다.\n먼저 Auto ML 탐색을 실행해주세요.")
+                return
+            
+            dialog = TuneHistoryDialog(self)
+            dialog.load_from_csv(history_path)
+            dialog.exec_()
 
     def run_auto_tune(self):
         logger.info("Tab2 Auto ML 파라미터 튜닝 실행")
@@ -3931,7 +3989,10 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(self, 'Auto ML 튜닝', f'총 {self.t2_tune_iterations.value()}번의 조합 탐색을 시작합니다.\n계속 진행하시겠습니까?', QMessageBox.Yes | QMessageBox.No) == QMessageBox.No: return
         
         initial_params = {'box': self.t2_lbox.value(), 'cls': self.t2_lcls.value(), 'dfl': self.t2_ldfl.value(), 'hsv_h': self.t2_ah.value(), 'hsv_s': self.t2_as.value(), 'hsv_v': self.t2_av.value(), 'degrees': self.t2_adeg.value(), 'translate': self.t2_atrans.value(), 'scale': self.t2_ascale.value(), 'shear': self.t2_ashear.value(), 'flipud': self.t2_afud.value(), 'fliplr': self.t2_aflr.value(), 'mosaic': self.t2_amos.value(), 'mixup': self.t2_amix.value(), 'copy_paste': self.t2_acp.value()}
-        
+        self.tune_live_cache = []
+        if hasattr(self, 'live_tune_dialog'):
+            self.live_tune_dialog.df_list = []
+            self.live_tune_dialog.update_plot()
         args = {
             "processed_dir": self.w_proc_ds.get_path(), "workspace_dir": self.w_work_ds.get_path(), 
             "model_name": self.g_model.currentText(), "epochs": self.t2_epochs.value(), 
