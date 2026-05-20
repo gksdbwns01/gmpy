@@ -530,6 +530,9 @@ class LogDatabase:
             cursor.execute(
                 "CREATE TABLE IF NOT EXISTS evaluation_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, project_path TEXT, task_type TEXT, model_name TEXT, total_imgs INTEGER, wrong_count INTEGER, accuracy REAL, wrong_images TEXT, config_json TEXT)"
             )
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS tune_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, project_path TEXT, model_name TEXT, generation INTEGER, fitness REAL, map50 REAL, map50_95 REAL, params_json TEXT)"
+            )
             conn.commit()
 
     def _db_writer_loop(self):
@@ -555,7 +558,31 @@ class LogDatabase:
                 logger.warning("DB writer thread가 제한 시간 안에 종료되지 않았습니다.")
         except Exception as e:
             logger.error(f"DB writer 종료 처리 중 예외 발생: {e}", exc_info=True)
+    def insert_tune_log(self, project_path, model_name, generation, fitness, map50, map50_95, params_data):
+        params = (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            project_path,
+            model_name,
+            generation,
+            fitness,
+            map50,
+            map50_95,
+            json.dumps(params_data, ensure_ascii=False)
+        )
 
+        def _task(conn):
+            conn.execute(
+                """
+                INSERT INTO tune_logs  
+                (timestamp, project_path, model_name, generation, fitness, map50, map50_95, params_json)  
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                params
+            )
+            conn.commit()
+            logger.debug(f"세대 {generation} 튜닝 기록 DB 저장 완료 (Fitness: {fitness:.2f})")
+
+        self.log_queue.put(_task)
     def insert_log(
         self,
         project_path,
@@ -1179,34 +1206,35 @@ def _tune_worker(args, queue):
                 run_res["fitness"],
             )
 
-            if (
-                actual_epochs < adaptive_epochs
-                and args.get("webhook_url")
-                and args.get("noti_flags", {}).get("early_stop", False)
-            ):
-                worker_logger.info(
-                    f"세대 {gen + 1} 조기 종료 감지됨 (Epoch: {actual_epochs})"
-                )
-                send_discord_webhook(
-                    webhook_url=args["webhook_url"],
-                    title="🛑 [조기 종료 발동]",
-                    description=f"Auto ML {gen + 1}세대 - **{actual_epochs} Epoch**에서 학습이 조기 종료되었습니다.",
-                    color=0xE74C3C,
-                    sync=True,
-                )
-                queue.put(
-                    {
-                        "type": "tune_progress",
-                        "generation": gen + 1,
-                        "fitness": fitness,
-                        "best_fitness": study.best_value
-                        if len(study.trials) > 0
-                        else fitness,
-                        "params": current_params,
-                        "mAP50": mAP50,
-                        "mAP50_95": mAP50_95,
-                    }
-                )
+            # 💡 [핵심 수정] 중단 신호(stop_event)가 켜진 상태로 끝났다면 이 세대를 무효화
+            if stop_event and stop_event.is_set():
+                worker_logger.info(f"세대 {gen + 1} 학습이 중간에 중단되었습니다. (Epoch: {actual_epochs}) 이 세대의 기록을 무효화합니다.")
+                
+                if args.get("webhook_url") and args.get("noti_flags", {}).get("early_stop", False):
+                    send_discord_webhook(
+                        webhook_url=args["webhook_url"],
+                        title="🛑 [튜닝 조기 종료 발동]",
+                        description=f"Auto ML {gen + 1}세대 - **{actual_epochs} Epoch**에서 중단되었습니다.\n*데이터 오염 방지를 위해 이 세대의 점수는 무효 처리됩니다.*",
+                        color=0xE74C3C,
+                        sync=True,
+                    )
+                # 🚫 큐(DB 저장) 전송 생략, CSV 기록 생략, fitness 반환 생략
+                # Optuna에게 이 세대가 끝까지 완료되지 않았음을 알림 (기록 무효화)
+                raise optuna.exceptions.TrialPruned()
+
+            # 🟢 정상적으로 완료된 경우에만 UI/DB 기록 및 점수 반환
+            queue.put(
+                {
+                    "type": "tune_progress",
+                    "generation": gen + 1,
+                    "fitness": fitness,
+                    "best_fitness": study.best_value if len(study.trials) > 0 else fitness,
+                    "params": current_params,
+                    "mAP50": mAP50,
+                    "mAP50_95": mAP50_95,
+                }
+            )
+            
             search_history.append(
                 {
                     "generation": gen + 1,
@@ -1220,7 +1248,7 @@ def _tune_worker(args, queue):
                 tune_base / "tune_history.csv", index=False, encoding="utf-8-sig"
             )
             worker_logger.info(
-                f"세대 {gen + 1}: Fitness={fitness:.2f} | Epochs실행: {adaptive_epochs}"
+                f"세대 {gen + 1}: Fitness={fitness:.2f} | Epochs실행: {actual_epochs}"
             )
             return fitness
 
@@ -5960,12 +5988,34 @@ class MainWindow(QMainWindow):
 
     def on_training_progress(self, data):
         if data.get("type") == "tune_progress":
+            # 1. UI 실시간 그래프 및 테이블 업데이트 (기존 로직)
             if hasattr(self, "live_tune_dialog") and self.live_tune_dialog.isVisible():
                 self.live_tune_dialog.add_live_data(data)
             else:
                 if not hasattr(self, "tune_live_cache"):
                     self.tune_live_cache = []
                 self.tune_live_cache.append(data)
+
+            # 2. 💡 [추가] 매 세대마다 DB에 안전하게 기록
+            generation = data.get("generation", 0)
+            fitness = data.get("fitness", 0.0)
+            map50 = data.get("mAP50", 0.0)        # 워커에서 넘겨준 경우 추출
+            map50_95 = data.get("mAP50_95", 0.0)  # 워커에서 넘겨준 경우 추출
+            params = data.get("params", {})
+            
+            # 현재 프로젝트 경로와 모델명 확보
+            current_proj = self.w_proj_root.get_path() if hasattr(self, "w_proj_root") else ""
+            current_model = self.g_model.currentText() if hasattr(self, "g_model") else "Unknown"
+
+            self.log_db.insert_tune_log(
+                project_path=current_proj,
+                model_name=current_model,
+                generation=generation,
+                fitness=fitness,
+                map50=map50,
+                map50_95=map50_95,
+                params_data=params
+            )
 
         elif data.get("type") == "progress" and hasattr(self, "t5_progress"):
             self.t5_progress.setValue(data.get("val", 0))
