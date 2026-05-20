@@ -609,22 +609,28 @@ def _tune_worker(args, queue):
         tune_patience = args.get("tune_patience", 5)
         
         tune_base = workspace_dir / "runs" / "tune_custom"
-        if tune_base.exists(): shutil.rmtree(tune_base); worker_logger.debug("기존 tune_custom 폴더 삭제 완료")
-        tune_base.mkdir(parents=True, exist_ok=True)
+        data_yaml = tune_base / "tune_data.yaml"
         
-        img_map = {f.stem: f for f in sorted((processed_dir / "images").glob("*.jpg"))}
-        lbl_map = {f.stem: f for f in sorted((processed_dir / "labels").glob("*.txt"))}
-        paired = [(str(img_map[n]), str(lbl_map[n])) for n in img_map if n in lbl_map]
-        worker_logger.debug(f"[AutoML Worker] 이미지-라벨 페어 개수: {len(paired)}")
-        
-        if len(paired) < 5: 
-            result["error"] = "튜닝용 데이터 부족"
-            worker_logger.error("데이터 부족으로 튜닝 종료"); queue.put(result); return
+        # 🟢 [수정] 데이터셋 설정 파일이 이미 있다면 폴더를 지우지 않고 건너뜁니다 (이어하기).
+        if not data_yaml.exists():
+            if tune_base.exists(): shutil.rmtree(tune_base)
+            tune_base.mkdir(parents=True, exist_ok=True)
             
-        tr, vl = train_test_split(paired, test_size=0.2)
-        tr_txt, vl_txt = tune_base / "train.txt", tune_base / "val.txt"
-        tr_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in tr))
-        vl_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in vl))
+            img_map = {f.stem: f for f in sorted((processed_dir / "images").glob("*.jpg"))}
+            lbl_map = {f.stem: f for f in sorted((processed_dir / "labels").glob("*.txt"))}
+            paired = [(str(img_map[n]), str(lbl_map[n])) for n in img_map if n in lbl_map]
+            
+            if len(paired) < 5: 
+                result["error"] = "튜닝용 데이터 부족"
+                worker_logger.error("데이터 부족으로 튜닝 종료"); queue.put(result); return
+                
+            tr, vl = train_test_split(paired, test_size=0.2)
+            tr_txt, vl_txt = tune_base / "train.txt", tune_base / "val.txt"
+            tr_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in tr))
+            vl_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in vl))
+            data_yaml.write_text(f"train: {tr_txt.resolve()}\nval: {vl_txt.resolve()}\nnc: {len(args['class_names'])}\nnames: {args['class_names']}\n")
+        else:
+            worker_logger.info("기존 데이터셋 환경 발견. 재구성 없이 이어서 진행합니다.")
         data_yaml = tune_base / "tune_data.yaml"
         history_csv_path = tune_base / "tune_history.csv"
         if history_csv_path.exists():
@@ -635,8 +641,7 @@ def _tune_worker(args, queue):
                 search_history = []
         else:
             search_history = []
-        search_history = []
-        
+                    
         def objective(trial):
             if stop_handler.should_stop("Optuna 탐색 단계(Objective)"):
                 worker_logger.info("🛑 사용자에 의한 탐색 취소. Optuna Study를 중단합니다.")
