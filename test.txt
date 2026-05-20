@@ -77,11 +77,11 @@ db로그 폴더 수정. 전체 로그보기 가능. 라벨링 툴 목록에서 �
 -closeEvent UI 반응성 개선 (QProgressDialog 및 이벤트 루프 처리)
 -종료 시 비정상적인 웹훅 지연 방지 처리
 멀티프로세싱 워커 종료 시 데드락 및 좀비 프로세스 해결
-실시간 AutoML 세대별 Fitness 그래프 시각화
+실시간 AutoML 세대별 Fitness 그래프 시각화 - 창 껏다켜도 반영
 
 automl 개선작업 시작 전 백업
 -개선은 main.py에서 작업
--automl 실시간으로 튜닝 기록 그래프를 볼 수 있으면 좋을듯 - 오래걸리니깐 수동 얼리스타핑?
+-automl - 오래걸리니깐 수동 얼리스타핑?
 
 https://chatgpt.com/share/6a0ab080-6c5c-83a3-9031-dbd929e020f1
 -Closing dataloader mosaic 이후 딜레이 있음

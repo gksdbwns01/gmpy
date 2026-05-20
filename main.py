@@ -2643,9 +2643,8 @@ class TuneHistoryDialog(QDialog):
         self.ax.set_xlabel("세대 (Generation)")
         self.ax.set_ylabel("Fitness Score")
         self.ax.grid(True, linestyle='--', alpha=0.7)
-        self.canvas.draw_idle() # UI가 멈추지 않도록 idle 시점에 다시 그리기
-        
-        # 테이블 업데이트
+        self.canvas.draw_idle()
+        QApplication.processEvents() # UI 강제 갱신
         top_df = df.sort_values(by='fitness', ascending=False).head(5)
         self.table.setRowCount(len(top_df))
         self.table.setColumnCount(len(df.columns))
@@ -3962,10 +3961,10 @@ class MainWindow(QMainWindow):
         if self.training_process and self.training_process.is_alive():
             if not hasattr(self, 'live_tune_dialog'):
                 self.live_tune_dialog = TuneHistoryDialog(self)
-                if hasattr(self, 'tune_live_cache'):
-                    for data in self.tune_live_cache:
-                        self.live_tune_dialog.add_live_data(data)
-                    self.tune_live_cache = []
+            if hasattr(self, 'tune_live_cache') and self.tune_live_cache:
+                for data in self.tune_live_cache:
+                    self.live_tune_dialog.add_live_data(data)
+                self.tune_live_cache = []
             self.live_tune_dialog.show()
             self.live_tune_dialog.raise_()
             self.live_tune_dialog.activateWindow()
