@@ -641,10 +641,19 @@ def _tune_worker(args, queue):
                 search_history = []
         else:
             search_history = []
-                    
+
         def objective(trial):
+            # 🛑 [수정] 중단 신호 감지 시, 종료 전 마지막으로 CSV 백업을 수행합니다.
             if stop_handler.should_stop("Optuna 탐색 단계(Objective)"):
-                worker_logger.info("🛑 사용자에 의한 탐색 취소. Optuna Study를 중단합니다.")
+                worker_logger.info("🛑 사용자에 의한 탐색 취소. 마지막 상태를 저장하고 중단합니다.")
+                try:
+                    # 마지막으로 남은 데이터까지 CSV로 확실히 저장
+                    if search_history:
+                        pd.DataFrame(search_history).to_csv(tune_base / "tune_history.csv", index=False, encoding="utf-8-sig")
+                        worker_logger.info("중단 전 최종 데이터 백업 완료.")
+                except Exception as e:
+                    worker_logger.error(f"중단 시 백업 저장 실패: {e}")
+                
                 trial.study.stop()
                 raise optuna.exceptions.TrialPruned()
 
@@ -800,6 +809,15 @@ def _tune_worker(args, queue):
     except Exception: 
         result["error"] = traceback.format_exc(); worker_logger.error(f"[AutoML Worker] Exception: {result['error']}")
     finally: 
+        # 🟢 [만약의 사태 대비] 에러로 종료되든, 중단되어 종료되든 무조건 저장
+        try:
+            if 'search_history' in locals() and search_history:
+                tune_history_path = tune_base / "tune_history.csv"
+                pd.DataFrame(search_history).to_csv(tune_history_path, index=False, encoding="utf-8-sig")
+                worker_logger.info("프로세스 종료 전 데이터 최종 백업 완료")
+        except Exception as e:
+            worker_logger.error(f"종료 시 백업 저장 실패: {e}")
+            
         clear_vram()
         try:
             queue.put(result, timeout=3.0)
@@ -2596,13 +2614,27 @@ class LogViewerDialog(QDialog):
         layout.addWidget(btn_close)
 
 class TuneHistoryDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, history_path, parent=None): # history_path 인자 추가
         super().__init__(parent)
+        self.history_path = history_path # 경로 저장
         self.setWindowTitle("📈 Auto ML 실시간 튜닝 모니터링")
         self.resize(1000, 700)
         self.layout = QVBoxLayout(self)
         
-        self.df_list = [] # 실시간 데이터를 쌓을 리스트
+        # 🟢 제어 버튼 레이아웃 추가
+        control_layout = QHBoxLayout()
+        self.auto_refresh_check = QCheckBox("실시간 자동 업데이트 (Auto-Update)")
+        self.auto_refresh_check.setChecked(True) # 기본값: 켬
+        control_layout.addWidget(self.auto_refresh_check)
+        
+        self.btn_refresh = QPushButton("🔄 강제 새로고침")
+        self.btn_refresh.setMinimumHeight(30)
+        self.btn_refresh.setStyleSheet("background-color: #e0f2fe; font-weight: bold; color: #0369a1;")
+        self.btn_refresh.clicked.connect(lambda: self.load_from_csv(self.history_path))
+        control_layout.addWidget(self.btn_refresh)
+        self.layout.addLayout(control_layout)
+        
+        self.df_list = [] 
         
         # 그래프 세팅
         self.canvas = FigureCanvas(plt.Figure(figsize=(8, 4)))
@@ -2626,24 +2658,24 @@ class TuneHistoryDialog(QDialog):
     def load_from_csv(self, history_csv_path):
         """기존 저장된 CSV 파일 불러오기"""
         try:
-            df = pd.read_csv(history_csv_path)
-            self.df_list = df.to_dict('records')
-            self.update_plot()
+            if history_csv_path.exists():
+                df = pd.read_csv(history_csv_path)
+                self.df_list = df.to_dict('records')
+                self.update_plot()
         except Exception as e:
             QMessageBox.warning(self, "오류", f"기록을 불러오는 중 오류 발생:\n{e}")
 
     def add_live_data(self, data_dict):
         """실시간 데이터 1줄 추가 및 화면 갱신"""
-        row = {
-            "generation": data_dict["generation"],
-            "fitness": data_dict["fitness"]
-        }
+        row = {"generation": data_dict["generation"], "fitness": data_dict["fitness"]}
         row.update(data_dict["params"])
         self.df_list.append(row)
-        self.update_plot()
+        
+        # 🟢 자동 업데이트가 켜져있을 때만 즉시 그래프 갱신
+        if self.auto_refresh_check.isChecked():
+            self.update_plot()
 
     def update_plot(self):
-        """데이터를 바탕으로 차트와 표를 다시 그립니다."""
         if not self.df_list: return
         df = pd.DataFrame(self.df_list)
         
@@ -2662,7 +2694,7 @@ class TuneHistoryDialog(QDialog):
         self.ax.set_ylabel("Fitness Score")
         self.ax.grid(True, linestyle='--', alpha=0.7)
         self.canvas.draw_idle()
-        QApplication.processEvents() # UI 강제 갱신
+        
         top_df = df.sort_values(by='fitness', ascending=False).head(5)
         self.table.setRowCount(len(top_df))
         self.table.setColumnCount(len(df.columns))
@@ -2676,7 +2708,6 @@ class TuneHistoryDialog(QDialog):
                 item.setTextAlignment(Qt.AlignCenter)
                 self.table.setItem(r_idx, c_idx, item)
         self.table.resizeColumnsToContents()
-
 class IntegrityThread(QThread):
     progress = pyqtSignal(int, str)
     finished_ok = pyqtSignal(list)
@@ -3976,25 +4007,25 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "파일 탐색 실패", "지정된 오류 이미지들을 찾을 수 없습니다. (이미 삭제되었을 수 있습니다)")
     def show_tune_history(self):
-        if self.training_process and self.training_process.is_alive():
-            if not hasattr(self, 'live_tune_dialog'):
-                self.live_tune_dialog = TuneHistoryDialog(self)
-            if hasattr(self, 'tune_live_cache') and self.tune_live_cache:
-                for data in self.tune_live_cache:
-                    self.live_tune_dialog.add_live_data(data)
-                self.tune_live_cache = []
-            self.live_tune_dialog.show()
-            self.live_tune_dialog.raise_()
-            self.live_tune_dialog.activateWindow()
-        else:
-            history_path = Path(self.w_work_ds.get_path()) / "runs" / "tune_custom" / "tune_history.csv"
-            if not history_path.exists():
-                QMessageBox.warning(self, "기록 없음", "저장된 튜닝 기록(tune_history.csv)이 없습니다.\n먼저 Auto ML 탐색을 실행해주세요.")
-                return
-            
-            dialog = TuneHistoryDialog(self)
-            dialog.load_from_csv(history_path)
-            dialog.exec_()
+        # 튜닝 데이터 경로 설정
+        history_path = Path(self.w_work_ds.get_path()) / "runs" / "tune_custom" / "tune_history.csv"
+        
+        # 1. 다이얼로그 생성/갱신 (history_path를 인자로 전달)
+        if not hasattr(self, 'live_tune_dialog') or not self.live_tune_dialog.isVisible():
+            self.live_tune_dialog = TuneHistoryDialog(history_path, self)
+            # 기존 CSV 파일이 있다면 로드
+            if history_path.exists():
+                self.live_tune_dialog.load_from_csv(history_path)
+
+        # 2. 실시간 캐시 데이터가 있다면 추가 반영
+        if hasattr(self, 'tune_live_cache') and self.tune_live_cache:
+            for data in self.tune_live_cache:
+                self.live_tune_dialog.add_live_data(data)
+            self.tune_live_cache = []
+        
+        self.live_tune_dialog.show()
+        self.live_tune_dialog.raise_()
+        self.live_tune_dialog.activateWindow()
 
     def run_auto_tune(self):
         logger.info("Tab2 Auto ML 파라미터 튜닝 실행")
