@@ -1,62 +1,83 @@
-import sys, os, json, shutil, math, time, platform, multiprocessing, signal, re, gc, traceback, sqlite3, csv, html, subprocess
-import queue as qlib
+# ruff
+import csv
+import gc
+import html
+import json
 import logging
+import math
+import multiprocessing
+import os
+import platform
+import queue as qlib
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import zipfile
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
-import zipfile, cv2, numpy as np, pandas as pd, psutil, torch, yaml
-import threading
 
-from PyQt5.QtWidgets import QSizePolicy
+import cv2
+import numpy as np
+import pandas as pd
+import psutil
+import torch
+import yaml
 from PyQt5.QtCore import (
+    QDate,
+    QRectF,
+    QSettings,
     QSize,
     Qt,
     QThread,
-    pyqtSignal,
     QTimer,
-    QRectF,
-    QSettings,
-    QDate,
+    pyqtSignal,
 )
+from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
+    QCheckBox,
+    QComboBox,
+    QDateEdit,
+    QDialog,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGraphicsLineItem,
+    QGraphicsPixmapItem,
+    QGraphicsRectItem,
+    QGraphicsScene,
+    QGraphicsView,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
-    QTabWidget,
+    QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
-    QPushButton,
-    QFileDialog,
-    QSpinBox,
-    QDoubleSpinBox,
-    QComboBox,
-    QCheckBox,
-    QTextEdit,
-    QProgressBar,
-    QMessageBox,
-    QTableWidget,
-    QTableWidgetItem,
-    QHeaderView,
-    QGroupBox,
-    QFormLayout,
-    QScrollArea,
-    QGridLayout,
-    QSplitter,
-    QDialog,
-    QInputDialog,
-    QGraphicsView,
-    QGraphicsScene,
-    QGraphicsRectItem,
-    QGraphicsPixmapItem,
     QListWidget,
     QListWidgetItem,
-    QGraphicsLineItem,
-    QDateEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
     QProgressDialog,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSpinBox,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt5.QtGui import QPixmap, QImage, QFont, QIcon, QColor, QPainter, QPen
 
 if hasattr(Qt, "AA_EnableHighDpiScaling"):
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
@@ -67,6 +88,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg as FigureCanvas,
+)
+from matplotlib.backends.backend_qt5agg import (
     NavigationToolbar2QT as NavigationToolbar,
 )
 
@@ -558,7 +581,17 @@ class LogDatabase:
                 logger.warning("DB writer thread가 제한 시간 안에 종료되지 않았습니다.")
         except Exception as e:
             logger.error(f"DB writer 종료 처리 중 예외 발생: {e}", exc_info=True)
-    def insert_tune_log(self, project_path, model_name, generation, fitness, map50, map50_95, params_data):
+
+    def insert_tune_log(
+        self,
+        project_path,
+        model_name,
+        generation,
+        fitness,
+        map50,
+        map50_95,
+        params_data,
+    ):
         params = (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             project_path,
@@ -567,7 +600,7 @@ class LogDatabase:
             fitness,
             map50,
             map50_95,
-            json.dumps(params_data, ensure_ascii=False)
+            json.dumps(params_data, ensure_ascii=False),
         )
 
         def _task(conn):
@@ -577,12 +610,15 @@ class LogDatabase:
                 (timestamp, project_path, model_name, generation, fitness, map50, map50_95, params_json)  
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                params
+                params,
             )
             conn.commit()
-            logger.debug(f"세대 {generation} 튜닝 기록 DB 저장 완료 (Fitness: {fitness:.2f})")
+            logger.debug(
+                f"세대 {generation} 튜닝 기록 DB 저장 완료 (Fitness: {fitness:.2f})"
+            )
 
         self.log_queue.put(_task)
+
     def insert_log(
         self,
         project_path,
@@ -756,10 +792,11 @@ def send_discord_webhook(
         return False
 
     def _send_task():
-        import requests
         import time
         from datetime import datetime
-        from requests.exceptions import Timeout, ConnectionError, RequestException
+
+        import requests
+        from requests.exceptions import ConnectionError, RequestException, Timeout
 
         embed = {
             "title": title,
@@ -965,8 +1002,10 @@ class WebhookSettingsDialog(QDialog):
 # =========================================================
 def _single_tune_run(args, queue):
     worker_logger = setup_logger()
-    import traceback, pandas as pd
+    import traceback
     from pathlib import Path
+
+    import pandas as pd
     from ultralytics import YOLO
 
     try:
@@ -1024,10 +1063,13 @@ def _single_tune_run(args, queue):
 
 def _tune_worker(args, queue):
     worker_logger = setup_logger()
-    import time, traceback, multiprocessing
+    import multiprocessing
+    import time
+    import traceback
     from pathlib import Path
-    from sklearn.model_selection import train_test_split
+
     import optuna
+    from sklearn.model_selection import train_test_split
 
     start_time = time.time()
     result = {
@@ -1208,9 +1250,13 @@ def _tune_worker(args, queue):
 
             # 💡 [핵심 수정] 중단 신호(stop_event)가 켜진 상태로 끝났다면 이 세대를 무효화
             if stop_event and stop_event.is_set():
-                worker_logger.info(f"세대 {gen + 1} 학습이 중간에 중단되었습니다. (Epoch: {actual_epochs}) 이 세대의 기록을 무효화합니다.")
-                
-                if args.get("webhook_url") and args.get("noti_flags", {}).get("early_stop", False):
+                worker_logger.info(
+                    f"세대 {gen + 1} 학습이 중간에 중단되었습니다. (Epoch: {actual_epochs}) 이 세대의 기록을 무효화합니다."
+                )
+
+                if args.get("webhook_url") and args.get("noti_flags", {}).get(
+                    "early_stop", False
+                ):
                     send_discord_webhook(
                         webhook_url=args["webhook_url"],
                         title="🛑 [튜닝 조기 종료 발동]",
@@ -1228,13 +1274,15 @@ def _tune_worker(args, queue):
                     "type": "tune_progress",
                     "generation": gen + 1,
                     "fitness": fitness,
-                    "best_fitness": study.best_value if len(study.trials) > 0 else fitness,
+                    "best_fitness": study.best_value
+                    if len(study.trials) > 0
+                    else fitness,
                     "params": current_params,
                     "mAP50": mAP50,
                     "mAP50_95": mAP50_95,
                 }
             )
-            
+
             search_history.append(
                 {
                     "generation": gen + 1,
@@ -1383,11 +1431,15 @@ def _tune_worker(args, queue):
 
 def _auto_threshold_worker(args, queue):
     worker_logger = setup_logger()
-    import time, traceback, numpy as np, gc
+    import gc
+    import time
+    import traceback
     from pathlib import Path
-    from ultralytics import YOLO
+
+    import numpy as np
     import torch
     import torchvision.ops as ops
+    from ultralytics import YOLO
 
     start_time = time.time()
     result = {
@@ -1704,8 +1756,10 @@ def _auto_threshold_worker(args, queue):
 
 def _single_fold_run(args, queue):
     worker_logger = setup_logger()
-    import traceback, pandas as pd
+    import traceback
     from pathlib import Path
+
+    import pandas as pd
     from ultralytics import YOLO
 
     try:
@@ -1762,10 +1816,13 @@ def _single_fold_run(args, queue):
 
 def _kfold_train_worker(args, queue):
     worker_logger = setup_logger()
-    import json, shutil, numpy as np, time, multiprocessing
-    import pandas as pd
-    from sklearn.model_selection import KFold, train_test_split
+    import multiprocessing
+    import shutil
+    import time
     from pathlib import Path
+
+    import numpy as np
+    from sklearn.model_selection import KFold, train_test_split
 
     start_time = time.time()
     result = {
@@ -2006,10 +2063,13 @@ def _kfold_train_worker(args, queue):
 
 def _retrain_worker(args, queue):
     worker_logger = setup_logger()
-    import yaml as _yaml, shutil, time
-    import pandas as pd
-    from ultralytics import YOLO
+    import shutil
+    import time
     from pathlib import Path
+
+    import pandas as pd
+    import yaml as _yaml
+    from ultralytics import YOLO
 
     start_time = time.time()
     result = {
@@ -2141,6 +2201,7 @@ def _retrain_worker(args, queue):
 def _eval_worker(args, queue):
     worker_logger = setup_logger()
     import shutil
+
     from ultralytics import YOLO
 
     result = {"success": False, "task": "eval", "error": ""}
@@ -2348,8 +2409,9 @@ def _tab4_eval_worker(args, queue):
 
 def _measure_worker(args, queue):
     worker_logger = setup_logger()
-    from ultralytics import YOLO
     import math
+
+    from ultralytics import YOLO
 
     COLOR_MAP = {
         "노란색 (Yellow)": (0, 255, 255),
@@ -2942,7 +3004,8 @@ class PreprocessThread(QThread):
     def run(self):
         logger.info("[Preprocess Thread] 데이터 전처리 쓰레드 시작")
         try:
-            from PIL import Image as PILImage, ImageOps, ImageDraw
+            from PIL import Image as PILImage
+            from PIL import ImageDraw, ImageOps
 
             c = self.config
             label_dir, image_dir = (
@@ -3155,7 +3218,7 @@ class PreprocessThread(QThread):
 
             logger.info(f"[Preprocess Thread] 데이터 전처리 완료. 성공: {ok_count}건")
             self.finished_ok.emit(ok_count)
-        except Exception as e:
+        except Exception:
             logger.error("[Preprocess Thread] 치명적 오류 발생", exc_info=True)
             self.error.emit(traceback.format_exc())
 
@@ -3722,7 +3785,8 @@ class LabelingView(QGraphicsView):
         if not self.image_item or not hasattr(self, "current_image_path"):
             return False, "이미지가 로드되지 않았습니다."
 
-        import cv2, numpy as np
+        import cv2
+        import numpy as np
 
         img_array = np.fromfile(str(self.current_image_path), np.uint8)
         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
@@ -4573,7 +4637,7 @@ class LogTabWidget(QWidget):
             self.txt_config.setHtml(
                 f"{diff_text}<pre style='color:#d4d4d4; font-family:Consolas,monospace; font-size:12px;'>{escaped_json}</pre>"
             )
-        except Exception as e:
+        except Exception:
             self.txt_config.setText(config_str)
 
     def on_row_double_clicked(self, item):
@@ -5999,13 +6063,17 @@ class MainWindow(QMainWindow):
             # 2. 💡 [추가] 매 세대마다 DB에 안전하게 기록
             generation = data.get("generation", 0)
             fitness = data.get("fitness", 0.0)
-            map50 = data.get("mAP50", 0.0)        # 워커에서 넘겨준 경우 추출
+            map50 = data.get("mAP50", 0.0)  # 워커에서 넘겨준 경우 추출
             map50_95 = data.get("mAP50_95", 0.0)  # 워커에서 넘겨준 경우 추출
             params = data.get("params", {})
-            
+
             # 현재 프로젝트 경로와 모델명 확보
-            current_proj = self.w_proj_root.get_path() if hasattr(self, "w_proj_root") else ""
-            current_model = self.g_model.currentText() if hasattr(self, "g_model") else "Unknown"
+            current_proj = (
+                self.w_proj_root.get_path() if hasattr(self, "w_proj_root") else ""
+            )
+            current_model = (
+                self.g_model.currentText() if hasattr(self, "g_model") else "Unknown"
+            )
 
             self.log_db.insert_tune_log(
                 project_path=current_proj,
@@ -6014,7 +6082,7 @@ class MainWindow(QMainWindow):
                 fitness=fitness,
                 map50=map50,
                 map50_95=map50_95,
-                params_data=params
+                params_data=params,
             )
 
         elif data.get("type") == "progress" and hasattr(self, "t5_progress"):
@@ -6496,7 +6564,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "오토 라벨링 실패", result)
         else:
             if result == 0:
-                self.statusBar().showMessage(f"⚠️ 비슷한 객체를 찾지 못했습니다.", 4000)
+                self.statusBar().showMessage("⚠️ 비슷한 객체를 찾지 못했습니다.", 4000)
             else:
                 self.statusBar().showMessage(
                     f"✨ 총 {result}개의 객체를 찾아 일괄 라벨링했습니다!", 4000
@@ -8103,7 +8171,6 @@ class MainWindow(QMainWindow):
     def run_tab4_eval(self):
         logger.info("Tab4 최종 평가 버튼 클릭")
         from ultralytics import YOLO
-        import yaml
 
         is_valid, err = self.validate_paths(
             평가모델_file=Path(self.t4_eval_model_display.text()),
@@ -8173,7 +8240,7 @@ class MainWindow(QMainWindow):
             )
 
         self.t4_btn_eval.setEnabled(False)
-        self.statusBar().showMessage(f"📊 재학습 평가 진행 중...")
+        self.statusBar().showMessage("📊 재학습 평가 진행 중...")
         self.t4_thread = Tab4FinalEvalThread(config)
         self.t4_thread.finished_ok.connect(self.on_tab4_eval_finished)
         self.t4_thread.error.connect(
