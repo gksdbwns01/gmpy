@@ -626,8 +626,15 @@ def _tune_worker(args, queue):
         tr_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in tr))
         vl_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in vl))
         data_yaml = tune_base / "tune_data.yaml"
-        data_yaml.write_text(f"train: {tr_txt.resolve()}\nval: {vl_txt.resolve()}\nnc: {len(args['class_names'])}\nnames: {args['class_names']}\n")
-        
+        history_csv_path = tune_base / "tune_history.csv"
+        if history_csv_path.exists():
+            try:
+                search_history = pd.read_csv(history_csv_path).to_dict('records')
+                worker_logger.info(f"기존 튜닝 기록 발견. {len(search_history)}세대부터 이어서 기록합니다.")
+            except Exception:
+                search_history = []
+        else:
+            search_history = []
         search_history = []
         
         def objective(trial):
@@ -719,12 +726,18 @@ def _tune_worker(args, queue):
                 "mAP50_95": mAP50_95,
                 **current_params
             })
-            
+            pd.DataFrame(search_history).to_csv(tune_base / "tune_history.csv", index=False, encoding="utf-8-sig")
             worker_logger.info(f"세대 {gen+1}: Fitness={fitness:.2f} | Epochs실행: {adaptive_epochs}")
             return fitness
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
-        study = optuna.create_study(direction="maximize")
+        db_path = tune_base / "tuning_storage.db"
+        study = optuna.create_study(
+            direction="maximize",
+            storage=f"sqlite:///{db_path.as_posix()}",
+            study_name="auto_tune_project",
+            load_if_exists=True
+        )
         
         # 💡 [개선 3] 1세대에 들어갈 기본(초기) 파라미터 필터링 및 lr0 초기값 세팅
         filtered_initial_params = {k: v for k, v in args["initial_params"].items() if k in ['box', 'cls', 'dfl', 'hsv_h', 'hsv_s', 'hsv_v', 'degrees', 'translate', 'scale', 'mosaic']}
