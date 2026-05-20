@@ -2706,7 +2706,7 @@ class TuneHistoryDialog(QDialog):
     self.ax.grid(True, linestyle='--', alpha=0.7)
     self.canvas.draw_idle()
     
-    top_df = df.sort_values(by='fitness', ascending=False).head(5)
+    top_df = df.sort_values(by='fitness', ascending=False)
     self.table.setRowCount(len(top_df))
     self.table.setColumnCount(len(df.columns))
     self.table.setHorizontalHeaderLabels(df.columns)
