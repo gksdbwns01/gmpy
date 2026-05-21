@@ -2872,13 +2872,19 @@ class StoppableProcessThread(QThread):
             # 🟢 [개선] 프로세스가 정상 종료되지 않았다면 결과 수집 스킵
             # exitcode가 0이 아니면 에러로 간주하거나 프로세스가 kill 된 것임
             if self.process.exitcode != 0:
-                logger.warning(
-                    f"워커 프로세스 비정상 종료 (ExitCode: {self.process.exitcode})"
-                )
-                return {
-                    "success": False,
-                    "error": f"프로세스가 비정상적으로 종료되었습니다. (Exit Code: {self.process.exitcode})",
-                }
+                # 💡 [추가] 하지만 결과를 이미 정상적으로 받아뒀다면, 종료가 조금 늦었을 뿐이므로 살려줍니다.
+                if res is not None and res.get("success"):
+                    logger.warning(
+                        "워커 프로세스가 비정상 종료되었으나, 결과 데이터는 안전하게 수신되었습니다."
+                    )
+                else:
+                    logger.warning(
+                        f"워커 프로세스 비정상 종료 (ExitCode: {self.process.exitcode})"
+                    )
+                    return {
+                        "success": False,
+                        "error": f"프로세스가 비정상적으로 종료되었습니다. (Exit Code: {self.process.exitcode})",
+                    }
 
             # 강제 종료된 것이 아니라면 남아있는 큐 데이터 확인
             while res is None:
@@ -4584,16 +4590,16 @@ class LogTabWidget(QWidget):
             )
         else:
             self.lbl_detail_title.setText(
-                f"<b>[평가 상세]</b> ID: {row_data[0]} | 모델: {row_data[3].split('|')[0].strip()}"
+                f"<b>[평가 상세]</b> ID: {row_data[0]} | 모델: {row_data[4].split('|')[0].strip()}"
             )
             wrong_imgs_str = row_data[8]
             config_str = row_data[9]
             self.list_wrong_imgs.clear()
 
             model_path_str = (
-                row_data[3].split("|")[-1].strip()
-                if "|" in row_data[3]
-                else row_data[3]
+                row_data[4].split("|")[-1].strip()
+                if "|" in row_data[4]
+                else row_data[4]
             )
             try:
                 model_path = Path(model_path_str)
@@ -4700,10 +4706,13 @@ class LogTabWidget(QWidget):
             row_data = self.current_rows[r]
             try:
                 cfg = json.loads(row_data[9])
-                base_run_name = cfg.get("tab3", {}).get("run_name", "check01")
                 if "Tab 4" in row_data[3]:
+                    # 🟢 Tab 4 재학습 평가는 tab4의 'run' 설정을 사용
+                    base_run_name = cfg.get("tab4", {}).get("run", "retrain_hard_01")
                     run_dir = eval_runs_dir / (base_run_name + "_final_eval")
                 else:
+                    # 🟢 Tab 3 평가는 tab3의 'run_name' 설정을 사용
+                    base_run_name = cfg.get("tab3", {}).get("run_name", "check01")
                     run_dir = eval_runs_dir / base_run_name
             except:
                 pass
