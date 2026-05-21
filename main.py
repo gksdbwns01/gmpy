@@ -4706,17 +4706,21 @@ class LogTabWidget(QWidget):
 
     def on_wrong_image_double_clicked(self, item):
         clicked_img_name = item.text()
-        workspace_dir = self.db_manager.db_path.parent
-        eval_runs_dir = workspace_dir / "runs" / "eval"
 
         valid_paths = []
         target_idx = 0
-
         run_dir = None
+
         selected = self.table.selectedItems()
         if selected:
             r = selected[0].row()
             row_data = self.current_rows[r]
+
+            # 🛠️ 수정된 부분: DB에 저장된 실제 프로젝트 경로를 참조하도록 변경
+            project_path = Path(row_data[2])
+            workspace_dir = project_path / "workspace"
+            eval_runs_dir = workspace_dir / "runs" / "eval"
+
             try:
                 cfg = json.loads(row_data[9])
                 if "Tab 4" in row_data[3]:
@@ -4730,6 +4734,7 @@ class LogTabWidget(QWidget):
             except:
                 pass
 
+        # 이하 코드는 기존과 동일하게 유지
         for i in range(self.list_wrong_imgs.count()):
             name = self.list_wrong_imgs.item(i).text()
             p = run_dir / name if run_dir else None
