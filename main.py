@@ -4534,6 +4534,7 @@ class LogTabWidget(QWidget):
                         [
                             "ID",
                             "Timestamp",
+                            "Project Path",
                             "Task Type",
                             "Model Name",
                             "Epochs",
@@ -4548,6 +4549,7 @@ class LogTabWidget(QWidget):
                         [
                             "ID",
                             "Timestamp",
+                            "Project Path",
                             "Task Type",
                             "Model Name",
                             "Total Imgs",
