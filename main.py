@@ -172,7 +172,7 @@ class ConfigDefaults:
         "method": "테두리 최단거리 (Edge)",
         "conf": 0.25,
         "iou": 0.45,
-        "max_det": 300,
+        "max_det": 99,
         "agnostic": True,
         "knn_n": 2,
         "edge_thr": "60",
@@ -5450,6 +5450,10 @@ class MainWindow(QMainWindow):
     def sync_work_paths(self, new_path):
         if hasattr(self, "t3_model"):
             self.t3_model.line_edit.setText(
+                str(Path(new_path) / "kfold" / "best_model.pt")
+            )
+        if hasattr(self, "t5_model"):
+            self.t5_model.line_edit.setText(
                 str(Path(new_path) / "kfold" / "best_model.pt")
             )
 
