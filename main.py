@@ -1742,7 +1742,8 @@ def _auto_threshold_worker(args, queue):
         worker_logger.info(
             f"[AutoThreshold Worker] 탐색 완료. Conf: {result['best_conf']}, IoU: {result['best_iou']}, 완벽매칭: {best_img_correct}장, F1: {result['best_acc']}%"
         )
-
+        elapsed_time = time.time() - start_time
+        worker_logger.info(f"[AutoThreshold Worker] 총 소요시간: {elapsed_time:.1f}초")
     except Exception:
         result["error"] = traceback.format_exc()
         worker_logger.error(f"[AutoThreshold Worker] Exception: {result['error']}")
@@ -2050,6 +2051,10 @@ def _kfold_train_worker(args, queue):
         else:
             result["error"] = "학습 실패"
             worker_logger.error("fold_metrics가 비어있음")
+        elapsed_time = time.time() - start_time
+        worker_logger.info(
+            f"[K-Fold Worker] 전체 Fold 총 소요시간: {elapsed_time:.1f}초"
+        )
     except Exception:
         result["error"] = traceback.format_exc()
         worker_logger.error(f"[K-Fold Worker] Exception: {result['error']}")
@@ -2184,6 +2189,8 @@ def _retrain_worker(args, queue):
         result["save_dir"] = str(res.save_dir)
         result["model_path"] = str(trained_model_path)
         worker_logger.info("[Retrain Worker] 하드 재학습 모두 완료됨")
+        elapsed_time = time.time() - start_time
+        worker_logger.info(f"[Retrain Worker] 재학습 총 소요시간: {elapsed_time:.1f}초")
     except Exception:
         result["error"] = traceback.format_exc()
         worker_logger.error(f"[Retrain Worker] Exception: {result['error']}")
