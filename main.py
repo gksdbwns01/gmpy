@@ -4200,6 +4200,8 @@ class LogTabWidget(QWidget):
 
         btn_delete = QPushButton("🗑️ 선택 삭제")
         btn_delete.clicked.connect(self.delete_selected)
+        self.chk_select_all = QCheckBox("☑️ 일괄 선택")
+        self.chk_select_all.stateChanged.connect(self.toggle_select_all)
 
         filter_layout.addWidget(QLabel("기간:"))
         filter_layout.addWidget(self.dt_from)
@@ -4212,6 +4214,7 @@ class LogTabWidget(QWidget):
             filter_layout.addWidget(self.chk_ng_only)
         filter_layout.addWidget(btn_search)
         filter_layout.addWidget(btn_export)
+        filter_layout.addWidget(self.chk_select_all)
         filter_layout.addWidget(btn_delete)
         filter_layout.addStretch()
 
@@ -4350,6 +4353,13 @@ class LogTabWidget(QWidget):
 
         self.current_rows = []
 
+    def toggle_select_all(self, state):
+        is_checked = state == Qt.Checked
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item:
+                item.setCheckState(Qt.Checked if is_checked else Qt.Unchecked)
+
     def compare_configs(self, old_c, new_c, prefix=""):
         diffs = []
         if isinstance(old_c, dict) and isinstance(new_c, dict):
@@ -4420,6 +4430,9 @@ class LogTabWidget(QWidget):
         )
         self.current_rows = rows
         self.table.setRowCount(len(rows))
+        self.chk_select_all.blockSignals(True)
+        self.chk_select_all.setChecked(False)
+        self.chk_select_all.blockSignals(False)
         for r_idx, row in enumerate(rows):
             chk_item = QTableWidgetItem()
             chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
