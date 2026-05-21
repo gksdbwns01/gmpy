@@ -4799,7 +4799,7 @@ class TuneHistoryDialog(QDialog):
         super().__init__(parent)
         self.history_path = history_path  # 경로 저장
         self.setWindowTitle("📈 Auto ML 실시간 튜닝 모니터링")
-        self.resize(1000, 700)
+        self.resize(1400, 900)
         self.layout = QVBoxLayout(self)
 
         # 🟢 제어 버튼 레이아웃 추가
@@ -4832,7 +4832,7 @@ class TuneHistoryDialog(QDialog):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.layout.addWidget(self.table)
-
+        self.layout.addWidget(self.table, stretch=1)
         btn_close = QPushButton("닫기")
         btn_close.setMinimumHeight(40)
         btn_close.clicked.connect(self.accept)
