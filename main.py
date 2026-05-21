@@ -5197,7 +5197,7 @@ class MainWindow(QMainWindow):
             if getattr(sys, "frozen", False)
             else Path(__file__).resolve().parent
         )
-        self.settings = QSettings("MyVisionProject", "YoloTrainerApp")
+        self.settings = QSettings("gksdbwns", "YoloTrainerApp")
         last_proj = self.settings.value("last_project_path", str(self.base_dir))
         self.config_manager = ConfigManager(last_proj)
         self.config_builder = ConfigBuilder()
@@ -5593,6 +5593,10 @@ class MainWindow(QMainWindow):
         if dialog.exec_() == QDialog.Accepted:
             self.noti_flags = dialog.get_flags()
             self.webhook_url = dialog.get_url()
+
+            # 🛠️ 추가된 부분: 입력받은 웹훅 URL을 프로그램 설정에 영구 저장합니다.
+            self.settings.setValue("webhook_url", self.webhook_url)
+
             self.statusBar().showMessage(
                 "⚙️ 알림 설정 및 웹훅 URL이 업데이트되었습니다.", 3000
             )
