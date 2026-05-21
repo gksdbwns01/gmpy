@@ -4391,8 +4391,9 @@ class LogTabWidget(QWidget):
         filter_ng = self.chk_ng_only.isChecked() if self.tab_type == "eval" else False
         current_proj_path = ""
         if self.chk_current_proj_only.isChecked():
-            main_window = self.window()
-            if hasattr(main_window, "w_proj_root"):
+            # Dialog의 부모인 MainWindow를 명시적으로 찾습니다.
+            main_window = self.window().parent()
+            if main_window and hasattr(main_window, "w_proj_root"):
                 current_proj_path = main_window.w_proj_root.get_path()
         offset = (self.current_page - 1) * self.page_size
         rows, total_count = self.db_manager.fetch_logs(
@@ -4483,8 +4484,9 @@ class LogTabWidget(QWidget):
         filter_ng = self.chk_ng_only.isChecked() if self.tab_type == "eval" else False
         current_proj_path = ""
         if self.chk_current_proj_only.isChecked():
-            main_window = self.window()
-            if hasattr(main_window, "w_proj_root"):
+            # Dialog의 부모인 MainWindow를 명시적으로 찾습니다.
+            main_window = self.window().parent()
+            if main_window and hasattr(main_window, "w_proj_root"):
                 current_proj_path = main_window.w_proj_root.get_path()
         rows, _ = self.db_manager.fetch_logs(
             table_type=self.tab_type,
