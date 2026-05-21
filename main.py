@@ -4561,8 +4561,8 @@ class LogTabWidget(QWidget):
         config_str = ""
 
         if self.tab_type == "train":
-            save_dir = row_data[7]
-            config_str = row_data[8]
+            save_dir = row_data[8]
+            config_str = row_data[9]
             self.lbl_detail_title.setText(
                 f"<b>[학습 상세]</b> ID: {row_data[0]} | 모델: {row_data[3]}"
             )
@@ -4570,8 +4570,8 @@ class LogTabWidget(QWidget):
             self.lbl_detail_title.setText(
                 f"<b>[평가 상세]</b> ID: {row_data[0]} | 모델: {row_data[3].split('|')[0].strip()}"
             )
-            config_str = row_data[8]
-            wrong_imgs_str = row_data[7]
+            wrong_imgs_str = row_data[8]
+            config_str = row_data[9]
             self.list_wrong_imgs.clear()
 
             model_path_str = (
@@ -4618,18 +4618,30 @@ class LogTabWidget(QWidget):
             current_config = json.loads(config_str)
             prev_config = {}
 
-            if (
-                self.sort_col == "id"
-                and self.sort_order == "DESC"
-                and r + 1 < len(self.current_rows)
-            ):
-                prev_config_str = self.current_rows[r + 1][8]
-                if prev_config_str:
-                    prev_config = json.loads(prev_config_str)
-            elif self.sort_col == "id" and self.sort_order == "ASC" and r - 1 >= 0:
-                prev_config_str = self.current_rows[r - 1][8]
-                if prev_config_str:
-                    prev_config = json.loads(prev_config_str)
+            # DB에서 동일 프로젝트의 직전 설정(가장 가까운 과거 ID)을 직접 조회
+            current_id = row_data[0]
+            current_proj_path = row_data[2]
+            table_name = (
+                "training_logs" if self.tab_type == "train" else "evaluation_logs"
+            )
+
+            try:
+                with self.db_manager._get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        f"""
+                        SELECT config_json FROM {table_name}
+                        WHERE id < ? AND project_path = ?
+                        ORDER BY id DESC LIMIT 1
+                    """,
+                        (current_id, current_proj_path),
+                    )
+
+                    result = cursor.fetchone()
+                    if result and result[0]:
+                        prev_config = json.loads(result[0])
+            except Exception as db_e:
+                logger.error(f"이전 설정 로드 실패: {db_e}")
 
             diff_text = ""
             if prev_config:
