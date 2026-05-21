@@ -1268,15 +1268,19 @@ def _tune_worker(args, queue):
                 # Optuna에게 이 세대가 끝까지 완료되지 않았음을 알림 (기록 무효화)
                 raise optuna.exceptions.TrialPruned()
 
-            # 🟢 정상적으로 완료된 경우에만 UI/DB 기록 및 점수 반환
+            try:
+                current_best = max(study.best_value, fitness)
+            except (
+                ValueError
+            ):  # 완료된 trial이 없어 에러가 나면 현재 점수를 최고점수로 사용
+                current_best = fitness
+
             queue.put(
                 {
                     "type": "tune_progress",
                     "generation": gen + 1,
                     "fitness": fitness,
-                    "best_fitness": study.best_value
-                    if len(study.trials) > 0
-                    else fitness,
+                    "best_fitness": current_best,
                     "params": current_params,
                     "mAP50": mAP50,
                     "mAP50_95": mAP50_95,
@@ -4415,9 +4419,17 @@ class LogTabWidget(QWidget):
             chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
             chk_item.setCheckState(Qt.Unchecked)
             self.table.setItem(r_idx, 0, chk_item)
-
+            db_idx_map = {
+                1: 0,  # ID
+                2: 1,  # 일시(timestamp)
+                3: 3,  # 유형(task_type) -> 2(project_path) 건너뜀
+                4: 4,  # 모델명(model_name)
+                5: 5,  # Epochs / 전체(total_imgs)
+                6: 6,  # Batch / 오답(wrong_count)
+                7: 7,  # 최고mAP / 정확도(accuracy)
+            }
             for c_idx in range(1, len(self.headers)):
-                db_idx = c_idx - 1
+                db_idx = db_idx_map[c_idx]
                 val = row[db_idx]
 
                 if self.tab_type == "train" and c_idx == 7:
@@ -4685,7 +4697,7 @@ class LogTabWidget(QWidget):
             r = selected[0].row()
             row_data = self.current_rows[r]
             try:
-                cfg = json.loads(row_data[8])
+                cfg = json.loads(row_data[9])
                 base_run_name = cfg.get("tab3", {}).get("run_name", "check01")
                 if "Tab 4" in row_data[3]:
                     run_dir = eval_runs_dir / (base_run_name + "_final_eval")
@@ -4937,7 +4949,11 @@ class IntegrityThread(QThread):
                 lbl_path = lbl_stems[stem]
 
                 # 2. 이미지 손상 및 중복(Hash) 검사
-                img = cv2.imread(str(img_path))
+                import numpy as np
+
+                img_array = np.fromfile(str(img_path), np.uint8)
+                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+
                 if img is None:
                     issues.append(
                         {
