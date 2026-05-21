@@ -1867,7 +1867,7 @@ def _kfold_train_worker(args, queue):
         for img, lbl in test_files:
             shutil.copy(img, test_img_dir)
             shutil.copy(lbl, test_lbl_dir)
-        fold_metrics, fold_save_dirs = [], {}
+        fold_metrics, fold_save_dirs, fold_times = [], {}, []
         splits = (
             [(train_test_split(train_val, test_size=args["test_split"]))]
             if args["num_folds"] == 1
@@ -1875,6 +1875,7 @@ def _kfold_train_worker(args, queue):
         )
 
         for fold, split_data in enumerate(splits):
+            fold_start_time = time.time()  # 👈 추가: 개별 Fold 시작 시간 기록
             if stop_handler.should_stop(f"Fold {fold + 1} 시작 전"):
                 if not fold_metrics:
                     return
@@ -1981,7 +1982,8 @@ def _kfold_train_worker(args, queue):
                         color=0xE74C3C,
                         sync=True,  # 동기식으로 확실하게 전송
                     )
-
+            fold_elapsed = time.time() - fold_start_time
+            fold_times.append(fold_elapsed)
             fold_metrics.append(res_dict)
             fold_save_dirs[fold_num] = save_dir
 
@@ -2029,6 +2031,7 @@ def _kfold_train_worker(args, queue):
                         "Recall": fm.get("metrics/recall(B)", 0),
                         "Fitness": (0.1 * fm.get("metrics/mAP50(B)", 0))
                         + (0.9 * fm.get("metrics/mAP50-95(B)", 0)),
+                        "Time": fold_times[i] if i < len(fold_times) else 0,
                     }
                     for i, fm in enumerate(fold_metrics)
                 ]
@@ -2041,6 +2044,7 @@ def _kfold_train_worker(args, queue):
                         / len(summary),
                         "Recall": sum(m["Recall"] for m in summary) / len(summary),
                         "Fitness": sum(m["Fitness"] for m in summary) / len(summary),
+                        "Time": sum(m["Time"] for m in summary) / len(summary),
                     }
                 )
                 result["metrics_summary"] = summary
@@ -6323,20 +6327,21 @@ class MainWindow(QMainWindow):
         logger.debug(f"K-Fold 검증 다이얼로그 오픈 (Best Fold: {best_fold})")
         dialog = QDialog(self)
         dialog.setWindowTitle("K-Fold 교차 검증 상세 지표")
-        dialog.resize(650, 350)
+        dialog.resize(800, 500)
         layout = QVBoxLayout(dialog)
         layout.addWidget(
             QLabel(
                 f"<b>{title_msg.replace(chr(10), '<br>')}</b><br><span style='color: #ef4444;'>⭐ <b>최우수 모델: Fold {best_fold}</b> (가중치 자동 저장됨)</span>"
             )
         )
-        table = QTableWidget(len(metrics_data), 6)
+        table = QTableWidget(len(metrics_data), 7)
         table.setHorizontalHeaderLabels(
-            ["Fold", "mAP50", "mAP50-95", "Precision", "Recall", "Fitness"]
+            ["Fold", "mAP50", "mAP50-95", "Precision", "Recall", "Fitness", "소요시간"]
         )
         self._apply_table_style(table)
         for i in range(table.columnCount()):
             table.horizontalHeader().setSectionResizeMode(i, QHeaderView.Stretch)
+
         for row, data in enumerate(metrics_data):
             fold_name = str(data["Fold"])
             table.setItem(
@@ -6351,7 +6356,17 @@ class MainWindow(QMainWindow):
             table.setItem(row, 3, QTableWidgetItem(f"{data['Precision']:.4f}"))
             table.setItem(row, 4, QTableWidgetItem(f"{data['Recall']:.4f}"))
             table.setItem(row, 5, QTableWidgetItem(f"{data['Fitness']:.4f}"))
-            for col in range(6):
+
+            # 👇 보기 좋게 초 단위가 넘어가면 '분/초'로 변환해서 출력합니다.
+            t_val = data.get("Time", 0)
+            t_str = (
+                f"{int(t_val // 60)}분 {int(t_val % 60)}초"
+                if t_val >= 60
+                else f"{t_val:.1f}초"
+            )
+            table.setItem(row, 6, QTableWidgetItem(t_str))
+
+            for col in range(7):  # 👈 6을 7로 변경
                 item = table.item(row, col)
                 item.setTextAlignment(Qt.AlignCenter)
                 if fold_name == "Average":
