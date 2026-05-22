@@ -7199,21 +7199,24 @@ class MainWindow(QMainWindow):
         self.t2_test_split.setSingleStep(0.05)
         self.t2_lcls = QDoubleSpinBox()
         self.t2_lcls.setRange(0.1, 10.0)
+        self.t2_lcls.setDecimals(4)
         self.t2_lcls.setValue(d["lcls"])
         self.t2_lcls.setSingleStep(0.1)
         self.t2_lbox = QDoubleSpinBox()
         self.t2_lbox.setRange(0.1, 20.0)
+        self.t2_lbox.setDecimals(4)
         self.t2_lbox.setValue(d["lbox"])
         self.t2_lbox.setSingleStep(0.5)
         self.t2_ldfl = QDoubleSpinBox()
         self.t2_ldfl.setRange(0.1, 10.0)
+        self.t2_ldfl.setDecimals(4)
         self.t2_ldfl.setValue(d["ldfl"])
         self.t2_ldfl.setSingleStep(0.1)
 
         def make_dbl(rng, val, step):
             b = QDoubleSpinBox()
             b.setRange(*rng)
-            b.setDecimals(3 if step < 0.01 else 2)
+            b.setDecimals(4)  # 👈 조건문 삭제하고 무조건 4자리로 고정
             b.setSingleStep(step)
             b.setValue(val)
             return b
@@ -8044,17 +8047,19 @@ class MainWindow(QMainWindow):
         self.t4_run = QLineEdit(d["run"])
         self.t4_lcls = QDoubleSpinBox()
         self.t4_lcls.setRange(0.1, 10.0)
+        self.t4_lcls.setDecimals(4)  # 👈 추가
         self.t4_lcls.setValue(d["lcls"])
         self.t4_lcls.setSingleStep(0.1)
         self.t4_lbox = QDoubleSpinBox()
         self.t4_lbox.setRange(0.1, 20.0)
+        self.t4_lbox.setDecimals(4)  # 👈 추가
         self.t4_lbox.setValue(d["lbox"])
         self.t4_lbox.setSingleStep(0.5)
 
         def make_dbl(rng, val, step):
             b = QDoubleSpinBox()
             b.setRange(*rng)
-            b.setDecimals(3 if step < 0.01 else 2)
+            b.setDecimals(4)  # 👈 조건문 삭제하고 무조건 4자리로 고정
             b.setSingleStep(step)
             b.setValue(val)
             return b
