@@ -2622,9 +2622,9 @@ def _measure_worker(args, queue):
                             )
                             measured_distances.append(round(b_dist, 1))
 
-                is_success, im_buf_arr = cv2.imencode(".jpg", plotted_img)
-                if is_success:
-                    im_buf_arr.tofile(str(result_img_path))
+            is_success, im_buf_arr = cv2.imencode(".jpg", plotted_img)
+            if is_success:
+                im_buf_arr.tofile(str(result_img_path))
 
             dstr = (
                 ", ".join([str(d) for d in sorted(list(set(measured_distances)))])
@@ -8701,25 +8701,17 @@ class MainWindow(QMainWindow):
     def on_tab5_finished(self, df_export, df_parsed, df_outliers, image_pairs):
         if getattr(self, "_shutting_down", False):
             return
-        msg = f"완료! (총 {len(df_export)}건)\n\n📂 저장 목록:\n - results.csv\n - statistics.csv\n"
-        if not df_outliers.empty:
-            msg += f" - outliers.csv (🚨 {len(df_outliers)}건)\n"
 
-        if self.webhook_url and self.noti_flags.get("task"):
-            send_discord_webhook(
-                webhook_url=self.webhook_url,
-                title="✅ [작업 완료] 거리 측정",
-                description=f"거리 측정 및 분석 완료 (총 {len(df_export)}건)",
-                color=0x2ECC71,
-            )
+        self.t5_progress.setValue(100)
 
-        QMessageBox.information(self, "완료", msg)
+        # 1️⃣ 화면에 사진과 그래프를 '먼저' 업데이트 합니다!
         self.t5_last_df_outliers = df_outliers
         self.t5_last_image_pairs = image_pairs
         self.t5_chk_show_outliers.setEnabled(True)
         self.t5_chk_show_outliers.blockSignals(True)
         self.t5_chk_show_outliers.setChecked(False)
         self.t5_chk_show_outliers.blockSignals(False)
+
         if not df_parsed.empty:
             self.t5_canvas.figure.clear()
             ax1 = self.t5_canvas.figure.add_subplot(121)
@@ -8752,7 +8744,26 @@ class MainWindow(QMainWindow):
                 )
             self.t5_canvas.figure.tight_layout()
             self.t5_canvas.draw()
+
         self.update_tab5_visualization()
+
+        # 💡 [핵심] 변경된 화면을 즉시 그리도록 강제 명령!
+        QApplication.processEvents()
+
+        # 2️⃣ 화면이 다 그려진 후에 팝업을 띄웁니다!
+        msg = f"완료! (총 {len(df_export)}건)\n\n📂 저장 목록:\n - results.csv\n - statistics.csv\n"
+        if not df_outliers.empty:
+            msg += f" - outliers.csv (🚨 {len(df_outliers)}건)\n"
+
+        if self.webhook_url and self.noti_flags.get("task"):
+            send_discord_webhook(
+                webhook_url=self.webhook_url,
+                title="✅ [작업 완료] 거리 측정",
+                description=f"거리 측정 및 분석 완료 (총 {len(df_export)}건)",
+                color=0x2ECC71,
+            )
+
+        QMessageBox.information(self, "완료", msg)
 
     def update_tab5_visualization(self):
         if not hasattr(self, "t5_last_image_pairs"):
