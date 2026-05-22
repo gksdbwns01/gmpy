@@ -4795,6 +4795,8 @@ class LogViewerDialog(QDialog):
 
 
 class TuneHistoryDialog(QDialog):
+    apply_params_requested = pyqtSignal(dict)
+
     def __init__(self, history_path, parent=None):  # history_path 인자 추가
         super().__init__(parent)
         self.history_path = history_path  # 경로 저장
@@ -4831,6 +4833,7 @@ class TuneHistoryDialog(QDialog):
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSortingEnabled(True)
         self.layout.addWidget(self.table)
         self.layout.addWidget(self.table, stretch=1)
         btn_close = QPushButton("닫기")
@@ -4896,21 +4899,50 @@ class TuneHistoryDialog(QDialog):
         self.ax.set_ylabel("Fitness Score")
         self.ax.grid(True, linestyle="--", alpha=0.7)
         self.canvas.draw_idle()
+        self.table.setSortingEnabled(False)
 
         top_df = df.sort_values(by="fitness", ascending=False)
         self.table.setRowCount(len(top_df))
-        self.table.setColumnCount(len(df.columns))
-        self.table.setHorizontalHeaderLabels(df.columns)
+
+        # '적용하기' 열을 위해 컬럼 수를 1개 더 늘립니다.
+        cols = list(df.columns)
+        self.table.setColumnCount(len(cols) + 1)
+        self.table.setHorizontalHeaderLabels(cols + ["UI에 적용"])
 
         for r_idx, (_, row) in enumerate(top_df.iterrows()):
-            for c_idx, col_name in enumerate(df.columns):
+            for c_idx, col_name in enumerate(cols):
                 val = row[col_name]
-                if isinstance(val, float):
-                    val = f"{val:.4f}"
-                item = QTableWidgetItem(str(val))
+                item = QTableWidgetItem()
+
+                # 🌟 [핵심] 문자열이 아닌 숫자로 입력해야 오름/내림차순 정렬이 정상적으로 작동합니다.
+                if pd.isna(val):
+                    item.setData(Qt.EditRole, "")
+                elif isinstance(val, float):
+                    item.setData(Qt.EditRole, float(f"{val:.4f}"))
+                else:
+                    item.setData(Qt.EditRole, val)
+
                 item.setTextAlignment(Qt.AlignCenter)
                 self.table.setItem(r_idx, c_idx, item)
+
+            # 🌟 [추가] 마지막 열에 '적용' 버튼 생성 및 연결
+            btn_apply = QPushButton("✅ 적용")
+            btn_apply.setStyleSheet(
+                "background-color: #dcfce7; color: #166534; font-weight: bold; margin: 2px;"
+            )
+
+            # 람다(lambda)의 기본값 바인딩을 이용해 현재 행의 데이터를 시그널로 전달
+            row_data = row.to_dict()
+            btn_apply.clicked.connect(
+                lambda checked, p=row_data: self.apply_params_requested.emit(p)
+            )
+
+            self.table.setCellWidget(r_idx, len(cols), btn_apply)
+
         self.table.resizeColumnsToContents()
+
+        # 🌟 [수정 끝] 데이터 삽입이 모두 끝난 후 정렬 기능을 다시 켭니다.
+        self.table.setSortingEnabled(True)
 
 
 class IntegrityThread(QThread):
@@ -7461,6 +7493,49 @@ class MainWindow(QMainWindow):
                 "지정된 오류 이미지들을 찾을 수 없습니다. (이미 삭제되었을 수 있습니다)",
             )
 
+    def apply_tune_params(self, params):
+        """튜닝 모니터링 창에서 전달받은 특정 세대의 파라미터를 탭 2(학습) UI에 적용합니다."""
+        if "box" in params and not pd.isna(params["box"]):
+            self.t2_lbox.setValue(float(params["box"]))
+        if "cls" in params and not pd.isna(params["cls"]):
+            self.t2_lcls.setValue(float(params["cls"]))
+        if "dfl" in params and not pd.isna(params["dfl"]):
+            self.t2_ldfl.setValue(float(params["dfl"]))
+
+        # 증강 데이터 매핑
+        if "hsv_h" in params and not pd.isna(params["hsv_h"]):
+            self.t2_ah.setValue(float(params["hsv_h"]))
+        if "hsv_s" in params and not pd.isna(params["hsv_s"]):
+            self.t2_as.setValue(float(params["hsv_s"]))
+        if "hsv_v" in params and not pd.isna(params["hsv_v"]):
+            self.t2_av.setValue(float(params["hsv_v"]))
+        if "degrees" in params and not pd.isna(params["degrees"]):
+            self.t2_adeg.setValue(float(params["degrees"]))
+        if "translate" in params and not pd.isna(params["translate"]):
+            self.t2_atrans.setValue(float(params["translate"]))
+        if "scale" in params and not pd.isna(params["scale"]):
+            self.t2_ascale.setValue(float(params["scale"]))
+        if "shear" in params and not pd.isna(params["shear"]):
+            self.t2_ashear.setValue(float(params["shear"]))
+        if "flipud" in params and not pd.isna(params["flipud"]):
+            self.t2_afud.setValue(float(params["flipud"]))
+        if "fliplr" in params and not pd.isna(params["fliplr"]):
+            self.t2_aflr.setValue(float(params["fliplr"]))
+        if "mosaic" in params and not pd.isna(params["mosaic"]):
+            self.t2_amos.setValue(float(params["mosaic"]))
+        if "mixup" in params and not pd.isna(params["mixup"]):
+            self.t2_amix.setValue(float(params["mixup"]))
+        if "copy_paste" in params and not pd.isna(params["copy_paste"]):
+            self.t2_acp.setValue(float(params["copy_paste"]))
+
+        gen = int(params.get("generation", 0))
+        QMessageBox.information(
+            self,
+            "파라미터 적용 완료",
+            f"세대 {gen}의 파라미터 조합이 [K-Fold 학습] 탭에 적용되었습니다.",
+        )
+        self.tabs.setCurrentIndex(2)
+
     def show_tune_history(self):
         # 튜닝 데이터 경로 설정
         history_path = (
@@ -7476,6 +7551,7 @@ class MainWindow(QMainWindow):
             or not self.live_tune_dialog.isVisible()
         ):
             self.live_tune_dialog = TuneHistoryDialog(history_path, self)
+            self.live_tune_dialog.apply_params_requested.connect(self.apply_tune_params)
             # 기존 CSV 파일이 있다면 로드
             if history_path.exists():
                 self.live_tune_dialog.load_from_csv(history_path)
