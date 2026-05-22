@@ -4609,33 +4609,21 @@ class LogTabWidget(QWidget):
             config_str = row_data[9]
             self.list_wrong_imgs.clear()
 
-            model_path_str = (
-                row_data[4].split("|")[-1].strip()
-                if "|" in row_data[4]
-                else row_data[4]
-            )
+            # --- 수정됨: 평가 결과가 저장된 실제 폴더(runs/eval/...)를 찾도록 변경 ---
+            save_dir = ""
             try:
-                model_path = Path(model_path_str)
-                if model_path.name == "best_model.pt":
-                    source_txt = model_path.parent / "best_model_source.txt"
-                    if source_txt.exists():
-                        original_path = Path(
-                            source_txt.read_text(encoding="utf-8").strip()
-                        )
-                        save_dir = (
-                            str(original_path.parent.parent)
-                            if original_path.parent.name == "weights"
-                            else str(original_path.parent)
-                        )
-                    else:
-                        save_dir = str(model_path.parent)
-                else:
-                    save_dir = (
-                        str(model_path.parent.parent)
-                        if model_path.parent.name == "weights"
-                        else str(model_path.parent)
-                    )
-            except:
+                project_path = Path(row_data[2])
+                eval_runs_dir = project_path / "workspace" / "runs" / "eval"
+
+                cfg = json.loads(config_str)
+                if "Tab 4" in row_data[3]:  # 재학습 평가인 경우
+                    base_run_name = cfg.get("tab4", {}).get("run", "retrain_hard_01")
+                    save_dir = str(eval_runs_dir / (base_run_name + "_final_eval"))
+                else:  # 일반 평가인 경우
+                    base_run_name = cfg.get("tab3", {}).get("run_name", "check01")
+                    save_dir = str(eval_runs_dir / base_run_name)
+            except Exception as e:
+                logger.error(f"평가 폴더 경로 추적 실패: {e}")
                 save_dir = ""
 
             if wrong_imgs_str:
@@ -4699,7 +4687,12 @@ class LogTabWidget(QWidget):
             self.txt_config.setText(config_str)
 
     def on_row_double_clicked(self, item):
-        r = item.row()
+        # 1. 더블클릭한 행을 명시적으로 다시 선택 처리하여
+        # btn_open_folder의 target_path가 확실하게 최신화되도록 강제합니다.
+        self.table.selectRow(item.row())
+        self.on_row_selected()
+
+        # 2. 확실하게 업데이트된 최신 경로를 가져와서 엽니다.
         path = self.btn_open_folder.property("target_path")
         if path and Path(path).exists():
             open_folder(path)
