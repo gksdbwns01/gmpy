@@ -4850,11 +4850,14 @@ class TuneHistoryDialog(QDialog):
 
     def add_live_data(self, data_dict):
         """실시간 데이터 1줄 추가 및 화면 갱신"""
-        row = {"generation": data_dict["generation"], "fitness": data_dict["fitness"]}
+        row = {
+            "generation": data_dict["generation"],
+            "fitness": data_dict["fitness"],
+            "mAP50": data_dict.get("mAP50", 0.0),
+            "mAP50_95": data_dict.get("mAP50_95", 0.0),
+        }
         row.update(data_dict["params"])
         self.df_list.append(row)
-
-        # 🟢 자동 업데이트가 켜져있을 때만 즉시 그래프 갱신
         if self.auto_refresh_check.isChecked():
             self.update_plot()
 
