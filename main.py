@@ -17,7 +17,6 @@ import sys
 import threading
 import time
 import traceback
-import zipfile
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -2825,7 +2824,7 @@ class StoppableProcessThread(QThread):
         self.process = multiprocessing.Process(
             target=worker_func, args=(self.config, run_queue)
         )
-        self.process.daemon = True
+        self.process.daemon = False
         self.process.start()
 
         res = None
@@ -5865,8 +5864,13 @@ class MainWindow(QMainWindow):
             "저장할 설정의 이름을 입력하세요:\n(빈칸으로 두면 날짜/시간으로 자동 생성됩니다)",
         )
         if ok:
+            # [개선 1] 특수문자 제거 (안전한 파일명 생성)
+            import re
+
+            safe_text = re.sub(r'[\\/*?:"<>|]', "", text.strip())
+
             success, result = self.config_manager.save_config(
-                self.config_builder.build(self), text.strip()
+                self.config_builder.build(self), safe_text
             )
             if success:
                 self.statusBar().showMessage(
@@ -5945,23 +5949,30 @@ class MainWindow(QMainWindow):
 
     def apply_loaded_config(self, c):
         logger.debug("불러온 Config를 UI에 적용 중")
+
         g = c.get("global", {})
-        if "proj_root" in g:
-            self.w_proj_root.line_edit.setText(g["proj_root"])
-        if "base_ds" in g:
-            self.w_base_ds.line_edit.setText(g["base_ds"])
-        if "proc_ds" in g:
-            self.w_proc_ds.line_edit.setText(g["proc_ds"])
-        if "work_ds" in g:
-            self.w_work_ds.line_edit.setText(g["work_ds"])
+
+        # ⚠️ [개선 2] 다른 환경(PC)에서 로드할 때 경로가 꼬이지 않도록 절대 경로는 무시합니다.
+        # if "proj_root" in g:
+        #     self.w_proj_root.line_edit.setText(g["proj_root"])
+        # if "base_ds" in g:
+        #     self.w_base_ds.line_edit.setText(g["base_ds"])
+        # if "proc_ds" in g:
+        #     self.w_proc_ds.line_edit.setText(g["proc_ds"])
+        # if "work_ds" in g:
+        #     self.w_work_ds.line_edit.setText(g["work_ds"])
+
         if "webhook_url" in g and g["webhook_url"].strip():
             self.webhook_url = g["webhook_url"]
         if "noti_flags" in g:
             self.noti_flags = g["noti_flags"]
+
+        # 모델과 이미지 사이즈는 파라미터이므로 적용합니다.
         if "model" in g:
             self.g_model.setCurrentText(g["model"])
         if "imgsz" in g:
             self.g_imgsz.setCurrentText(g["imgsz"])
+
         t1 = c.get("tab1", {})
         if "auto_crop" in t1:
             self.t1_auto_crop.setChecked(t1["auto_crop"])
@@ -5981,6 +5992,7 @@ class MainWindow(QMainWindow):
             self.t1_clean.setChecked(t1["clean"])
         if "exif" in t1:
             self.t1_exif.setChecked(t1["exif"])
+
         t2 = c.get("tab2", {})
         if "epochs" in t2:
             self.t2_epochs.setValue(t2["epochs"])
@@ -6026,6 +6038,7 @@ class MainWindow(QMainWindow):
             self.t2_amix.setValue(t2["amix"])
         if "acp" in t2:
             self.t2_acp.setValue(t2["acp"])
+
         t3 = c.get("tab3", {})
         if "conf" in t3:
             self.t3_conf.setValue(t3["conf"])
@@ -6041,6 +6054,7 @@ class MainWindow(QMainWindow):
             self.t3_agnostic.setChecked(t3["agnostic"])
         if "save_rel" in t3:
             self.t3_save_rel.setChecked(t3["save_rel"])
+
         t4 = c.get("tab4", {})
         if "epochs" in t4:
             self.t4_epochs.setValue(t4["epochs"])
@@ -6078,6 +6092,7 @@ class MainWindow(QMainWindow):
             self.t4_max_det.setValue(t4["eval_max"])
         if "eval_agnostic" in t4:
             self.t4_agnostic.setChecked(t4["eval_agnostic"])
+
         t5 = c.get("tab5", {})
         if "method" in t5:
             self.t5_method.setCurrentText(t5["method"])
@@ -6101,6 +6116,7 @@ class MainWindow(QMainWindow):
             self.t5_color1.setCurrentText(t5["color1"])
         if "color2" in t5:
             self.t5_color2.setCurrentText(t5["color2"])
+
         t6 = c.get("tab6", {})
         if "class_map" in t6:
             self.t6_class_map.setText(t6["class_map"])
@@ -6850,57 +6866,54 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("➡️ 라벨링 완료!", 5000)
 
     def export_project_dialog(self):
-        logger.info("프로젝트 압축(내보내기) 실행")
-        t3_model = self.t3_model.get_path() if hasattr(self, "t3_model") else ""
-        t4_model = (
-            self.t4_eval_model_display.text()
-            if hasattr(self, "t4_eval_model_display")
-            else ""
-        )
-        has_base = bool(t3_model and Path(t3_model).exists())
-        has_retrained = bool(t4_model and Path(t4_model).exists())
-        if not has_base and not has_retrained:
-            QMessageBox.warning(self, "경고", "내보낼 모델이 없습니다.")
+        logger.info("프로젝트 전체 백업(내보내기) 실행")
+        proj_root = Path(self.w_proj_root.get_path())
+
+        if not proj_root.exists() or not any(proj_root.iterdir()):
+            QMessageBox.warning(
+                self, "경고", "백업할 프로젝트 폴더가 없거나 비어있습니다."
+            )
             return
-        proj_name = Path(self.w_proj_root.get_path()).name
+
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "프로젝트 내보내기 (Zip)", f"{proj_name}.zip", "Zip Files (*.zip)"
+            self,
+            "프로젝트 전체 백업 (Zip)",
+            f"{proj_root.name}_backup.zip",
+            "Zip Files (*.zip)",
         )
         if not save_path:
             return
-        config_data = self.config_builder.build(self)
-        if "global" in config_data and "webhook_url" in config_data["global"]:
-            config_data["global"]["webhook_url"] = ""
-        final_json_data = {
-            "metadata": {
-                "saved_at": datetime.now().strftime("%Y%m%d_%H%M%S"),
-                "type": "project_snapshot",
-                "has_base_model": has_base,
-                "has_retrained_model": has_retrained,
-            },
-            "config": config_data,
-        }
-        self.statusBar().showMessage("📦 프로젝트 내보내기 중...")
+
+        # 확장자가 없으면 자동 추가
+        if not save_path.lower().endswith(".zip"):
+            save_path += ".zip"
+
+        self.statusBar().showMessage(
+            "📦 프로젝트 전체 백업 중... 시간이 걸릴 수 있습니다."
+        )
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+
         try:
-            with zipfile.ZipFile(save_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr(
-                    "config.json",
-                    json.dumps(final_json_data, ensure_ascii=False, indent=4),
-                )
-                if has_base:
-                    zf.write(t3_model, "base_model.pt")
-                if has_retrained:
-                    zf.write(t4_model, "retrained_model.pt")
-            logger.info(f"프로젝트 내보내기 완료: {save_path}")
+            import shutil
+
+            # 현재 상태를 config로 저장해둠 (백업 직전 최신 상태 반영)
+            config_data = self.config_builder.build(self)
+            self.config_manager.save_config(config_data, "backup_snapshot")
+
+            # 프로젝트 폴더 전체를 Zip으로 압축
+            shutil.make_archive(save_path.replace(".zip", ""), "zip", str(proj_root))
+
+            logger.info(f"프로젝트 전체 백업 완료: {save_path}")
             QMessageBox.information(
-                self, "내보내기 완료", f"저장되었습니다:\n{save_path}"
-            )
-            self.statusBar().showMessage(
-                f"✅ 프로젝트 내보내기 완료: {Path(save_path).name}", 5000
+                self,
+                "백업 완료",
+                f"전체 프로젝트가 성공적으로 백업되었습니다:\n{save_path}",
             )
         except Exception as e:
-            logger.error(f"프로젝트 내보내기 중 에러: {e}", exc_info=True)
-            QMessageBox.critical(self, "오류", f"오류 발생:\n{e}")
+            logger.error(f"프로젝트 백업 중 에러: {e}", exc_info=True)
+            QMessageBox.critical(self, "오류", f"백업 중 오류 발생:\n{e}")
+        finally:
+            QApplication.restoreOverrideCursor()
             self.statusBar().clearMessage()
 
     def import_project_dialog(self):
@@ -6910,9 +6923,11 @@ class MainWindow(QMainWindow):
         )
         if not load_path:
             return
+
         import_name = Path(load_path).stem
         current_root_parent = Path(self.w_proj_root.get_path()).parent
         new_proj_path = current_root_parent / import_name
+
         is_renamed = False
         original_name = new_proj_path.name
         counter = 1
@@ -6920,52 +6935,38 @@ class MainWindow(QMainWindow):
             is_renamed = True
             new_proj_path = current_root_parent / f"{import_name}_{counter}"
             counter += 1
-        new_proj_path.mkdir(parents=True, exist_ok=True)
-        target_dir = new_proj_path / "workspace" / f"Imported_{import_name}"
-        target_dir.mkdir(parents=True, exist_ok=True)
+
         self.statusBar().showMessage(
-            f"📥 '{new_proj_path.name}' 프로젝트를 구성하는 중..."
+            f"📥 '{new_proj_path.name}' 프로젝트를 복구하는 중..."
         )
         QApplication.setOverrideCursor(Qt.WaitCursor)
+
         try:
+            import zipfile
+
+            # 압축 해제 (Path Traversal 방어 포함)
             with zipfile.ZipFile(load_path, "r") as zf:
-                resolved_target = Path(target_dir).resolve()
+                resolved_target = new_proj_path.resolve()
                 for member in zf.infolist():
-                    member_path = Path(target_dir / member.filename).resolve()
+                    member_path = (new_proj_path / member.filename).resolve()
                     if not str(member_path).startswith(str(resolved_target)):
                         raise PermissionError(
-                            f"보안 경고: 압축 파일이 지정된 경로를 벗어나려고 합니다! ({member.filename})"
+                            f"보안 경고: 비정상적인 경로 압축 파일 ({member.filename})"
                         )
-                zf.extractall(target_dir)
+                zf.extractall(new_proj_path)
 
-            config_file = target_dir / "config.json"
-            config_data = {}
-            if config_file.exists():
-                with open(config_file, "r", encoding="utf-8") as f:
-                    config_data = json.load(f).get("config", {})
+            # 1. UI 경로 동기화 (sync_project_root가 호출되며 하위 경로 자동 매핑됨)
             self.w_proj_root.line_edit.setText(str(new_proj_path))
-            self.apply_loaded_config(config_data)
-            legacy_model, base_model, retrained_model = (
-                target_dir / "model.pt",
-                target_dir / "base_model.pt",
-                target_dir / "retrained_model.pt",
+
+            backup_config_path = (
+                new_proj_path / "workspace" / "configs" / "backup_snapshot.json"
             )
-            if base_model.exists() or legacy_model.exists():
-                model_path_str = str(
-                    (base_model if base_model.exists() else legacy_model).resolve()
-                )
-                self.t3_model.line_edit.setText(model_path_str)
-                self.t4_base.line_edit.setText(model_path_str)
-                self.t5_model.line_edit.setText(model_path_str)
-            if retrained_model.exists():
-                retrained_path_str = str(retrained_model.resolve())
-                self.t4_eval_model_display.setText(retrained_path_str)
-                self.t4_btn_eval.setEnabled(True)
-                self.t4_btn_auto_thr.setEnabled(True)
-                self.t5_model.line_edit.setText(retrained_path_str)
-            self.config_manager.update_workspace_path(str(new_proj_path / "workspace"))
-            QApplication.restoreOverrideCursor()
-            logger.info(f"프로젝트 불러오기 완료: {new_proj_path}")
+            if backup_config_path.exists():
+                success, data = self.config_manager.load_config(backup_config_path)
+                if success:
+                    self.apply_loaded_config(data)
+
+            # 👉 누락되었던 '이름 변경 알림' 팝업 조건문을 다시 추가합니다
             if is_renamed:
                 QMessageBox.warning(
                     self,
@@ -6978,16 +6979,18 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.information(
                     self,
-                    "✅ 불러오기 완료",
-                    f"루트: {new_proj_path.name}\n모든 경로가 연동되었습니다.",
+                    "✅ 복구 완료",
+                    f"프로젝트 복구가 완료되었습니다.\n새 경로: {new_proj_path.name}",
                 )
                 self.statusBar().showMessage(
                     f"✅ 프로젝트 불러오기 완료: {new_proj_path.name}", 5000
                 )
+
         except Exception as e:
             logger.error(f"프로젝트 불러오기 중 에러: {e}", exc_info=True)
+            QMessageBox.critical(self, "❌ 오류", f"복구 중 오류 발생:\n{e}")
+        finally:
             QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "❌ 오류", f"오류 발생:\n{e}")
             self.statusBar().clearMessage()
 
     def setup_tab1(self):
