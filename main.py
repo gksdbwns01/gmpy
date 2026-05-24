@@ -1104,7 +1104,9 @@ def _tune_worker(args, queue):
             tune_base.mkdir(parents=True, exist_ok=True)
 
             img_map = {
-                f.stem: f for f in sorted((processed_dir / "images").glob("*.jpg"))
+                f.stem: f
+                for f in (processed_dir / "images").iterdir()
+                if f.suffix.lower() in [".jpg", ".jpeg", ".png"]
             }
             lbl_map = {
                 f.stem: f for f in sorted((processed_dir / "labels").glob("*.txt"))
@@ -1124,7 +1126,7 @@ def _tune_worker(args, queue):
             tr_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in tr))
             vl_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in vl))
             data_yaml.write_text(
-                f"train: {tr_txt.resolve()}\nval: {vl_txt.resolve()}\nnc: {len(args['class_names'])}\nnames: {args['class_names']}\n"
+                f"train: {tr_txt.resolve().as_posix()}\nval: {vl_txt.resolve().as_posix()}\nnc: {len(args['class_names'])}\nnames: {args['class_names']}\n"
             )
         else:
             worker_logger.info(
@@ -1496,7 +1498,11 @@ def _auto_threshold_worker(args, queue):
                 (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - ia + 1e-6
             )
 
-        img_files = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))
+        img_files = [
+            f
+            for f in img_dir.iterdir()
+            if f.suffix.lower() in [".jpg", ".jpeg", ".png"]
+        ]
         total_imgs = len(img_files)
         worker_logger.debug(f"평가 대상 이미지 수: {total_imgs}장")
 
@@ -1849,7 +1855,11 @@ def _kfold_train_worker(args, queue):
         )
         kfold_base = workspace_dir / "kfold"
         runs_dir = workspace_dir / "runs" / "kfold_train"
-        img_map = {f.stem: f for f in sorted((processed_dir / "images").glob("*.jpg"))}
+        img_map = {
+            f.stem: f
+            for f in (processed_dir / "images").iterdir()
+            if f.suffix.lower() in [".jpg", ".jpeg", ".png"]
+        }
         lbl_map = {f.stem: f for f in sorted((processed_dir / "labels").glob("*.txt"))}
         paired = [(str(img_map[n]), str(lbl_map[n])) for n in img_map if n in lbl_map]
         worker_logger.debug(f"[K-Fold Worker] 매칭된 데이터 수: {len(paired)}개")
@@ -1905,7 +1915,7 @@ def _kfold_train_worker(args, queue):
             vl_txt.write_text("\n".join(str(Path(p[0]).resolve()) for p in vl))
             data_yaml = fd / "data.yaml"
             data_yaml.write_text(
-                f"train: {tr_txt.resolve()}\nval: {vl_txt.resolve()}\ntest: {test_img_dir.resolve()}\nnc: {len(args['class_names'])}\nnames: {args['class_names']}\n"
+                f"train: {tr_txt.resolve().as_posix()}\nval: {vl_txt.resolve().as_posix()}\ntest: {test_img_dir.resolve().as_posix()}\nnc: {len(args['class_names'])}\nnames: {args['class_names']}\n"
             )
 
             run_name = f"fold_{fold_num}" if args["num_folds"] > 1 else "single_train"
@@ -4123,7 +4133,7 @@ class ImageGridWidget(QWidget):
         self.current_images = self.all_image_paths[start_idx:end_idx]
         for i in reversed(range(self.grid.count())):
             if self.grid.itemAt(i).widget():
-                self.grid.itemAt(i).widget().setParent(None)
+                self.grid.itemAt(i).widget().deleteLater()
         for i in range(self.grid.rowCount()):
             self.grid.setRowStretch(i, 0)
         for i in range(self.grid.columnCount()):
