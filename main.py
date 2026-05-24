@@ -8349,7 +8349,6 @@ class MainWindow(QMainWindow):
 
     def run_tab4_eval(self):
         logger.info("Tab4 최종 평가 버튼 클릭")
-        from ultralytics import YOLO
 
         is_valid, err = self.validate_paths(
             평가모델_file=Path(self.t4_eval_model_display.text()),
@@ -8368,11 +8367,11 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         eval_yaml_dir = Path(self.w_work_ds.get_path()) / "eval_tmp"
         try:
-            temp_model = YOLO(str(model_to_eval))
-            model_class_names = temp_model.names
+            ckpt = torch.load(str(model_to_eval), map_location="cpu")
+            model_class_names = ckpt["model"].names
             num_classes = len(model_class_names)
             class_names_list = [model_class_names[i] for i in range(num_classes)]
-            del temp_model
+            del ckpt
             clear_vram()
             eval_yaml_dir.mkdir(parents=True, exist_ok=True)
             yaml_path = eval_yaml_dir / "eval_data.yaml"
