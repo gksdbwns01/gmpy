@@ -903,7 +903,7 @@ def create_stop_callback(stop_event):
     return {
         "on_train_epoch_end": check_stop,
         "on_train_batch_end": check_stop,
-        "on_train_batch_start": check_stop,  # 🟢 추가: 배치 시작 직전에도 체크
+        "on_train_batch_start": check_stop,
     }
 
 
@@ -1097,7 +1097,6 @@ def _tune_worker(args, queue):
         tune_base = workspace_dir / "runs" / "tune_custom"
         data_yaml = tune_base / "tune_data.yaml"
 
-        # 🟢 [수정] 데이터셋 설정 파일이 이미 있다면 폴더를 지우지 않고 건너뜁니다 (이어하기).
         if not data_yaml.exists():
             if tune_base.exists():
                 shutil.rmtree(tune_base)
@@ -1416,7 +1415,6 @@ def _tune_worker(args, queue):
         result["error"] = traceback.format_exc()
         worker_logger.error(f"[AutoML Worker] Exception: {result['error']}")
     finally:
-        # 🟢 [만약의 사태 대비] 에러로 종료되든, 중단되어 종료되든 무조건 저장
         try:
             if "search_history" in locals() and search_history:
                 tune_history_path = tune_base / "tune_history.csv"
@@ -2545,6 +2543,7 @@ def _measure_worker(args, queue):
             plotted_img = r.plot(line_width=1, conf=False, labels=False)
             measured_distances = []
             worst_conf = r.boxes.conf.min().item() if num_objects > 0 else 0.0
+            drawn_lines = set()
             if num_objects >= 2:
                 boxes = r.boxes.xyxy.cpu().numpy()
                 for i, b1 in enumerate(boxes):
@@ -2586,20 +2585,24 @@ def _measure_worker(args, queue):
                         for d, pt1, pt2 in sorted(knn_cands, key=lambda x: x[0])[
                             : c["n_neighbors"]
                         ]:
-                            cv2.line(plotted_img, pt1, pt2, c1, 2)
-                            cv2.putText(
-                                plotted_img,
-                                f"{d:.1f}",
-                                (
-                                    int((pt1[0] + pt2[0]) / 2),
-                                    int((pt1[1] + pt2[1]) / 2),
-                                ),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.6,
-                                c1,
-                                2,
-                            )
-                            measured_distances.append(round(d, 1))
+                            line_id = tuple(sorted([pt1, pt2]))
+
+                            if line_id not in drawn_lines:
+                                cv2.line(plotted_img, pt1, pt2, c1, 2)
+                                cv2.putText(
+                                    plotted_img,
+                                    f"{d:.1f}",
+                                    (
+                                        int((pt1[0] + pt2[0]) / 2),
+                                        int((pt1[1] + pt2[1]) / 2),
+                                    ),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6,
+                                    c1,
+                                    2,
+                                )
+                                measured_distances.append(round(d, 1))
+                                drawn_lines.add(line_id)
                     else:
                         if r_pts:
                             cv2.line(plotted_img, r_pts[0], r_pts[1], c1, 2)
@@ -2838,7 +2841,7 @@ class StoppableProcessThread(QThread):
         self.process.start()
 
         res = None
-        stop_deadline = None  # 🟢 [개선] 1회 설정을 위한 변수 초기화
+        stop_deadline = None
 
         try:
             # 프로세스가 살아있는 동안 루프
@@ -2846,13 +2849,11 @@ class StoppableProcessThread(QThread):
                 # 1. 종료 신호 감지 및 강제 종료 카운트다운
                 if self.stop_event and self.stop_event.is_set():
                     if stop_deadline is None:
-                        # 🟢 [개선] 최초 1회만 데드라인 설정
                         stop_deadline = time.time() + self.stop_grace_seconds
                         logger.warning(
                             f"[{self.__class__.__name__}] 안전 종료 대기 중... ({self.stop_grace_seconds:.0f}초)"
                         )
                     elif time.time() > stop_deadline:
-                        # 🟢 [개선] 데드라인 초과 시 즉시 강제 종료하고 루프 탈출
                         self.force_stop_process()
                         break
 
@@ -2878,10 +2879,7 @@ class StoppableProcessThread(QThread):
                 self.force_stop_process()
                 self.process.join(timeout=2)
 
-            # 🟢 [개선] 프로세스가 정상 종료되지 않았다면 결과 수집 스킵
-            # exitcode가 0이 아니면 에러로 간주하거나 프로세스가 kill 된 것임
             if self.process.exitcode != 0:
-                # 💡 [추가] 하지만 결과를 이미 정상적으로 받아뒀다면, 종료가 조금 늦었을 뿐이므로 살려줍니다.
                 if res is not None and res.get("success"):
                     logger.warning(
                         "워커 프로세스가 비정상 종료되었으나, 결과 데이터는 안전하게 수신되었습니다."
@@ -2895,7 +2893,6 @@ class StoppableProcessThread(QThread):
                         "error": f"프로세스가 비정상적으로 종료되었습니다. (Exit Code: {self.process.exitcode})",
                     }
 
-            # 강제 종료된 것이 아니라면 남아있는 큐 데이터 확인
             while res is None:
                 try:
                     msg = run_queue.get_nowait()
@@ -2910,7 +2907,6 @@ class StoppableProcessThread(QThread):
                 except qlib.Empty:
                     break
 
-            # 최종 사용자 취소 확인
             if res is None and self.stop_event and self.stop_event.is_set():
                 res = {"success": False, "error": "사용자 취소됨"}
 
@@ -4726,11 +4722,9 @@ class LogTabWidget(QWidget):
             try:
                 cfg = json.loads(row_data[9])
                 if "Tab 4" in row_data[3]:
-                    # 🟢 Tab 4 재학습 평가는 tab4의 'run' 설정을 사용
                     base_run_name = cfg.get("tab4", {}).get("run", "retrain_hard_01")
                     run_dir = eval_runs_dir / (base_run_name + "_final_eval")
                 else:
-                    # 🟢 Tab 3 평가는 tab3의 'run_name' 설정을 사용
                     base_run_name = cfg.get("tab3", {}).get("run_name", "check01")
                     run_dir = eval_runs_dir / base_run_name
             except:
@@ -4806,7 +4800,6 @@ class TuneHistoryDialog(QDialog):
         self.resize(1400, 900)
         self.layout = QVBoxLayout(self)
 
-        # 🟢 제어 버튼 레이아웃 추가
         control_layout = QHBoxLayout()
         self.auto_refresh_check = QCheckBox("실시간 자동 업데이트 (Auto-Update)")
         self.auto_refresh_check.setChecked(True)  # 기본값: 켬
@@ -5448,7 +5441,6 @@ class MainWindow(QMainWindow):
                     self._shutdown_active_tasks()
 
         finally:
-            # 🟢 리소스 정리는 finally에서 수행하여 어떤 에러가 나도 반드시 실행되게 함
             if hasattr(self, "log_db") and self.log_db:
                 self.log_db.close(timeout=5.0)
 
